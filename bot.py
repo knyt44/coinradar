@@ -16,11 +16,12 @@ Kurulum:
     pip install requests pandas
 
 Env:
-    TELEGRAM_BOT_TOKEN=...
-    TELEGRAM_CHAT_ID=...
+    Railway Variables kullan:
+    TELEGRAM_BOT_TOKEN
+    TELEGRAM_CHAT_ID
 
 Çalıştır:
-    python super_binance_spot_scanner_final.py
+    python bot.py
 """
 from __future__ import annotations
 
