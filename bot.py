@@ -42,7 +42,7 @@ import requests
 # ============================================================
 # CONFIG
 # ============================================================
-BINANCE_BASE_URL = "https://fapi.binance.tr"
+BINANCE_BASE_URL = "https://fapi.mexc.com"
 STATE_FILE = "super_binance_spot_scanner_final_state.json"
 LOG_FILE = "super_binance_spot_scanner_final.log"
 HTTP_TIMEOUT = 15
@@ -317,31 +317,31 @@ def tg_send(text: str) -> None:
 # BINANCE API
 # ============================================================
 def api_get(path: str, params: Optional[Dict] = None):
-    url = f"{BINANCE_BASE_URL}{path}"
+    url = f"{MEXC_BASE_URL}{path}"
     r = HTTP.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
 def get_exchange_info() -> List[Dict]:
-    data = api_get("/fapi/v1/exchangeInfo")
+    data = api_get("/fapi/v3/exchangeInfo")
     return data.get("symbols", []) if isinstance(data, dict) else []
 
 
 def get_24hr_tickers() -> List[Dict]:
-    data = api_get("/fapi/v1/ticker/24hr")
+    data = api_get("/fapi/v3/ticker/24hr")
     return data if isinstance(data, list) else []
 
 
 def get_book_tickers() -> Dict[str, Dict]:
-    data = api_get("/fapi/v1/ticker/bookTicker")
+    data = api_get("/fapi/v3/ticker/bookTicker")
     if isinstance(data, dict):
         data = [data]
     return {item.get("symbol"): item for item in data if item.get("symbol")}
 
 
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    data = api_get("/fapi/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not data:
         return pd.DataFrame()
 
