@@ -42,7 +42,7 @@ import requests
 # ============================================================
 # CONFIG
 # ============================================================
-BINANCE_BASE_URL = "https://api.binance.com"
+BINANCE_BASE_URL = "https://api.binance.me"
 STATE_FILE = "super_binance_spot_scanner_final_state.json"
 LOG_FILE = "super_binance_spot_scanner_final.log"
 HTTP_TIMEOUT = 15
