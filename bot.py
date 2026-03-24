@@ -324,24 +324,24 @@ def api_get(path: str, params: Optional[Dict] = None):
 
 
 def get_exchange_info() -> List[Dict]:
-    data = api_get("/api/v1/exchangeInfo")
+    data = api_get("/fapi/v1/exchangeInfo")
     return data.get("symbols", []) if isinstance(data, dict) else []
 
 
 def get_24hr_tickers() -> List[Dict]:
-    data = api_get("/api/v1/ticker/24hr")
+    data = api_get("/fapi/v1/ticker/24hr")
     return data if isinstance(data, list) else []
 
 
 def get_book_tickers() -> Dict[str, Dict]:
-    data = api_get("/api/v1/ticker/bookTicker")
+    data = api_get("/fapi/v1/ticker/bookTicker")
     if isinstance(data, dict):
         data = [data]
     return {item.get("symbol"): item for item in data if item.get("symbol")}
 
 
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = api_get("/api/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    data = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not data:
         return pd.DataFrame()
 
