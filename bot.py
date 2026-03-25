@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
 """
-BINANCE SUPER SPOT SCANNER - FINAL
+MEXC SUPER SPOT SCANNER - BINANCE-LISTED ONLY
 
 Amaç:
-- Binance spot USDT marketini tarar
-- Çöp coinleri mümkün olduğunca filtreler
+- Binance spot USDT'de listeli coinleri referans alır
+- Aynı coin MEXC spot'ta da varsa tarar
+- Çöp coinleri filtreler
 - Sadece LONG spot fırsatı arar
 - Telegram'a giriş, stop, TP1, TP2, TP3 yollar
 - Aktif sinyalleri takip eder
 - TP1 sonrası BE, TP2 sonrası stop yükseltme yapar
 
-Bu sürüm sinyal botudur, otomatik emir açmaz.
-
 Kurulum:
     pip install requests pandas
 
 Env:
-    Railway Variables kullan:
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_CHAT_ID=...
 
 Çalıştır:
     python bot.py
 """
+
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -42,38 +40,43 @@ import requests
 # ============================================================
 # CONFIG
 # ============================================================
-BINANCE_BASE_URL = "https://fapi.mexc.com"
-STATE_FILE = "super_binance_spot_scanner_final_state.json"
-LOG_FILE = "super_binance_spot_scanner_final.log"
+BINANCE_BASE_URL = "https://api.binance.com"   # sadece coin evreni için
+MEXC_BASE_URL = "https://api.mexc.com"         # asıl veri kaynağı
+
+STATE_FILE = "mexc_binance_listed_scanner_state.json"
+LOG_FILE = "mexc_binance_listed_scanner.log"
+
 HTTP_TIMEOUT = 15
 CHECK_EVERY_SECONDS = 60
 TOP_N_SIGNALS = 5
-MAX_SYMBOLS_TO_SCAN = 140
+MAX_SYMBOLS_TO_SCAN = 160
 QUOTE_ASSET = "USDT"
-USER_AGENT = "super-binance-spot-scanner-final/1.0"
+USER_AGENT = "mexc-binance-listed-scanner/1.0"
 
 # Anti-trash filters
-MIN_QUOTE_VOLUME_USDT = 10_000_000
-MAX_SPREAD_PCT = 0.30
-MIN_TRADES_24H = 25_000
-MAX_24H_PUMP_PCT = 12.0
+MIN_QUOTE_VOLUME_USDT = 8_000_000
+MAX_SPREAD_PCT = 0.35
+MIN_TRADES_24H = 12_000
+MAX_24H_PUMP_PCT = 14.0
 MIN_PRICE = 0.00001
 MIN_LISTING_AGE_BARS_4H = 140
 MAX_RANGE_COMPRESSION_PCT = 0.0125
-MIN_ATR_PCT_15M = 0.0035
-MAX_ATR_PCT_15M = 0.0280
-MIN_24H_CHANGE_PCT = -8.0
-MAX_SINGLE_CANDLE_BODY_PCT = 0.06
+MIN_ATR_PCT_15M = 0.0030
+MAX_ATR_PCT_15M = 0.0300
+MIN_24H_CHANGE_PCT = -9.0
+MAX_SINGLE_CANDLE_BODY_PCT = 0.065
+
 EXCLUDED_BASES = {
     "USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "EUR", "TRY", "BRL",
     "AUD", "GBP", "BIDR", "UAH", "NGN", "RUB", "ZAR"
 }
-LEVERAGED_TOKEN_MARKERS = ["UP", "DOWN", "BULL", "BEAR"]
+LEVERAGED_TOKEN_MARKERS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
 
 # Regime / timeframe settings
 MIN_BARS_4H = 300
 MIN_BARS_1H = 300
 MIN_BARS_15M = 300
+
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
@@ -81,8 +84,9 @@ EMA_PULLBACK = 21
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
+
 BREAKOUT_LOOKBACK = 20
-VOLUME_SURGE_MULT = 1.35
+VOLUME_SURGE_MULT = 1.30
 RETEST_BUFFER_PCT = 0.0018
 ENTRY_ZONE_BUFFER_PCT = 0.0022
 MAX_DISTANCE_FROM_EMA20_ATR = 2.0
@@ -91,6 +95,7 @@ MAX_WICK_TO_BODY_RATIO = 3.0
 MIN_BREAKOUT_BODY_ATR = 0.18
 MIN_ADX_4H = 18
 MIN_ADX_1H = 17
+
 REQUIRE_BTC_CONFIRMATION = True
 BTC_CONFIRMATION_SYMBOL = "BTCUSDT"
 
@@ -120,14 +125,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ============================================================
 # LOGGING
 # ============================================================
-logger = logging.getLogger("super_binance_spot_scanner_final")
+logger = logging.getLogger("mexc_binance_listed_scanner")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
+
 _formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
 _file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 _file_handler.setFormatter(_formatter)
+
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.setFormatter(_formatter)
+
 logger.addHandler(_file_handler)
 logger.addHandler(_stream_handler)
 
@@ -314,34 +323,58 @@ def tg_send(text: str) -> None:
 
 
 # ============================================================
-# BINANCE API
+# REST HELPERS
 # ============================================================
-def api_get(path: str, params: Optional[Dict] = None):
-    url = f"{BİNANCE_BASE_URL}{path}"
+def rest_get(base_url: str, path: str, params: Optional[Dict] = None):
+    url = f"{base_url}{path}"
     r = HTTP.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 
-def get_exchange_info() -> List[Dict]:
-    data = api_get("/fapi/v3/exchangeInfo")
+def binance_get(path: str, params: Optional[Dict] = None):
+    return rest_get(BINANCE_BASE_URL, path, params)
+
+
+def mexc_get(path: str, params: Optional[Dict] = None):
+    return rest_get(MEXC_BASE_URL, path, params)
+
+
+# ============================================================
+# BINANCE UNIVERSE (REFERENCE ONLY)
+# ============================================================
+def get_binance_exchange_info() -> List[Dict]:
+    data = binance_get("/api/v3/exchangeInfo")
     return data.get("symbols", []) if isinstance(data, dict) else []
 
 
-def get_24hr_tickers() -> List[Dict]:
-    data = api_get("/fapi/v3/ticker/24hr")
+def get_binance_24hr_tickers() -> List[Dict]:
+    data = binance_get("/api/v3/ticker/24hr")
     return data if isinstance(data, list) else []
 
 
-def get_book_tickers() -> Dict[str, Dict]:
-    data = api_get("/fapi/v3/ticker/bookTicker")
+# ============================================================
+# MEXC MARKET DATA
+# ============================================================
+def get_mexc_exchange_info() -> List[Dict]:
+    data = mexc_get("/api/v3/exchangeInfo")
+    return data.get("symbols", []) if isinstance(data, dict) else []
+
+
+def get_mexc_24hr_tickers() -> List[Dict]:
+    data = mexc_get("/api/v3/ticker/24hr")
+    return data if isinstance(data, list) else []
+
+
+def get_mexc_book_tickers() -> Dict[str, Dict]:
+    data = mexc_get("/api/v3/ticker/bookTicker")
     if isinstance(data, dict):
         data = [data]
     return {item.get("symbol"): item for item in data if item.get("symbol")}
 
 
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = api_get("/fapi/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    data = mexc_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
     if not data:
         return pd.DataFrame()
 
@@ -442,14 +475,9 @@ def is_leveraged_or_unwanted(base_asset: str) -> bool:
     return False
 
 
-def build_universe() -> List[Dict]:
-    exchange_info = get_exchange_info()
-    tickers = {x.get("symbol"): x for x in get_24hr_tickers() if x.get("symbol")}
-    books = get_book_tickers()
-
-    universe: List[Dict] = []
-
-    for item in exchange_info:
+def get_binance_spot_usdt_symbols() -> set:
+    out = set()
+    for item in get_binance_exchange_info():
         symbol = item.get("symbol", "")
         status = item.get("status", "")
         quote = item.get("quoteAsset", "")
@@ -463,9 +491,38 @@ def build_universe() -> List[Dict]:
             continue
         if is_leveraged_or_unwanted(base):
             continue
+        out.add(symbol)
+    return out
 
-        ticker = tickers.get(symbol)
-        book = books.get(symbol)
+
+def build_universe() -> List[Dict]:
+    binance_symbols = get_binance_spot_usdt_symbols()
+
+    mexc_exchange_info = get_mexc_exchange_info()
+    mexc_tickers = {x.get("symbol"): x for x in get_mexc_24hr_tickers() if x.get("symbol")}
+    mexc_books = get_mexc_book_tickers()
+
+    universe: List[Dict] = []
+
+    for item in mexc_exchange_info:
+        symbol = item.get("symbol", "")
+        status = item.get("status", "")
+        quote = item.get("quoteAsset", "")
+        base = item.get("baseAsset", "")
+
+        if symbol not in binance_symbols:
+            continue
+        if status != "ENABLED" and status != "1" and status != "TRADING":
+            continue
+        if quote != QUOTE_ASSET:
+            continue
+        if not symbol.endswith(QUOTE_ASSET):
+            continue
+        if is_leveraged_or_unwanted(base):
+            continue
+
+        ticker = mexc_tickers.get(symbol)
+        book = mexc_books.get(symbol)
         if not ticker or not book:
             continue
 
@@ -908,3 +965,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+::contentReference[oaicite:1]{index=1}
