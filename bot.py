@@ -54,16 +54,16 @@ QUOTE_ASSET = "USDT"
 USER_AGENT = "mexc-binance-listed-scanner/1.0"
 
 # Anti-trash filters
-MIN_QUOTE_VOLUME_USDT = 8_000_000
-MAX_SPREAD_PCT = 0.35
-MIN_TRADES_24H = 12_000
-MAX_24H_PUMP_PCT = 14.0
+MIN_QUOTE_VOLUME_USDT = 5_000_000
+MAX_SPREAD_PCT = 0.40
+MIN_TRADES_24H = 0
+MAX_24H_PUMP_PCT = 16.0
 MIN_PRICE = 0.00001
 MIN_LISTING_AGE_BARS_4H = 140
 MAX_RANGE_COMPRESSION_PCT = 0.0125
 MIN_ATR_PCT_15M = 0.0030
 MAX_ATR_PCT_15M = 0.0300
-MIN_24H_CHANGE_PCT = -9.0
+MIN_24H_CHANGE_PCT = -10.0
 MAX_SINGLE_CANDLE_BODY_PCT = 0.065
 
 EXCLUDED_BASES = {
@@ -84,7 +84,7 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 BREAKOUT_LOOKBACK = 20
-VOLUME_SURGE_MULT = 1.30
+VOLUME_SURGE_MULT = 1.25
 RETEST_BUFFER_PCT = 0.0018
 ENTRY_ZONE_BUFFER_PCT = 0.0022
 MAX_DISTANCE_FROM_EMA20_ATR = 2.0
@@ -97,9 +97,9 @@ REQUIRE_BTC_CONFIRMATION = True
 BTC_CONFIRMATION_SYMBOL = "BTCUSDT"
 
 # Thresholds
-BASE_MIN_SIGNAL_SCORE = 12
-MIN_QUALITY_SCORE = 8
-MIN_RR_TO_TP2 = 1.35
+BASE_MIN_SIGNAL_SCORE = 11
+MIN_QUALITY_SCORE = 7
+MIN_RR_TO_TP2 = 1.30
 MIN_SCORE_ADVANTAGE = 0
 
 # Risk plan
@@ -181,6 +181,8 @@ def utc_now_str() -> str:
 
 def safe_float(x, default: float = 0.0) -> float:
     try:
+        if x is None or x == "":
+            return default
         return float(x)
     except Exception:
         return default
@@ -346,11 +348,11 @@ def rest_get(base_url: str, path: str, params: Optional[Dict] = None):
 
 
 def binance_get(path: str, params: Optional[Dict] = None):
-    return rest_get("https://api.binance.com", path, params)
+    return rest_get(BINANCE_BASE_URL, path, params)
 
 
 def mexc_get(path: str, params: Optional[Dict] = None):
-    return rest_get("https://api.mexc.com", path, params)
+    return rest_get(MEXC_BASE_URL, path, params)
 
 
 # ============================================================
@@ -384,21 +386,35 @@ def get_mexc_book_tickers() -> Dict[str, Dict]:
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     data = mexc_get(
         "/api/v3/klines",
-        {"symbol": symbol, "interval": mexc_interval(interval), "limit": limit},
+        {
+            "symbol": symbol,
+            "interval": mexc_interval(interval),
+            "limit": min(limit, 500),
+        },
     )
+
     if not data:
         return pd.DataFrame()
 
+    # MEXC kline response = 8 alan
     df = pd.DataFrame(
         data,
         columns=[
-            "open_time", "open", "high", "low", "close", "volume", "close_time",
-            "quote_volume", "ignore_1", "ignore_2", "ignore_3", "ignore_4"
+            "open_time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
         ],
     )
+
     for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # MEXC kline response'ta trade count yok
     df["n_trades"] = 0
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
@@ -534,7 +550,7 @@ def build_universe() -> List[Dict]:
 
         if symbol not in binance_symbols:
             continue
-        if status not in {"1", "ENABLED", "TRADING"}:
+        if status != "1":
             continue
         if quote != QUOTE_ASSET:
             continue
@@ -551,7 +567,11 @@ def build_universe() -> List[Dict]:
         ask = safe_float(book.get("askPrice"))
         bid = safe_float(book.get("bidPrice"))
         last = safe_float(ticker.get("lastPrice"))
-        quote_volume = safe_float(ticker.get("quoteVolume"))
+        quote_volume = safe_float(ticker.get("quoteVolume"), 0.0)
+        # MEXC'te quoteVolume null gelebiliyor; volume * last fallback
+        if quote_volume <= 0:
+            quote_volume = safe_float(ticker.get("volume"), 0.0) * max(last, 0.0)
+
         change_pct_24h = safe_float(ticker.get("priceChangePercent"))
         n_trades = int(safe_float(ticker.get("count"), 0))
 
@@ -903,7 +923,9 @@ def format_summary(signals: List[Signal], btc_note: str, min_score: int, min_qua
         "",
     ]
     for i, s in enumerate(signals[:TOP_N_SIGNALS], 1):
-        lines.append(f"{i}) {s.symbol} | skor {s.score} | kalite {s.quality} | giriş {s.entry} | stop {s.stop} | tp2 {s.tp2}")
+        lines.append(
+            f"{i}) {s.symbol} | skor {s.score} | kalite {s.quality} | giriş {s.entry} | stop {s.stop} | tp2 {s.tp2}"
+        )
     return "\n".join(lines)
 
 
