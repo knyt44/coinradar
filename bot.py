@@ -17,20 +17,19 @@ import numpy as np
 # CONFIG
 # =========================
 
-BINANCE_BASE_URL = "https://api.binance.com"
 MEXC_BASE_URL = "https://api.mexc.com"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-STATE_FILE = os.getenv("STATE_FILE", "mexc_binance_listed_scanner_state.json")
+STATE_FILE = os.getenv("STATE_FILE", "mexc_spot_scanner_state.json")
 
 DEBUG = os.getenv("DEBUG", "true").strip().lower() == "true"
 SEND_DEBUG_TO_TELEGRAM = os.getenv("SEND_DEBUG_TO_TELEGRAM", "true").strip().lower() == "true"
 
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
-TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "25"))   # ilk testte düşük tut
-MIN_24H_QUOTE_VOL_USDT = float(os.getenv("MIN_24H_QUOTE_VOL_USDT", "1500000"))
+TOP_SYMBOL_LIMIT = int(os.getenv("TOP_SYMBOL_LIMIT", "50"))
+MIN_24H_QUOTE_VOL_USDT = float(os.getenv("MIN_24H_QUOTE_VOL_USDT", "500000"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.0005"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "50000"))
 
@@ -43,23 +42,23 @@ ENTRY_INTERVAL = os.getenv("ENTRY_INTERVAL", "5m")
 TREND_KLINE_LIMIT = int(os.getenv("TREND_KLINE_LIMIT", "240"))
 ENTRY_KLINE_LIMIT = int(os.getenv("ENTRY_KLINE_LIMIT", "240"))
 
-RSI_BULL_MIN_15M = float(os.getenv("RSI_BULL_MIN_15M", "52"))
-RSI_ENTRY_MIN_5M = float(os.getenv("RSI_ENTRY_MIN_5M", "54"))
-ATR_PCT_MIN = float(os.getenv("ATR_PCT_MIN", "0.004"))
-ATR_PCT_MAX = float(os.getenv("ATR_PCT_MAX", "0.035"))
-MIN_VOLUME_BOOST = float(os.getenv("MIN_VOLUME_BOOST", "1.10"))
+RSI_BULL_MIN_15M = float(os.getenv("RSI_BULL_MIN_15M", "48"))
+RSI_ENTRY_MIN_5M = float(os.getenv("RSI_ENTRY_MIN_5M", "50"))
+ATR_PCT_MIN = float(os.getenv("ATR_PCT_MIN", "0.003"))
+ATR_PCT_MAX = float(os.getenv("ATR_PCT_MAX", "0.040"))
+MIN_VOLUME_BOOST = float(os.getenv("MIN_VOLUME_BOOST", "1.00"))
 
 SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", "1.20"))
 TP1_ATR_MULT = float(os.getenv("TP1_ATR_MULT", "1.40"))
 TP2_ATR_MULT = float(os.getenv("TP2_ATR_MULT", "2.20"))
 TP3_ATR_MULT = float(os.getenv("TP3_ATR_MULT", "3.20"))
-MIN_RR = float(os.getenv("MIN_RR", "1.15"))
+MIN_RR = float(os.getenv("MIN_RR", "1.05"))
 
-BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "true").strip().lower() == "true"
+BTC_FILTER_ENABLED = os.getenv("BTC_FILTER_ENABLED", "false").strip().lower() == "true"
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (compatible; MEXC-Binance-Listed-Scanner/2.0)"
+    "User-Agent": "Mozilla/5.0 (compatible; MEXC-Spot-Scanner/3.0)"
 })
 
 
@@ -208,6 +207,10 @@ STABLE_BASES = {
     "EUR", "EURT", "AEUR", "TRY", "BRL", "GBP"
 }
 
+BAD_BASE_KEYWORDS = {
+    "NFT", "BRC20"
+}
+
 def is_leveraged_or_bad(symbol: str) -> bool:
     s = symbol.upper()
     if not s.endswith("USDT"):
@@ -220,6 +223,9 @@ def is_leveraged_or_bad(symbol: str) -> bool:
         return True
 
     if re.search(r"(BULL|BEAR|UP|DOWN|[345]L|[345]S)$", base):
+        return True
+
+    if base in BAD_BASE_KEYWORDS:
         return True
 
     return False
@@ -249,16 +255,13 @@ def ensure_numeric_ohlcv(df: pd.DataFrame, symbol="?", where="?") -> pd.DataFram
             log_err(f"{symbol} {where} missing column: {col} | cols={list(df.columns)}")
             return pd.DataFrame()
 
-    before = df.dtypes.astype(str).to_dict()
-
     for col in needed:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=needed).reset_index(drop=True)
 
-    after = df.dtypes.astype(str).to_dict()
     if DEBUG:
-        log(f"{symbol} {where} dtypes before={before} after={after} rows={len(df)}")
+        log(f"{symbol} {where} rows={len(df)} dtypes={df.dtypes.astype(str).to_dict()}")
 
     return df
 
@@ -325,46 +328,18 @@ def prepare_indicators(df: pd.DataFrame, symbol="?", where="?") -> pd.DataFrame:
         debug_telegram(
             f"{symbol} prepare_indicators patladı [{where}]\n"
             f"err={e}\n"
-            f"dtypes={getattr(df, 'dtypes', 'NA')}\n"
             f"tail={safe_tail_rows(df)}"
         )
         return pd.DataFrame()
 
 
 # =========================
-# API
+# MEXC API
 # =========================
 
-def get_binance_spot_symbols():
-    url = f"{BINANCE_BASE_URL}/api/v3/exchangeInfo"
-    data = fetch_json(url, timeout=30)
-
-    symbols = []
-    for item in data.get("symbols", []):
-        try:
-            symbol = clean_symbol_text(item.get("symbol", ""))
-            status = item.get("status", "")
-            quote = item.get("quoteAsset", "")
-            is_spot = item.get("isSpotTradingAllowed", False)
-
-            if status != "TRADING":
-                continue
-            if quote != "USDT":
-                continue
-            if not is_spot:
-                continue
-            if is_leveraged_or_bad(symbol):
-                continue
-
-            symbols.append(symbol)
-        except Exception:
-            continue
-
-    return sorted(set(symbols))
-
 def get_mexc_tradeable_symbols():
-    exch_url = f"{MEXC_BASE_URL}/api/v3/exchangeInfo"
-    data = fetch_json(exch_url, timeout=30)
+    url = f"{MEXC_BASE_URL}/api/v3/exchangeInfo"
+    data = fetch_json(url, timeout=30)
 
     out = set()
     for item in data.get("symbols", []):
@@ -521,7 +496,6 @@ def assess_entry_5m(df5: pd.DataFrame):
     vol_ma = float(last["vol_ma20"]) if not pd.isna(last["vol_ma20"]) else 0.0
 
     recent_high = float(pd.to_numeric(df5["high"].iloc[-12:-2], errors="coerce").max())
-    recent_low = float(pd.to_numeric(df5["low"].iloc[-12:-2], errors="coerce").min())
 
     breakout = close > recent_high
     reclaim = (
@@ -547,8 +521,6 @@ def assess_entry_5m(df5: pd.DataFrame):
         "ema50": ema50v,
         "rsi": rsi5,
         "atr": atr5,
-        "recent_high": recent_high,
-        "recent_low": recent_low,
     }
 
 def build_long_signal(symbol: str, trend_info: dict, entry_info: dict, t24: dict):
@@ -619,12 +591,10 @@ def get_btc_filter_state():
     try:
         btc_df = get_mexc_klines("BTCUSDT", TREND_INTERVAL, TREND_KLINE_LIMIT)
         if btc_df.empty:
-            log_err("BTC filtre: btc_df boş")
             return {"ok": False, "reason": "btc_df_empty"}
 
         btc_df = prepare_indicators(btc_df, symbol="BTCUSDT", where="btc_filter")
         if btc_df.empty:
-            log_err("BTC filtre: indikatör sonrası btc_df boş")
             return {"ok": False, "reason": "btc_indicators_empty"}
 
         last = btc_df.iloc[-1]
@@ -655,7 +625,7 @@ def get_btc_filter_state():
 
 
 # =========================
-# SIGNAL FORMAT
+# SIGNAL TEXT
 # =========================
 
 def format_signal_message(sig: dict) -> str:
@@ -757,7 +727,6 @@ def monitor_active_signals(state, tickers24):
             tp1 = float(sig["tp1"])
             tp2 = float(sig["tp2"])
             tp3 = float(sig["tp3"])
-            stop = float(sig["stop"])
             tp1_hit = bool(sig.get("tp1_hit", False))
 
             if not tp1_hit and price >= tp1:
@@ -798,19 +767,11 @@ def monitor_active_signals(state, tickers24):
 # =========================
 
 def build_symbol_universe():
-    log("Binance universe çekiliyor...")
-    binance_symbols = set(get_binance_spot_symbols())
-    log(f"Binance uygun USDT spot: {len(binance_symbols)}")
-
-    log("MEXC symbols çekiliyor...")
+    log("Sadece MEXC universe çekiliyor...")
     mexc_symbols = set(get_mexc_tradeable_symbols())
-    log(f"MEXC uygun USDT: {len(mexc_symbols)}")
-
-    common = sorted(binance_symbols.intersection(mexc_symbols))
-    common = [s for s in common if not is_leveraged_or_bad(s)]
-
-    log(f"Ortak uygun sembol: {len(common)}")
-    return common
+    symbols = [s for s in mexc_symbols if not is_leveraged_or_bad(s)]
+    log(f"Filtrelenmiş MEXC sembol sayısı: {len(symbols)}")
+    return sorted(symbols)
 
 def rank_symbols_by_liquidity(symbols, tickers24):
     ranked = []
@@ -836,7 +797,7 @@ def rank_symbols_by_liquidity(symbols, tickers24):
 
 
 # =========================
-# SYMBOL ANALYSIS
+# ANALYZE SYMBOL
 # =========================
 
 def analyze_symbol(symbol, t24, btc_state=None):
@@ -869,8 +830,7 @@ def analyze_symbol(symbol, t24, btc_state=None):
         if not entry_info:
             return None
 
-        sig = build_long_signal(symbol, trend_info, entry_info, t24)
-        return sig
+        return build_long_signal(symbol, trend_info, entry_info, t24)
 
     except Exception as e:
         log_err(f"Sembol analiz hatası {symbol}: {e}")
@@ -889,13 +849,12 @@ def analyze_symbol(symbol, t24, btc_state=None):
 # =========================
 
 def main():
-    log("MEXC BINANCE-LISTED SCANNER başlıyor")
+    log("MEXC ONLY SPOT SCANNER başlıyor")
     state = load_state()
 
     if not state.get("sent_startup", False):
         ok = send_telegram(
-            "✅ *MEXC Binance-listed spot scanner başlatıldı.*\n"
-            f"Binance universe: `{BINANCE_BASE_URL}`\n"
+            "✅ *MEXC only spot scanner başlatıldı.*\n"
             f"MEXC market: `{MEXC_BASE_URL}`\n"
             f"Saat: `{now_str()}`"
         )
@@ -929,10 +888,7 @@ def main():
                 if not btc_state.get("ok", False):
                     log_err(f"BTC filtre devre dışı, sebep={btc_state.get('reason')}")
                 else:
-                    log(
-                        f"BTC filtre aktif | bullish={btc_state['bullish']} "
-                        f"bearish={btc_state['bearish']} rsi={btc_state['rsi']:.2f}"
-                    )
+                    log(f"BTC filtre aktif | bullish={btc_state['bullish']} rsi={btc_state['rsi']:.2f}")
 
             ranked_symbols = rank_symbols_by_liquidity(universe, tickers24)
             log(f"Taranacak sembol sayısı: {len(ranked_symbols)}")
