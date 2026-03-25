@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-MEXC SUPER SPOT SCANNER - BINANCE-LISTED ONLY
+MEXC SUPER SPOT SCANNER - BINANCE LISTED ONLY
 
 Amaç:
 - Binance spot USDT'de listeli coinleri referans alır
 - Aynı coin MEXC spot'ta da varsa tarar
-- Çöp coinleri filtreler
+- Çöp coinleri mümkün olduğunca filtreler
 - Sadece LONG spot fırsatı arar
 - Telegram'a giriş, stop, TP1, TP2, TP3 yollar
 - Aktif sinyalleri takip eder
 - TP1 sonrası BE, TP2 sonrası stop yükseltme yapar
+
+Bu sürüm sinyal botudur, otomatik emir açmaz.
 
 Kurulum:
     pip install requests pandas
@@ -21,7 +23,6 @@ Env:
 Çalıştır:
     python bot.py
 """
-
 from __future__ import annotations
 
 import json
@@ -40,12 +41,11 @@ import requests
 # ============================================================
 # CONFIG
 # ============================================================
-BINANCE_BASE_URL = "https://api.binance.com"   # sadece coin evreni için
+BINANCE_BASE_URL = "https://api.binance.com"   # sadece referans coin evreni için
 MEXC_BASE_URL = "https://api.mexc.com"         # asıl veri kaynağı
 
 STATE_FILE = "mexc_binance_listed_scanner_state.json"
 LOG_FILE = "mexc_binance_listed_scanner.log"
-
 HTTP_TIMEOUT = 15
 CHECK_EVERY_SECONDS = 60
 TOP_N_SIGNALS = 5
@@ -76,7 +76,6 @@ LEVERAGED_TOKEN_MARKERS = ["UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S"]
 MIN_BARS_4H = 300
 MIN_BARS_1H = 300
 MIN_BARS_15M = 300
-
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
@@ -84,7 +83,6 @@ EMA_PULLBACK = 21
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
-
 BREAKOUT_LOOKBACK = 20
 VOLUME_SURGE_MULT = 1.30
 RETEST_BUFFER_PCT = 0.0018
@@ -95,7 +93,6 @@ MAX_WICK_TO_BODY_RATIO = 3.0
 MIN_BREAKOUT_BODY_ATR = 0.18
 MIN_ADX_4H = 18
 MIN_ADX_1H = 17
-
 REQUIRE_BTC_CONFIRMATION = True
 BTC_CONFIRMATION_SYMBOL = "BTCUSDT"
 
@@ -203,6 +200,21 @@ def round_smart(x: float) -> float:
     return round(x, 8)
 
 
+def mexc_interval(interval: str) -> str:
+    mapping = {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "60m",
+        "4h": "4h",
+        "1d": "1d",
+        "1w": "1W",
+        "1M": "1M",
+    }
+    return mapping.get(interval, interval)
+
+
 def default_state() -> Dict:
     return {
         "sent": {},
@@ -212,6 +224,7 @@ def default_state() -> Dict:
         "last_summary_ts": 0,
         "last_btc_note": "",
         "last_loss_ts": 0,
+        "last_universe_empty_notice_ts": 0,
     }
 
 
@@ -333,11 +346,11 @@ def rest_get(base_url: str, path: str, params: Optional[Dict] = None):
 
 
 def binance_get(path: str, params: Optional[Dict] = None):
-    return rest_get(BINANCE_BASE_URL, path, params)
+    return rest_get("https://api.binance.com", path, params)
 
 
 def mexc_get(path: str, params: Optional[Dict] = None):
-    return rest_get(MEXC_BASE_URL, path, params)
+    return rest_get("https://api.mexc.com", path, params)
 
 
 # ============================================================
@@ -346,11 +359,6 @@ def mexc_get(path: str, params: Optional[Dict] = None):
 def get_binance_exchange_info() -> List[Dict]:
     data = binance_get("/api/v3/exchangeInfo")
     return data.get("symbols", []) if isinstance(data, dict) else []
-
-
-def get_binance_24hr_tickers() -> List[Dict]:
-    data = binance_get("/api/v3/ticker/24hr")
-    return data if isinstance(data, list) else []
 
 
 # ============================================================
@@ -374,7 +382,10 @@ def get_mexc_book_tickers() -> Dict[str, Dict]:
 
 
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    data = mexc_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    data = mexc_get(
+        "/api/v3/klines",
+        {"symbol": symbol, "interval": mexc_interval(interval), "limit": limit},
+    )
     if not data:
         return pd.DataFrame()
 
@@ -382,11 +393,13 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         data,
         columns=[
             "open_time", "open", "high", "low", "close", "volume", "close_time",
-            "quote_volume", "n_trades", "taker_base", "taker_quote", "ignore"
+            "quote_volume", "ignore_1", "ignore_2", "ignore_3", "ignore_4"
         ],
     )
-    for col in ["open", "high", "low", "close", "volume", "quote_volume", "n_trades"]:
+    for col in ["open", "high", "low", "close", "volume", "quote_volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["n_trades"] = 0
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
     df = df.dropna().reset_index(drop=True)
@@ -457,9 +470,13 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["body_pct"] = out["body"] / out["close"].replace(0, pd.NA)
     out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
     out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
-    out["wick_to_body"] = (out[["upper_wick", "lower_wick"]].max(axis=1) / out["body"].replace(0, pd.NA)).fillna(999)
+    out["wick_to_body"] = (
+        out[["upper_wick", "lower_wick"]].max(axis=1) / out["body"].replace(0, pd.NA)
+    ).fillna(999)
     out["high_breakout"] = out["high"].rolling(BREAKOUT_LOOKBACK).max().shift(2)
-    out["compression"] = ((out["high"].rolling(12).max() - out["low"].rolling(12).min()) / out["close"]).fillna(999)
+    out["compression"] = (
+        (out["high"].rolling(12).max() - out["low"].rolling(12).min()) / out["close"]
+    ).fillna(999)
     return out
 
 
@@ -502,17 +519,22 @@ def build_universe() -> List[Dict]:
     mexc_tickers = {x.get("symbol"): x for x in get_mexc_24hr_tickers() if x.get("symbol")}
     mexc_books = get_mexc_book_tickers()
 
+    logger.info("Binance listed symbols: %s", len(binance_symbols))
+    logger.info("MEXC exchange symbols: %s", len(mexc_exchange_info))
+    logger.info("MEXC 24hr tickers: %s", len(mexc_tickers))
+    logger.info("MEXC book tickers: %s", len(mexc_books))
+
     universe: List[Dict] = []
 
     for item in mexc_exchange_info:
         symbol = item.get("symbol", "")
-        status = item.get("status", "")
+        status = str(item.get("status", ""))
         quote = item.get("quoteAsset", "")
         base = item.get("baseAsset", "")
 
         if symbol not in binance_symbols:
             continue
-        if status != "ENABLED" and status != "1" and status != "TRADING":
+        if status not in {"1", "ENABLED", "TRADING"}:
             continue
         if quote != QUOTE_ASSET:
             continue
@@ -559,6 +581,7 @@ def build_universe() -> List[Dict]:
             "n_trades": n_trades,
         })
 
+    logger.info("MEXC filtered universe before cap: %s", len(universe))
     universe.sort(key=lambda x: (x["quote_volume"], x["n_trades"]), reverse=True)
     return universe[:MAX_SYMBOLS_TO_SCAN]
 
@@ -617,7 +640,6 @@ def evaluate_symbol(meta: Dict, min_score: int, min_quality: int) -> Optional[Si
     prev15 = df15.iloc[-3]
     l15 = df15.iloc[-2]
 
-    # Hard filters
     if pd.isna(l15["atr"]) or l15["atr"] <= 0:
         return None
     if not (MIN_ATR_PCT_15M <= l15["atr_pct"] <= MAX_ATR_PCT_15M):
@@ -635,7 +657,6 @@ def evaluate_symbol(meta: Dict, min_score: int, min_quality: int) -> Optional[Si
     quality = 0
     reasons: List[str] = []
 
-    # 4H trend
     if l4["ema20"] > l4["ema50"] > l4["ema200"]:
         score += 3
         quality += 2
@@ -655,7 +676,6 @@ def evaluate_symbol(meta: Dict, min_score: int, min_quality: int) -> Optional[Si
         quality += 1
         reasons.append("4h ADX iyi")
 
-    # 1H trend / momentum
     if l1["ema20"] > l1["ema50"] > l1["ema200"]:
         score += 3
         quality += 2
@@ -675,7 +695,6 @@ def evaluate_symbol(meta: Dict, min_score: int, min_quality: int) -> Optional[Si
         quality += 1
         reasons.append("1h ADX destekli")
 
-    # 15M alignment
     if l15["ema20"] > l15["ema50"] and l15["close"] > l15["ema20"]:
         score += 1
         reasons.append("15m trend yönünde")
@@ -849,7 +868,7 @@ def check_active_trades(state: Dict) -> None:
 # ============================================================
 def format_signal(sig: Signal, min_score: int, min_quality: int) -> str:
     return (
-        f"🚀 BINANCE SUPER SPOT SCANNER\n"
+        f"🚀 MEXC BINANCE-LISTED SPOT SCANNER\n"
         f"Saat: {utc_now_str()}\n"
         f"Coin: {sig.symbol}\n"
         f"Yön: {sig.side}\n"
@@ -876,7 +895,7 @@ def format_signal(sig: Signal, min_score: int, min_quality: int) -> str:
 def format_summary(signals: List[Signal], btc_note: str, min_score: int, min_quality: int, state: Dict) -> str:
     stats = get_recent_stats(state)
     lines = [
-        f"📊 BINANCE spot tarama özeti | {utc_now_str()}",
+        f"📊 MEXC Binance-listed spot tarama özeti | {utc_now_str()}",
         f"BTC filtre: {btc_note}",
         f"Aktif eşik: skor>={min_score} | kalite>={min_quality}",
         f"Son {stats['count']} sonuç win-rate: %{stats['win_rate']:.1f}",
@@ -907,12 +926,20 @@ def run_scan(state: Dict) -> List[Signal]:
 
     if REQUIRE_BTC_CONFIRMATION and not btc_ok:
         logger.info("Tarama pas: %s", btc_note)
-        tg_send(f"⚠️ Binance spot tarama pas: {btc_note}\nSaat: {utc_now_str()}")
+        tg_send(f"⚠️ MEXC tarama pas: {btc_note}\nSaat: {utc_now_str()}")
         save_state(state)
         return []
 
     universe = build_universe()
     logger.info("Tarama evreni: %s coin", len(universe))
+
+    if len(universe) == 0:
+        last_notice = int(state.get("last_universe_empty_notice_ts", 0))
+        if now_ts() - last_notice >= 1800:
+            tg_send(f"⚠️ MEXC tarama evreni boş.\nSaat: {utc_now_str()}")
+            state["last_universe_empty_notice_ts"] = now_ts()
+            save_state(state)
+        return []
 
     signals: List[Signal] = []
     for meta in universe:
@@ -948,8 +975,17 @@ def run_scan(state: Dict) -> List[Signal]:
 
 
 def main() -> None:
-    logger.info("BINANCE SUPER SPOT SCANNER FINAL başlıyor")
-    logger.info("Endpoint: %s", BINANCE_BASE_URL)
+    logger.info("MEXC BINANCE-LISTED SCANNER başlıyor")
+    logger.info("Binance universe endpoint: %s", BINANCE_BASE_URL)
+    logger.info("MEXC market endpoint: %s", MEXC_BASE_URL)
+
+    tg_send(
+        "✅ Bot başladı\n"
+        f"Binance universe: {BINANCE_BASE_URL}\n"
+        f"MEXC market: {MEXC_BASE_URL}\n"
+        f"Saat: {utc_now_str()}"
+    )
+
     state = load_state()
 
     while True:
@@ -960,6 +996,7 @@ def main() -> None:
             break
         except Exception as e:
             logger.exception("Ana döngü hatası: %s", e)
+            tg_send(f"❌ Ana döngü hatası:\n{e}\nSaat: {utc_now_str()}")
         time.sleep(CHECK_EVERY_SECONDS)
 
 
