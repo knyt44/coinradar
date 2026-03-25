@@ -965,5 +965,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-::contentReference[oaicite:1]{index=1}
