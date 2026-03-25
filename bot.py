@@ -317,7 +317,7 @@ def tg_send(text: str) -> None:
 # BINANCE API
 # ============================================================
 def api_get(path: str, params: Optional[Dict] = None):
-    url = f"{MEXC_BASE_URL}{path}"
+    url = f"{BİNANCE_BASE_URL}{path}"
     r = HTTP.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
