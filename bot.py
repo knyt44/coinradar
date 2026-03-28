@@ -1,134 +1,101 @@
+# =========================
+# DOSYA: bot.py
+# =========================
 # -*- coding: utf-8 -*-
 """
-XAUUSD V2 PRO PRICE ACTION BOT
---------------------------------------------------
-Özellikler:
-- Enstrüman: XAUUSD
-- HTF trend: H4
-- Giriş timeframe: M15
-- Destek / direnç: H4 pivot cluster
-- PDH / PDL (previous day high/low)
-- Asian range + London / NY session trap
-- Liquidity sweep
-- BOS / mini structure break
-- FVG filtre
-- Premium / discount zone
-- Inside bar / fakey / pin bar
-- ATR stop
-- RR filtresi
-- TP1 partial close + SL BE
-- Telegram
-- Dry run / canlı mod
+XAUUSD SIGNAL BOT - GITHUB ACTIONS + OANDA + TELEGRAM
+-----------------------------------------------------
+Amaç:
+- XAUUSD için sinyal üretmek
+- H4 trend + M15 entry mantığı
+- Destek/direnç + inside bar + fakey + sweep + PDH/PDL
+- Telegram'a mesaj atmak
+- İşlem açmaz, sadece sinyal gönderir
 
-KURULUM:
-pip install MetaTrader5 pandas numpy requests
+GEREKEN GITHUB SECRETS:
+- OANDA_API_KEY
+- OANDA_ACCOUNT_ID
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+- OANDA_BASE_URL
 
-ÇALIŞTIRMA:
-python xauusd_v2_pro_bot.py
+NOT:
+- OANDA instrument adı hesap tipine göre değişebilir.
+- Varsayılan: XAU_USD
 """
 
-import time
-import math
+import os
+import json
 import traceback
 from datetime import datetime, timezone
 
-import MetaTrader5 as mt5
+import requests
 import pandas as pd
 import numpy as np
-import requests
 
 
 # =========================================================
-# AYARLAR
+# CONFIG
 # =========================================================
 
-LIVE_TRADING = False
-SYMBOL = "XAUUSD"
+OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-HTF = mt5.TIMEFRAME_H4
-LTF = mt5.TIMEFRAME_M15
-DAY_TF = mt5.TIMEFRAME_D1
+OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
+INSTRUMENT = os.getenv("OANDA_INSTRUMENT", "XAU_USD").strip()
 
-HTF_BARS = 500
-LTF_BARS = 700
-DAY_BARS = 10
+HTF_GRANULARITY = "H4"
+LTF_GRANULARITY = "M15"
+DAY_GRANULARITY = "D"
 
-CHECK_EVERY_SECONDS = 20
+HTF_COUNT = 300
+LTF_COUNT = 500
+DAY_COUNT = 10
 
-# Risk
-RISK_PER_TRADE = 0.01
-MIN_RR = 1.8
-PARTIAL_CLOSE_AT_TP1 = 0.50
-MOVE_SL_TO_BE_AFTER_TP1 = True
-
-# EMA / RSI / ADX
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
-ADX_PERIOD = 14
-MIN_ADX = 18
-
-# ATR
 ATR_PERIOD = 14
-ATR_SL_BUFFER = 0.25
+ADX_PERIOD = 14
+
+MIN_ADX = 18
+MIN_RR = 1.8
+
+PIVOT_LEFT = 3
+PIVOT_RIGHT = 3
+MAX_HTF_LEVEL_AGE = 140
+
 LEVEL_NEAR_ATR = 0.45
 LEVEL_MERGE_ATR = 0.35
 SWEEP_MIN_ATR = 0.18
+ATR_SL_BUFFER = 0.25
 MAX_ENTRY_DISTANCE_ATR = 1.10
 
-# Pivots
-PIVOT_LEFT = 3
-PIVOT_RIGHT = 3
-MAX_HTF_LEVEL_AGE = 220
-
-# Pin bar
 MIN_PIN_WICK_RATIO = 2.0
 MAX_BODY_TO_RANGE_FOR_PIN = 0.42
 
-# Spread
-MAX_SPREAD_DOLLAR = 0.60
+ASIA_START = 0
+ASIA_END = 6
 
-# Sessions UTC
 LONDON_START = 7
 LONDON_END = 16
 NEWYORK_START = 12
 NEWYORK_END = 21
-
-# Asian range (UTC)
-ASIA_START = 0
-ASIA_END = 6
-
-# Session trap hours
 TRAP_LOOK_WINDOW_START = 6
 TRAP_LOOK_WINDOW_END = 15
 
-# FVG
-MIN_FVG_ATR = 0.10
-
-# Telegram
-TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
-
-MAGIC = 440088
+STATE_FILE = "signal_state.json"
 
 
 # =========================================================
-# YARDIMCI
+# HELPERS
 # =========================================================
 
-def log(msg):
+def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
-
-
-def send_telegram(msg):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        log(f"Telegram hata: {e}")
 
 
 def safe_float(x, default=0.0):
@@ -136,7 +103,7 @@ def safe_float(x, default=0.0):
         if x is None:
             return default
         return float(x)
-    except:
+    except Exception:
         return default
 
 
@@ -158,38 +125,130 @@ def in_trap_window():
     return TRAP_LOOK_WINDOW_START <= h < TRAP_LOOK_WINDOW_END
 
 
+def ensure_env():
+    missing = []
+    if not OANDA_API_KEY:
+        missing.append("OANDA_API_KEY")
+    if not OANDA_ACCOUNT_ID:
+        missing.append("OANDA_ACCOUNT_ID")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+
+    if missing:
+        raise RuntimeError(f"Eksik environment/secrets: {', '.join(missing)}")
+
+
+def oanda_headers():
+    return {
+        "Authorization": f"Bearer {OANDA_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+
 # =========================================================
-# MT5
+# TELEGRAM
 # =========================================================
 
-def init_mt5():
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 initialize başarısız: {mt5.last_error()}")
+def send_telegram(msg: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram secrets eksik.")
+        return False
 
-    info = mt5.symbol_info(SYMBOL)
-    if info is None:
-        raise RuntimeError(f"{SYMBOL} bulunamadı")
-    if not info.visible:
-        if not mt5.symbol_select(SYMBOL, True):
-            raise RuntimeError(f"{SYMBOL} seçilemedi")
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=20
+        )
 
-    log("MT5 hazır")
+        log(f"Telegram status: {resp.status_code}")
+        log(f"Telegram response: {resp.text}")
+
+        if resp.status_code != 200:
+            return False
+
+        data = resp.json()
+        return bool(data.get("ok", False))
+    except Exception as e:
+        log(f"Telegram hata: {e}")
+        return False
 
 
-def get_rates(symbol, timeframe, count):
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-    if rates is None or len(rates) == 0:
-        return None
-    df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+# =========================================================
+# OANDA DATA
+# =========================================================
+
+def fetch_candles(instrument: str, granularity: str, count: int) -> pd.DataFrame:
+    url = f"{OANDA_BASE_URL}/v3/instruments/{instrument}/candles"
+    params = {
+        "granularity": granularity,
+        "count": count,
+        "price": "M"
+    }
+
+    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=30)
+    log(f"OANDA candles status [{granularity}]: {resp.status_code}")
+    log(resp.text[:500])
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"OANDA candle fetch failed [{granularity}]: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    candles = data.get("candles", [])
+    rows = []
+
+    for c in candles:
+        if not c.get("complete", False):
+            continue
+        mid = c.get("mid", {})
+        rows.append({
+            "time": pd.to_datetime(c["time"], utc=True),
+            "open": safe_float(mid.get("o")),
+            "high": safe_float(mid.get("h")),
+            "low": safe_float(mid.get("l")),
+            "close": safe_float(mid.get("c")),
+            "volume": safe_float(c.get("volume"))
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise RuntimeError(f"Boş candle verisi [{granularity}]")
     return df
 
 
+def fetch_latest_price(instrument: str) -> float:
+    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    params = {"instruments": instrument}
+    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=20)
+
+    log(f"OANDA pricing status: {resp.status_code}")
+    log(resp.text[:500])
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"OANDA pricing failed: {resp.status_code} {resp.text}")
+
+    data = resp.json()
+    prices = data.get("prices", [])
+    if not prices:
+        raise RuntimeError("Fiyat verisi yok")
+
+    p = prices[0]
+    bids = p.get("bids", [])
+    asks = p.get("asks", [])
+    bid = safe_float(bids[0]["price"]) if bids else 0.0
+    ask = safe_float(asks[0]["price"]) if asks else 0.0
+    mid = (bid + ask) / 2.0 if bid and ask else 0.0
+    return mid
+
+
 # =========================================================
-# İNDİKATÖRLER
+# INDICATORS
 # =========================================================
 
-def add_indicators(df):
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     df["ema20"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
@@ -215,6 +274,7 @@ def add_indicators(df):
     down_move = -df["low"].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
     tr_smooth = df["tr"].rolling(ADX_PERIOD).sum()
     plus_di = 100 * pd.Series(plus_dm).rolling(ADX_PERIOD).sum() / tr_smooth
     minus_di = 100 * pd.Series(minus_dm).rolling(ADX_PERIOD).sum() / tr_smooth
@@ -233,7 +293,7 @@ def add_indicators(df):
 # LEVELS
 # =========================================================
 
-def is_pivot_high(df, i):
+def is_pivot_high(df: pd.DataFrame, i: int) -> bool:
     if i - PIVOT_LEFT < 0 or i + PIVOT_RIGHT >= len(df):
         return False
     h = df.iloc[i]["high"]
@@ -245,7 +305,7 @@ def is_pivot_high(df, i):
     return True
 
 
-def is_pivot_low(df, i):
+def is_pivot_low(df: pd.DataFrame, i: int) -> bool:
     if i - PIVOT_LEFT < 0 or i + PIVOT_RIGHT >= len(df):
         return False
     l = df.iloc[i]["low"]
@@ -257,9 +317,10 @@ def is_pivot_low(df, i):
     return True
 
 
-def merge_levels(levels, atr):
+def merge_levels(levels, atr: float):
     if not levels:
         return []
+
     levels = sorted(levels, key=lambda x: x["price"])
     merged = [levels[0].copy()]
     merge_dist = atr * LEVEL_MERGE_ATR
@@ -275,11 +336,10 @@ def merge_levels(levels, atr):
             merged[-1]["last_index"] = max(merged[-1]["last_index"], lv["last_index"])
         else:
             merged.append(lv.copy())
-
     return merged
 
 
-def build_htf_levels(df):
+def build_htf_levels(df: pd.DataFrame):
     atr = safe_float(df.iloc[-1]["atr"])
     if atr <= 0:
         return [], []
@@ -299,21 +359,21 @@ def build_htf_levels(df):
     return merge_levels(supports, atr), merge_levels(resistances, atr)
 
 
-def nearest_level(levels, price):
+def nearest_level(levels, price: float):
     if not levels:
         return None
     return min(levels, key=lambda x: abs(x["price"] - price))
 
 
-def near_level(price, level_price, atr):
+def near_level(price: float, level_price: float, atr: float) -> bool:
     return abs(price - level_price) <= atr * LEVEL_NEAR_ATR
 
 
 # =========================================================
-# TREND / PREMIUM-DISCOUNT
+# TREND / ZONE
 # =========================================================
 
-def get_htf_trend(df):
+def get_htf_trend(df: pd.DataFrame) -> str:
     last = df.iloc[-1]
 
     bull = (
@@ -334,7 +394,7 @@ def get_htf_trend(df):
     return "sideways"
 
 
-def premium_discount_zone(htf_df, price):
+def premium_discount_zone(htf_df: pd.DataFrame, price: float):
     swing_low = float(htf_df.iloc[-40:]["low"].min())
     swing_high = float(htf_df.iloc[-40:]["high"].max())
     eq = (swing_low + swing_high) / 2.0
@@ -345,10 +405,10 @@ def premium_discount_zone(htf_df, price):
 
 
 # =========================================================
-# CANDLE PATTERNS
+# PATTERNS
 # =========================================================
 
-def bullish_pin_bar(row):
+def bullish_pin_bar(row) -> bool:
     body = safe_float(row["body"])
     rng = safe_float(row["range"])
     uw = safe_float(row["upper_wick"])
@@ -360,7 +420,7 @@ def bullish_pin_bar(row):
     return lw >= body * MIN_PIN_WICK_RATIO and uw <= body * 1.25
 
 
-def bearish_pin_bar(row):
+def bearish_pin_bar(row) -> bool:
     body = safe_float(row["body"])
     rng = safe_float(row["range"])
     uw = safe_float(row["upper_wick"])
@@ -372,11 +432,12 @@ def bearish_pin_bar(row):
     return uw >= body * MIN_PIN_WICK_RATIO and lw <= body * 1.25
 
 
-def detect_inside_bar(df):
+def detect_inside_bar(df: pd.DataFrame):
     if len(df) < 4:
         return None
     mb = df.iloc[-3]
     ib = df.iloc[-2]
+
     if ib["high"] < mb["high"] and ib["low"] > mb["low"]:
         return {
             "mother_high": float(mb["high"]),
@@ -387,11 +448,12 @@ def detect_inside_bar(df):
     return None
 
 
-def detect_inside_break(df):
+def detect_inside_break(df: pd.DataFrame):
     st = detect_inside_bar(df)
     if not st:
         return None
     last = df.iloc[-1]
+
     if last["close"] > st["inside_high"]:
         return {"direction": "long", "pattern": "inside_break_long", **st}
     if last["close"] < st["inside_low"]:
@@ -399,7 +461,7 @@ def detect_inside_break(df):
     return None
 
 
-def detect_fakey(df):
+def detect_fakey(df: pd.DataFrame):
     if len(df) < 5:
         return None
 
@@ -443,11 +505,7 @@ def detect_fakey(df):
     return None
 
 
-# =========================================================
-# PDH / PDL
-# =========================================================
-
-def get_previous_day_levels(day_df):
+def get_previous_day_levels(day_df: pd.DataFrame):
     if day_df is None or len(day_df) < 3:
         return None
     prev = day_df.iloc[-2]
@@ -459,53 +517,45 @@ def get_previous_day_levels(day_df):
     }
 
 
-# =========================================================
-# ASIAN RANGE / TRAP
-# =========================================================
-
-def get_today_ltf_df(ltf_df):
+def get_today_ltf_df(ltf_df: pd.DataFrame):
     today = now_utc().date()
     return ltf_df[ltf_df["time"].dt.date == today].copy()
 
 
-def get_asian_range(ltf_df):
+def get_asian_range(ltf_df: pd.DataFrame):
     today_df = get_today_ltf_df(ltf_df)
     if today_df.empty:
         return None
-    asia = today_df[(today_df["time"].dt.hour >= ASIA_START) & (today_df["time"].dt.hour < ASIA_END)]
+
+    asia = today_df[
+        (today_df["time"].dt.hour >= ASIA_START) &
+        (today_df["time"].dt.hour < ASIA_END)
+    ]
     if asia.empty:
         return None
+
     return {
         "high": float(asia["high"].max()),
         "low": float(asia["low"].min()),
     }
 
 
-def detect_session_trap(ltf_df, asian_range, pd_levels):
-    """
-    London/NY açılışına yakın:
-    - Asia high sweep + geri dönüş = short trap
-    - Asia low sweep + geri dönüş = long trap
-    - PDH/PDL sweep de ek teyit sayılır
-    """
+def detect_session_trap(ltf_df: pd.DataFrame, asian_range, pd_levels):
     if asian_range is None:
         return None
     if not in_trap_window():
         return None
 
     last = ltf_df.iloc[-1]
-    prev = ltf_df.iloc[-4:-1]
     atr = safe_float(last["atr"])
     if atr <= 0:
         return None
 
     asia_high = asian_range["high"]
     asia_low = asian_range["low"]
-
     pdh = pd_levels["pdh"] if pd_levels else None
     pdl = pd_levels["pdl"] if pd_levels else None
 
-    # short trap
     if last["high"] > asia_high and last["close"] < asia_high:
         if (last["high"] - asia_high) >= atr * SWEEP_MIN_ATR:
             extra = False
@@ -517,7 +567,6 @@ def detect_session_trap(ltf_df, asian_range, pd_levels):
                 "swept_level": max(asia_high, pdh if pdh else asia_high)
             }
 
-    # long trap
     if last["low"] < asia_low and last["close"] > asia_low:
         if (asia_low - last["low"]) >= atr * SWEEP_MIN_ATR:
             extra = False
@@ -532,79 +581,20 @@ def detect_session_trap(ltf_df, asian_range, pd_levels):
     return None
 
 
-# =========================================================
-# FVG
-# =========================================================
-
-def detect_recent_fvg(df):
-    """
-    Basit 3 mumluk FVG:
-    bullish: candle[-3].high < candle[-1].low
-    bearish: candle[-3].low > candle[-1].high
-    """
-    if len(df) < 5:
-        return None
-
-    a = df.iloc[-3]
-    b = df.iloc[-2]
-    c = df.iloc[-1]
-    atr = safe_float(c["atr"])
-    if atr <= 0:
-        return None
-
-    # bullish FVG
-    if a["high"] < c["low"]:
-        gap = c["low"] - a["high"]
-        if gap >= atr * MIN_FVG_ATR:
-            return {
-                "direction": "long",
-                "pattern": "bullish_fvg",
-                "low": float(a["high"]),
-                "high": float(c["low"]),
-            }
-
-    # bearish FVG
-    if a["low"] > c["high"]:
-        gap = a["low"] - c["high"]
-        if gap >= atr * MIN_FVG_ATR:
-            return {
-                "direction": "short",
-                "pattern": "bearish_fvg",
-                "low": float(c["high"]),
-                "high": float(a["low"]),
-            }
-
-    return None
-
-
-def price_in_fvg(price, fvg):
-    if not fvg:
-        return False
-    return fvg["low"] <= price <= fvg["high"]
-
-
-# =========================================================
-# BOS / CHoCH BENZERİ
-# =========================================================
-
-def recent_structure_points(df, lookback=25):
+def recent_structure_points(df: pd.DataFrame, lookback=25):
     sub = df.iloc[-lookback:].copy()
     highs = []
     lows = []
+
     for i in range(2, len(sub) - 2):
-        if sub.iloc[i]["high"] > sub.iloc[i-1]["high"] and sub.iloc[i]["high"] > sub.iloc[i+1]["high"]:
+        if sub.iloc[i]["high"] > sub.iloc[i - 1]["high"] and sub.iloc[i]["high"] > sub.iloc[i + 1]["high"]:
             highs.append((sub.iloc[i]["time"], float(sub.iloc[i]["high"])))
-        if sub.iloc[i]["low"] < sub.iloc[i-1]["low"] and sub.iloc[i]["low"] < sub.iloc[i+1]["low"]:
+        if sub.iloc[i]["low"] < sub.iloc[i - 1]["low"] and sub.iloc[i]["low"] < sub.iloc[i + 1]["low"]:
             lows.append((sub.iloc[i]["time"], float(sub.iloc[i]["low"])))
     return highs, lows
 
 
-def detect_bos(df):
-    """
-    Basit kullanım:
-    - son kapanış son local high üstünde = bullish BOS
-    - son kapanış son local low altında = bearish BOS
-    """
+def detect_bos(df: pd.DataFrame):
     if len(df) < 35:
         return None
 
@@ -620,33 +610,22 @@ def detect_bos(df):
         return {"direction": "long", "pattern": "bullish_bos", "level": recent_high}
     if last["close"] < recent_low:
         return {"direction": "short", "pattern": "bearish_bos", "level": recent_low}
-
     return None
 
 
-def detect_choch_like(df):
-    """
-    Dönüşe yakın yapı:
-    - önce lower low sweep, sonra son birkaç mumun tepesini kırarsa bullish reversal
-    - önce higher high sweep, sonra son birkaç mumun dibini kırarsa bearish reversal
-    """
+def detect_choch_like(df: pd.DataFrame):
     if len(df) < 12:
         return None
 
     last = df.iloc[-1]
     prev = df.iloc[-6:-1]
-    atr = safe_float(last["atr"])
-    if atr <= 0:
-        return None
 
     local_high = float(prev["high"].max())
     local_low = float(prev["low"].min())
 
-    # bullish reversal
     if last["close"] > local_high and prev.iloc[-1]["low"] < prev["low"].iloc[:-1].min():
         return {"direction": "long", "pattern": "choch_like_long", "level": local_high}
 
-    # bearish reversal
     if last["close"] < local_low and prev.iloc[-1]["high"] > prev["high"].iloc[:-1].max():
         return {"direction": "short", "pattern": "choch_like_short", "level": local_low}
 
@@ -654,17 +633,10 @@ def detect_choch_like(df):
 
 
 # =========================================================
-# KALİTE FİLTRELERİ
+# QUALITY / SIGNAL
 # =========================================================
 
-def spread_ok():
-    tick = mt5.symbol_info_tick(SYMBOL)
-    if tick is None:
-        return False
-    return (tick.ask - tick.bid) <= MAX_SPREAD_DOLLAR
-
-
-def ltf_quality_ok(df, direction):
+def ltf_quality_ok(df: pd.DataFrame, direction: str) -> bool:
     last = df.iloc[-1]
 
     if safe_float(last["adx"]) < MIN_ADX:
@@ -680,11 +652,7 @@ def ltf_quality_ok(df, direction):
     return True
 
 
-# =========================================================
-# SİNYAL BİRLEŞTİRME
-# =========================================================
-
-def build_signal(htf_df, ltf_df, day_df):
+def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFrame):
     htf_last = htf_df.iloc[-1]
     ltf_last = ltf_df.iloc[-1]
 
@@ -711,13 +679,10 @@ def build_signal(htf_df, ltf_df, day_df):
     trap = detect_session_trap(ltf_df, asian_range, pd_levels)
     bos = detect_bos(ltf_df)
     choch = detect_choch_like(ltf_df)
-    fvg = detect_recent_fvg(ltf_df)
 
-    # PDH/PDL yakınlık
     near_pdh = pd_levels is not None and abs(price - pd_levels["pdh"]) <= htf_atr * LEVEL_NEAR_ATR
     near_pdl = pd_levels is not None and abs(price - pd_levels["pdl"]) <= htf_atr * LEVEL_NEAR_ATR
 
-    # LONG SENARYOSU
     long_reasons = []
     long_stop_candidates = []
 
@@ -750,14 +715,16 @@ def build_signal(htf_df, ltf_df, day_df):
     if bos and bos["direction"] == "long":
         long_reasons.append(bos["pattern"])
 
-    if fvg and fvg["direction"] == "long" and price_in_fvg(price, fvg):
-        long_reasons.append("in_bullish_fvg")
-
     if (
         ltf_quality_ok(ltf_df, "long")
         and len(long_reasons) >= 3
         and ("htf_support" in long_reasons or "pdl" in long_reasons or zone == "discount")
-        and (("fakey_long" in " ".join(long_reasons)) or ("inside_break_long" in " ".join(long_reasons)) or ("session_trap_long" in " ".join(long_reasons)) or ("choch_like_long" in " ".join(long_reasons)))
+        and (
+            ("fakey_long" in " ".join(long_reasons)) or
+            ("inside_break_long" in " ".join(long_reasons)) or
+            ("session_trap_long" in " ".join(long_reasons)) or
+            ("choch_like_long" in " ".join(long_reasons))
+        )
         and htf_trend in ["bull", "sideways"]
     ):
         stop = min(long_stop_candidates) if long_stop_candidates else price - ltf_atr
@@ -781,7 +748,6 @@ def build_signal(htf_df, ltf_df, day_df):
                     "atr": ltf_atr
                 }
 
-    # SHORT SENARYOSU
     short_reasons = []
     short_stop_candidates = []
 
@@ -814,14 +780,16 @@ def build_signal(htf_df, ltf_df, day_df):
     if bos and bos["direction"] == "short":
         short_reasons.append(bos["pattern"])
 
-    if fvg and fvg["direction"] == "short" and price_in_fvg(price, fvg):
-        short_reasons.append("in_bearish_fvg")
-
     if (
         ltf_quality_ok(ltf_df, "short")
         and len(short_reasons) >= 3
         and ("htf_resistance" in short_reasons or "pdh" in short_reasons or zone == "premium")
-        and (("fakey_short" in " ".join(short_reasons)) or ("inside_break_short" in " ".join(short_reasons)) or ("session_trap_short" in " ".join(short_reasons)) or ("choch_like_short" in " ".join(short_reasons)))
+        and (
+            ("fakey_short" in " ".join(short_reasons)) or
+            ("inside_break_short" in " ".join(short_reasons)) or
+            ("session_trap_short" in " ".join(short_reasons)) or
+            ("choch_like_short" in " ".join(short_reasons))
+        )
         and htf_trend in ["bear", "sideways"]
     ):
         stop = max(short_stop_candidates) if short_stop_candidates else price + ltf_atr
@@ -849,302 +817,156 @@ def build_signal(htf_df, ltf_df, day_df):
 
 
 # =========================================================
-# LOT / EMİR
+# STATE
 # =========================================================
 
-def get_account_balance():
-    acc = mt5.account_info()
-    if acc is None:
-        return 0.0
-    return safe_float(acc.balance)
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-def get_symbol_info():
-    info = mt5.symbol_info(SYMBOL)
-    if info is None:
-        raise RuntimeError(f"{SYMBOL} info yok")
-    return info
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def calc_lot(entry, stop):
-    info = get_symbol_info()
-    balance = get_account_balance()
-    if balance <= 0:
-        return 0.0
-
-    risk_money = balance * RISK_PER_TRADE
-    sl_distance = abs(entry - stop)
-    if sl_distance <= 0:
-        return 0.0
-
-    tick_value = safe_float(info.trade_tick_value)
-    tick_size = safe_float(info.trade_tick_size)
-    volume_step = safe_float(info.volume_step, 0.01)
-    min_lot = safe_float(info.volume_min, 0.01)
-    max_lot = safe_float(info.volume_max, 100.0)
-
-    if tick_value <= 0 or tick_size <= 0:
-        return 0.0
-
-    loss_per_lot = (sl_distance / tick_size) * tick_value
-    if loss_per_lot <= 0:
-        return 0.0
-
-    lot = risk_money / loss_per_lot
-    lot = math.floor(lot / volume_step) * volume_step
-    lot = max(min_lot, min(lot, max_lot))
-    return round(lot, 2)
-
-
-def current_positions():
-    positions = mt5.positions_get(symbol=SYMBOL)
-    return [] if positions is None else list(positions)
-
-
-def direction_position_exists(direction):
-    positions = current_positions()
-    if direction == "long":
-        return any(p.type == mt5.POSITION_TYPE_BUY for p in positions)
-    return any(p.type == mt5.POSITION_TYPE_SELL for p in positions)
-
-
-def send_market_order(signal):
-    tick = mt5.symbol_info_tick(SYMBOL)
-    if tick is None:
-        return None
-
-    direction = signal["direction"]
-    entry = tick.ask if direction == "long" else tick.bid
-    stop = signal["stop"]
-    tp2 = signal["tp2"]
-
-    lot = calc_lot(entry, stop)
-    if lot <= 0:
-        log("Lot hesaplanamadı")
-        return None
-
-    order_type = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if direction == "long" else tick.bid
-
-    msg = (
-        f"🚨 XAUUSD V2 SİNYAL\n"
-        f"Yön: {direction}\n"
-        f"Pattern: {signal['pattern']}\n"
-        f"HTF Trend: {signal['htf_trend']}\n"
-        f"Zone: {signal['zone']}\n"
-        f"Seviye: {signal['level_type']} @ {signal['level_price']:.2f}\n"
-        f"Entry: {price:.2f}\n"
-        f"SL: {stop:.2f}\n"
-        f"TP1: {signal['tp1']:.2f}\n"
-        f"TP2: {tp2:.2f}\n"
-        f"Lot: {lot}"
-    )
-    log(msg)
-    send_telegram(msg)
-
-    if not LIVE_TRADING:
-        log("Dry run mod")
-        return {"dry_run": True}
-
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": SYMBOL,
-        "volume": lot,
-        "type": order_type,
-        "price": price,
-        "sl": stop,
-        "tp": tp2,
-        "deviation": 20,
-        "magic": MAGIC,
-        "comment": "XAUUSD_V2_PRO",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-    if result is None:
-        return None
-
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        err = f"Emir reddedildi retcode={result.retcode}"
-        log(err)
-        send_telegram(err)
-        return None
-
-    ok = f"✅ XAUUSD V2 emir açıldı ticket={result.order} lot={lot}"
-    log(ok)
-    send_telegram(ok)
-    return result
+def make_signal_key(signal, ltf_df):
+    bar_time = str(ltf_df.iloc[-1]["time"])
+    return f"{bar_time}|{signal['direction']}|{signal['pattern']}"
 
 
 # =========================================================
-# POZİSYON YÖNETİMİ
+# MAIN
 # =========================================================
 
-def modify_position_sl_tp(ticket, new_sl=None, new_tp=None):
-    pos = mt5.positions_get(ticket=ticket)
-    if pos is None or len(pos) == 0:
-        return False
-    p = pos[0]
+def run():
+    ensure_env()
 
-    request = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "position": p.ticket,
-        "symbol": p.symbol,
-        "sl": p.sl if new_sl is None else new_sl,
-        "tp": p.tp if new_tp is None else new_tp,
-        "magic": MAGIC,
-    }
+    log("Bot başladı.")
+    send_telegram("🤖 XAUUSD Signal Bot başlatıldı.")
 
-    result = mt5.order_send(request)
-    return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
-
-
-def partial_close(ticket, volume):
-    pos = mt5.positions_get(ticket=ticket)
-    if pos is None or len(pos) == 0:
-        return False
-    p = pos[0]
-
-    tick = mt5.symbol_info_tick(p.symbol)
-    if tick is None:
-        return False
-
-    close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-    price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": p.symbol,
-        "volume": volume,
-        "type": close_type,
-        "position": p.ticket,
-        "price": price,
-        "deviation": 20,
-        "magic": MAGIC,
-        "comment": "partial_close",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-    return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
-
-
-def manage_positions():
-    positions = current_positions()
-    if not positions:
-        return
-
-    for p in positions:
-        if p.symbol != SYMBOL:
-            continue
-
-        entry = safe_float(p.price_open)
-        sl = safe_float(p.sl)
-        volume = safe_float(p.volume)
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick is None:
-            continue
-
-        current_price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
-        risk = abs(entry - sl)
-        if risk <= 0:
-            continue
-
-        if p.type == mt5.POSITION_TYPE_BUY:
-            tp1 = entry + risk * 1.0
-            if current_price >= tp1:
-                partial_vol = round(volume * PARTIAL_CLOSE_AT_TP1, 2)
-                if partial_vol > 0 and partial_vol < volume:
-                    partial_close(p.ticket, partial_vol)
-                if MOVE_SL_TO_BE_AFTER_TP1:
-                    modify_position_sl_tp(p.ticket, new_sl=entry)
-
-        else:
-            tp1 = entry - risk * 1.0
-            if current_price <= tp1:
-                partial_vol = round(volume * PARTIAL_CLOSE_AT_TP1, 2)
-                if partial_vol > 0 and partial_vol < volume:
-                    partial_close(p.ticket, partial_vol)
-                if MOVE_SL_TO_BE_AFTER_TP1:
-                    modify_position_sl_tp(p.ticket, new_sl=entry)
-
-
-# =========================================================
-# BAR KONTROL
-# =========================================================
-
-last_bar_time = None
-
-def is_new_ltf_bar(df):
-    global last_bar_time
-    t = df.iloc[-1]["time"]
-    if last_bar_time is None:
-        last_bar_time = t
-        return True
-    if t != last_bar_time:
-        last_bar_time = t
-        return True
-    return False
-
-
-# =========================================================
-# ANA ÇALIŞMA
-# =========================================================
-
-def run_once():
     if not in_main_sessions():
-        log("Ana session dışında")
-        return
+        log("Ana seans dışında. Yine de veri kontrol edilecek.")
 
-    if not spread_ok():
-        log("Spread yüksek")
-        return
-
-    htf_df = get_rates(SYMBOL, HTF, HTF_BARS)
-    ltf_df = get_rates(SYMBOL, LTF, LTF_BARS)
-    day_df = get_rates(SYMBOL, DAY_TF, DAY_BARS)
-
-    if htf_df is None or ltf_df is None or day_df is None:
-        log("Veri alınamadı")
-        return
+    htf_df = fetch_candles(INSTRUMENT, HTF_GRANULARITY, HTF_COUNT)
+    ltf_df = fetch_candles(INSTRUMENT, LTF_GRANULARITY, LTF_COUNT)
+    day_df = fetch_candles(INSTRUMENT, DAY_GRANULARITY, DAY_COUNT)
 
     htf_df = add_indicators(htf_df)
     ltf_df = add_indicators(ltf_df)
     day_df = add_indicators(day_df)
 
-    manage_positions()
-
-    if not is_new_ltf_bar(ltf_df):
-        return
-
     signal = build_signal(htf_df, ltf_df, day_df)
     if signal is None:
-        log("Sinyal yok")
+        log("Sinyal yok.")
+        send_telegram("ℹ️ XAUUSD: uygun sinyal yok.")
         return
 
-    if direction_position_exists(signal["direction"]):
-        log(f"Aynı yönde açık pozisyon var: {signal['direction']}")
+    state = load_state()
+    key = make_signal_key(signal, ltf_df)
+    last_key = state.get("last_signal_key")
+
+    if key == last_key:
+        log("Aynı sinyal daha önce gönderilmiş.")
         return
 
-    send_market_order(signal)
+    state["last_signal_key"] = key
+    save_state(state)
 
+    msg = (
+        f"🚨 XAUUSD SİNYAL\n"
+        f"Yön: {signal['direction'].upper()}\n"
+        f"Pattern: {signal['pattern']}\n"
+        f"HTF Trend: {signal['htf_trend']}\n"
+        f"Zone: {signal['zone']}\n"
+        f"Seviye: {signal['level_type']} @ {signal['level_price']:.2f}\n"
+        f"Entry: {signal['entry']:.2f}\n"
+        f"SL: {signal['stop']:.2f}\n"
+        f"TP1: {signal['tp1']:.2f}\n"
+        f"TP2: {signal['tp2']:.2f}\n"
+        f"ATR: {signal['atr']:.2f}\n"
+        f"Enstrüman: {INSTRUMENT}"
+    )
 
-def main():
-    init_mt5()
-    log("XAUUSD V2 PRO başladı")
-    send_telegram("🤖 XAUUSD V2 PRO başlatıldı")
-
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            err = f"HATA: {e}\n{traceback.format_exc()}"
-            log(err)
-            send_telegram(err)
-        time.sleep(CHECK_EVERY_SECONDS)
+    log(msg)
+    ok = send_telegram(msg)
+    log(f"Telegram gönderim sonucu: {ok}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except Exception as e:
+        err = f"HATA: {e}\n{traceback.format_exc()}"
+        log(err)
+        try:
+            send_telegram(err[:3500])
+        except Exception:
+            pass
+        raise
+
+
+# =========================
+# DOSYA: requirements.txt
+# =========================
+# Bu kısmı ayrı dosyaya kaydet:
+# pandas
+# numpy
+# requests
+
+
+# =========================
+# DOSYA: .github/workflows/xau-signal-bot.yml
+# =========================
+# Bu kısmı ayrı dosyaya kaydet:
+#
+# name: XAUUSD Signal Bot
+#
+# on:
+#   workflow_dispatch:
+#   schedule:
+#     - cron: "*/15 * * * *"
+#
+# jobs:
+#   run-bot:
+#     runs-on: ubuntu-latest
+#
+#     permissions:
+#       contents: write
+#
+#     steps:
+#       - name: Repo çek
+#         uses: actions/checkout@v4
+#
+#       - name: Python kur
+#         uses: actions/setup-python@v5
+#         with:
+#           python-version: "3.11"
+#
+#       - name: Paketleri kur
+#         run: |
+#           python -m pip install --upgrade pip
+#           pip install -r requirements.txt
+#
+#       - name: Botu çalıştır
+#         env:
+#           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+#           OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+#           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+#           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+#           OANDA_BASE_URL: ${{ secrets.OANDA_BASE_URL }}
+#           OANDA_INSTRUMENT: XAU_USD
+#         run: python bot.py
+#
+#       - name: State dosyasını commit et
+#         run: |
+#           git config user.name "github-actions[bot]"
+#           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+#           git add signal_state.json || true
+#           git diff --cached --quiet || git commit -m "Update signal state"
+#           git push || true
