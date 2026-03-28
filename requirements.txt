@@ -1,4 +1,3 @@
 pandas
-requests
 numpy
-MetaTrader5
+requests
