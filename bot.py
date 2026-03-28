@@ -1,1701 +1,1150 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-ETH SUPERBOT PRO+ AI WHALE NEWS SWING
-=========================================================
+XAUUSD V2 PRO PRICE ACTION BOT
+--------------------------------------------------
 Özellikler:
-- ETHUSDT için LONG / SHORT sinyal üretir
-- 15m trend + 5m entry mantığı
-- 1h / 2h / 4h swing uygunluk analizi
-- BTCUSDT çoklu timeframe rejim filtresi
-- Balina baskı alarmı (open interest + large trade pressure)
-- Haber / risk alarmı (RSS headline tarama + yaklaşan event uyarısı)
-- AI yorumlama metni
-- Telegram bildirimleri
-- State yönetimi / cooldown / aktif sinyal takibi
+- Enstrüman: XAUUSD
+- HTF trend: H4
+- Giriş timeframe: M15
+- Destek / direnç: H4 pivot cluster
+- PDH / PDL (previous day high/low)
+- Asian range + London / NY session trap
+- Liquidity sweep
+- BOS / mini structure break
+- FVG filtre
+- Premium / discount zone
+- Inside bar / fakey / pin bar
+- ATR stop
+- RR filtresi
+- TP1 partial close + SL BE
+- Telegram
+- Dry run / canlı mod
 
-Not:
-- "Haberi önceden bilme" mümkün değildir.
-- Bu sürüm yeni yayınlanan başlıkları erken algılar ve yaklaşan event uyarısı verir.
-- Balina modülü, public veri üzerinden baskı tahmini yapar; %100 kesin değildir.
+KURULUM:
+pip install MetaTrader5 pandas numpy requests
+
+ÇALIŞTIRMA:
+python xauusd_v2_pro_bot.py
 """
 
-import os
-import re
 import time
-import json
 import math
 import traceback
-from datetime import datetime, timezone, timedelta
-from xml.etree import ElementTree as ET
+from datetime import datetime, timezone
 
+import MetaTrader5 as mt5
+import pandas as pd
+import numpy as np
 import requests
 
-# =========================================================
-# CONFIG
-# =========================================================
-SYMBOL = "ETHUSDT"
-BTC_SYMBOL = "BTCUSDT"
-MARKET_TYPE = "futures"   # "futures" veya "spot"
 
-SPOT_BASE_URL = "https://api.binance.com"
-FUTURES_BASE_URL = "https://fapi.binance.com"
+# =========================================================
+# AYARLAR
+# =========================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+LIVE_TRADING = False
+SYMBOL = "XAUUSD"
+
+HTF = mt5.TIMEFRAME_H4
+LTF = mt5.TIMEFRAME_M15
+DAY_TF = mt5.TIMEFRAME_D1
+
+HTF_BARS = 500
+LTF_BARS = 700
+DAY_BARS = 10
 
 CHECK_EVERY_SECONDS = 20
-STATE_FILE = "eth_superbot_pro_plus_state.json"
 
-HTTP_TIMEOUT = 15
-MAX_HTTP_RETRY = 3
+# Risk
+RISK_PER_TRADE = 0.01
+MIN_RR = 1.8
+PARTIAL_CLOSE_AT_TP1 = 0.50
+MOVE_SL_TO_BE_AFTER_TP1 = True
 
-# ---------------------------------------------------------
-# SIGNAL / LIFECYCLE
-# ---------------------------------------------------------
-MIN_SIGNAL_GAP_MINUTES = 25
-MAX_ACTIVE_SIGNAL_AGE_MINUTES = 180
-SIGNAL_TIMEOUT_MINUTES = 180
-MIN_PRICE_DISTANCE_PCT = 0.45
-REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
-SAME_DIRECTION_SCORE_BONUS = 2.0
+# EMA / RSI / ADX
+EMA_FAST = 20
+EMA_MID = 50
+EMA_SLOW = 200
+RSI_PERIOD = 14
+ADX_PERIOD = 14
+MIN_ADX = 18
 
-# ---------------------------------------------------------
-# THRESHOLDS
-# ---------------------------------------------------------
-LONG_SCORE_THRESHOLD = 9.25
-SHORT_SCORE_THRESHOLD = 9.25
-MIN_RR = 1.25
+# ATR
+ATR_PERIOD = 14
+ATR_SL_BUFFER = 0.25
+LEVEL_NEAR_ATR = 0.45
+LEVEL_MERGE_ATR = 0.35
+SWEEP_MIN_ATR = 0.18
+MAX_ENTRY_DISTANCE_ATR = 1.10
 
-# ---------------------------------------------------------
-# RISK
-# ---------------------------------------------------------
-ATR_SL_MULTIPLIER = 1.20
-ATR_TP1_MULTIPLIER = 1.50
-ATR_TP2_MULTIPLIER = 2.60
-ATR_TP3_MULTIPLIER = 3.60
+# Pivots
+PIVOT_LEFT = 3
+PIVOT_RIGHT = 3
+MAX_HTF_LEVEL_AGE = 220
 
-# ---------------------------------------------------------
-# BTC FILTER
-# ---------------------------------------------------------
-USE_BTC_FILTER = True
-BTC_15M_TREND_THRESHOLD = 0.12
-BTC_1H_TREND_THRESHOLD = 0.28
-BTC_4H_TREND_THRESHOLD = 0.75
-BTC_DUMP_BLOCK_PCT = -0.85
-BTC_PUMP_BLOCK_PCT = 0.85
+# Pin bar
+MIN_PIN_WICK_RATIO = 2.0
+MAX_BODY_TO_RANGE_FOR_PIN = 0.42
 
-# ---------------------------------------------------------
-# WHALE / FLOW
-# ---------------------------------------------------------
-ENABLE_WHALE_ALERTS = True
-WHALE_ALERT_COOLDOWN_MINUTES = 20
-LARGE_TRADE_NOTIONAL_USDT = 500000  # tek trade yaklaşık eşik
-AGGTRADE_LIMIT = 250
-OI_ALERT_THRESHOLD_PCT = 1.20
-TRADE_PRESSURE_DOMINANCE_PCT = 62.0
+# Spread
+MAX_SPREAD_DOLLAR = 0.60
 
-# ---------------------------------------------------------
-# NEWS / RISK
-# ---------------------------------------------------------
-ENABLE_NEWS_ALERTS = True
-NEWS_ALERT_COOLDOWN_MINUTES = 30
-NEWS_LOOKBACK_MINUTES = 120
+# Sessions UTC
+LONDON_START = 7
+LONDON_END = 16
+NEWYORK_START = 12
+NEWYORK_END = 21
 
-# Public RSS kaynakları
-NEWS_FEEDS = [
-    "https://cointelegraph.com/rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-]
+# Asian range (UTC)
+ASIA_START = 0
+ASIA_END = 6
 
-# Manüel yaklaşan event listesi
-# İstersen bunları güncellersin
-# UTC format: "YYYY-MM-DD HH:MM"
-UPCOMING_EVENTS = [
-    {"name": "US CPI", "time_utc": "2026-04-10 12:30", "impact": "HIGH"},
-    {"name": "FOMC", "time_utc": "2026-05-06 18:00", "impact": "HIGH"},
-    {"name": "PCE", "time_utc": "2026-04-30 12:30", "impact": "MEDIUM"},
-]
+# Session trap hours
+TRAP_LOOK_WINDOW_START = 6
+TRAP_LOOK_WINDOW_END = 15
 
-EVENT_PREALERT_HOURS = [24, 6, 1]
+# FVG
+MIN_FVG_ATR = 0.10
 
-NEWS_KEYWORDS_HIGH = [
-    "sec", "etf", "hack", "exploit", "liquidation", "lawsuit", "ban", "fed",
-    "fomc", "cpi", "pce", "rate", "interest rate", "war", "tariff",
-    "delist", "bankruptcy", "outage", "security breach", "approval", "rejection"
-]
+# Telegram
+TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "TELEGRAM_CHAT_ID"
 
-NEWS_KEYWORDS_CRYPTO = [
-    "bitcoin", "btc", "ethereum", "eth", "binance", "coinbase", "crypto",
-    "exchange", "stablecoin", "usdt", "usdc", "staking", "on-chain", "whale",
-    "futures", "open interest", "liquidation"
-]
+MAGIC = 440088
+
 
 # =========================================================
-# UTILS
+# YARDIMCI
 # =========================================================
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
+def send_telegram(msg):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        log(f"Telegram hata: {e}")
+
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except:
+        return default
+
+
 def now_utc():
     return datetime.now(timezone.utc)
 
-def now_local_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def utc_ts():
-    return int(now_utc().timestamp())
+def utc_hour():
+    return now_utc().hour
 
-def log(msg: str):
-    print(f"[{now_local_str()}] {msg}")
 
-def safe_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
+def in_main_sessions():
+    h = utc_hour()
+    return (LONDON_START <= h < LONDON_END) or (NEWYORK_START <= h < NEWYORK_END)
 
-def safe_int(x, default=None):
-    try:
-        return int(x)
-    except Exception:
-        return default
 
-def pct_change(a, b):
-    a = safe_float(a)
-    b = safe_float(b)
-    if a in (None, 0) or b is None:
-        return 0.0
-    return ((b - a) / a) * 100.0
+def in_trap_window():
+    h = utc_hour()
+    return TRAP_LOOK_WINDOW_START <= h < TRAP_LOOK_WINDOW_END
 
-def pct_diff(a, b):
-    a = safe_float(a)
-    b = safe_float(b)
-    if a in (None, 0) or b is None:
-        return 999.0
-    return abs(a - b) / a * 100.0
-
-def minutes_since(ts):
-    if not ts:
-        return 999999
-    return (utc_ts() - int(ts)) / 60.0
-
-def fmt_price(v):
-    try:
-        fv = float(v)
-        if fv >= 1000:
-            return f"{fv:,.2f}"
-        if fv >= 1:
-            return f"{fv:.2f}"
-        return f"{fv:.6f}"
-    except Exception:
-        return str(v)
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 # =========================================================
-# TELEGRAM
+# MT5
 # =========================================================
-def tg_send(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("ENV eksik: TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID")
-        return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }
+def init_mt5():
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize başarısız: {mt5.last_error()}")
 
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code == 200:
-            return True
-        log(f"Telegram hata: {r.status_code} | {r.text}")
-        return False
-    except Exception as e:
-        log(f"Telegram exception: {e}")
-        return False
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        raise RuntimeError(f"{SYMBOL} bulunamadı")
+    if not info.visible:
+        if not mt5.symbol_select(SYMBOL, True):
+            raise RuntimeError(f"{SYMBOL} seçilemedi")
 
-# =========================================================
-# HTTP
-# =========================================================
-def http_get_json(url: str, params=None):
-    last_err = None
-    for _ in range(MAX_HTTP_RETRY):
-        try:
-            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0)
-    raise last_err
+    log("MT5 hazır")
 
-def http_get_text(url: str):
-    last_err = None
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; ETHSuperBot/1.0)"
-    }
-    for _ in range(MAX_HTTP_RETRY):
-        try:
-            r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last_err = e
-            time.sleep(1.0)
-    raise last_err
 
-# =========================================================
-# MARKET DATA
-# =========================================================
-def get_base_url():
-    return FUTURES_BASE_URL if MARKET_TYPE == "futures" else SPOT_BASE_URL
-
-def get_klines(symbol: str, interval: str, limit: int = 200):
-    if MARKET_TYPE == "futures":
-        url = f"{FUTURES_BASE_URL}/fapi/v1/klines"
-    else:
-        url = f"{SPOT_BASE_URL}/api/v3/klines"
-
-    data = http_get_json(url, params={
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    })
-
-    candles = []
-    for k in data:
-        candles.append({
-            "open_time": int(k[0]),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": float(k[5]),
-            "close_time": int(k[6]),
-        })
-    return candles
-
-def get_mark_price(symbol: str):
-    if MARKET_TYPE == "futures":
-        url = f"{FUTURES_BASE_URL}/fapi/v1/premiumIndex"
-        data = http_get_json(url, params={"symbol": symbol})
-        return float(data["markPrice"])
-    else:
-        url = f"{SPOT_BASE_URL}/api/v3/ticker/price"
-        data = http_get_json(url, params={"symbol": symbol})
-        return float(data["price"])
-
-def get_agg_trades(symbol: str, limit: int = 250):
-    if MARKET_TYPE == "futures":
-        url = f"{FUTURES_BASE_URL}/fapi/v1/aggTrades"
-    else:
-        url = f"{SPOT_BASE_URL}/api/v3/aggTrades"
-
-    return http_get_json(url, params={
-        "symbol": symbol,
-        "limit": limit
-    })
-
-def get_open_interest(symbol: str):
-    if MARKET_TYPE != "futures":
+def get_rates(symbol, timeframe, count):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
         return None
-    url = f"{FUTURES_BASE_URL}/fapi/v1/openInterest"
-    data = http_get_json(url, params={"symbol": symbol})
-    return safe_float(data.get("openInterest"))
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    return df
 
-def get_open_interest_hist(symbol: str, period: str = "5m", limit: int = 30):
-    if MARKET_TYPE != "futures":
+
+# =========================================================
+# İNDİKATÖRLER
+# =========================================================
+
+def add_indicators(df):
+    df = df.copy()
+
+    df["ema20"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
+    df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(RSI_PERIOD).mean()
+    avg_loss = loss.rolling(RSI_PERIOD).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = df["tr"].rolling(ATR_PERIOD).mean()
+
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr_smooth = df["tr"].rolling(ADX_PERIOD).sum()
+    plus_di = 100 * pd.Series(plus_dm).rolling(ADX_PERIOD).sum() / tr_smooth
+    minus_di = 100 * pd.Series(minus_dm).rolling(ADX_PERIOD).sum() / tr_smooth
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    df["adx"] = dx.rolling(ADX_PERIOD).mean()
+
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["range"] = df["high"] - df["low"]
+    df["upper_wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+    df["lower_wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+
+    return df
+
+
+# =========================================================
+# LEVELS
+# =========================================================
+
+def is_pivot_high(df, i):
+    if i - PIVOT_LEFT < 0 or i + PIVOT_RIGHT >= len(df):
+        return False
+    h = df.iloc[i]["high"]
+    for j in range(i - PIVOT_LEFT, i + PIVOT_RIGHT + 1):
+        if j == i:
+            continue
+        if df.iloc[j]["high"] >= h:
+            return False
+    return True
+
+
+def is_pivot_low(df, i):
+    if i - PIVOT_LEFT < 0 or i + PIVOT_RIGHT >= len(df):
+        return False
+    l = df.iloc[i]["low"]
+    for j in range(i - PIVOT_LEFT, i + PIVOT_RIGHT + 1):
+        if j == i:
+            continue
+        if df.iloc[j]["low"] <= l:
+            return False
+    return True
+
+
+def merge_levels(levels, atr):
+    if not levels:
         return []
-    url = f"{FUTURES_BASE_URL}/futures/data/openInterestHist"
-    try:
-        data = http_get_json(url, params={
-            "symbol": symbol,
-            "period": period,
-            "limit": limit
-        })
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    levels = sorted(levels, key=lambda x: x["price"])
+    merged = [levels[0].copy()]
+    merge_dist = atr * LEVEL_MERGE_ATR
 
-# =========================================================
-# INDICATORS
-# =========================================================
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
-def ema_series(values, period):
-    if len(values) < period:
-        return [None] * len(values)
-
-    alpha = 2 / (period + 1)
-    result = [None] * len(values)
-
-    seed = sum(values[:period]) / period
-    result[period - 1] = seed
-    prev = seed
-
-    for i in range(period, len(values)):
-        prev = (values[i] - prev) * alpha + prev
-        result[i] = prev
-
-    return result
-
-def rsi_series(values, period=14):
-    if len(values) < period + 1:
-        return [None] * len(values)
-
-    gains = [0.0]
-    losses = [0.0]
-
-    for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(abs(min(diff, 0.0)))
-
-    avg_gain = sum(gains[1:period + 1]) / period
-    avg_loss = sum(losses[1:period + 1]) / period
-
-    result = [None] * len(values)
-
-    if avg_loss == 0:
-        result[period] = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        result[period] = 100 - (100 / (1 + rs))
-
-    for i in range(period + 1, len(values)):
-        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
-        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
-
-        if avg_loss == 0:
-            result[i] = 100.0
+    for lv in levels[1:]:
+        if abs(lv["price"] - merged[-1]["price"]) <= merge_dist:
+            total = merged[-1]["touches"] + lv["touches"]
+            merged[-1]["price"] = (
+                merged[-1]["price"] * merged[-1]["touches"] +
+                lv["price"] * lv["touches"]
+            ) / total
+            merged[-1]["touches"] = total
+            merged[-1]["last_index"] = max(merged[-1]["last_index"], lv["last_index"])
         else:
-            rs = avg_gain / avg_loss
-            result[i] = 100 - (100 / (1 + rs))
+            merged.append(lv.copy())
 
-    return result
+    return merged
 
-def macd_series(values, fast=12, slow=26, signal=9):
-    ema_fast = ema_series(values, fast)
-    ema_slow = ema_series(values, slow)
 
-    macd_line = [None] * len(values)
-    for i in range(len(values)):
-        if ema_fast[i] is not None and ema_slow[i] is not None:
-            macd_line[i] = ema_fast[i] - ema_slow[i]
+def build_htf_levels(df):
+    atr = safe_float(df.iloc[-1]["atr"])
+    if atr <= 0:
+        return [], []
 
-    valid = [x for x in macd_line if x is not None]
-    if len(valid) < signal:
-        return macd_line, [None] * len(values), [None] * len(values)
+    supports = []
+    resistances = []
 
-    signal_valid = ema_series(valid, signal)
-    signal_line = [None] * len(values)
+    start = max(PIVOT_LEFT, len(df) - MAX_HTF_LEVEL_AGE)
+    end = len(df) - PIVOT_RIGHT - 1
 
-    vi = 0
-    for i in range(len(values)):
-        if macd_line[i] is not None:
-            signal_line[i] = signal_valid[vi]
-            vi += 1
+    for i in range(start, end):
+        if is_pivot_low(df, i):
+            supports.append({"price": float(df.iloc[i]["low"]), "touches": 1, "last_index": i})
+        if is_pivot_high(df, i):
+            resistances.append({"price": float(df.iloc[i]["high"]), "touches": 1, "last_index": i})
 
-    hist = [None] * len(values)
-    for i in range(len(values)):
-        if macd_line[i] is not None and signal_line[i] is not None:
-            hist[i] = macd_line[i] - signal_line[i]
+    return merge_levels(supports, atr), merge_levels(resistances, atr)
 
-    return macd_line, signal_line, hist
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
+def nearest_level(levels, price):
+    if not levels:
         return None
+    return min(levels, key=lambda x: abs(x["price"] - price))
 
-    trs = []
-    for i in range(1, len(candles)):
-        h = candles[i]["high"]
-        l = candles[i]["low"]
-        pc = candles[i - 1]["close"]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
 
-    if len(trs) < period:
-        return None
+def near_level(price, level_price, atr):
+    return abs(price - level_price) <= atr * LEVEL_NEAR_ATR
 
-    return sum(trs[-period:]) / period
-
-def highest_high(candles, period):
-    if len(candles) < period:
-        return None
-    return max(x["high"] for x in candles[-period:])
-
-def lowest_low(candles, period):
-    if len(candles) < period:
-        return None
-    return min(x["low"] for x in candles[-period:])
 
 # =========================================================
-# STATE IO
+# TREND / PREMIUM-DISCOUNT
 # =========================================================
-def default_state():
-    return {
-        "last_signal": None,
-        "active_signal": None,
-        "signal_history": [],
-        "last_whale_alert_ts": 0,
-        "last_news_alert_ts": 0,
-        "sent_news_keys": [],
-        "sent_event_keys": []
-    }
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return default_state()
+def get_htf_trend(df):
+    last = df.iloc[-1]
 
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return default_state()
-            base = default_state()
-            base.update(data)
-            if not isinstance(base.get("sent_news_keys"), list):
-                base["sent_news_keys"] = []
-            if not isinstance(base.get("sent_event_keys"), list):
-                base["sent_event_keys"] = []
-            return base
-    except Exception as e:
-        log(f"State load exception: {e}")
-        return default_state()
+    bull = (
+        last["ema20"] > last["ema50"] > last["ema200"] and
+        last["close"] > last["ema20"] and
+        last["rsi"] >= 52
+    )
+    bear = (
+        last["ema20"] < last["ema50"] < last["ema200"] and
+        last["close"] < last["ema20"] and
+        last["rsi"] <= 48
+    )
 
-def save_state(state):
-    tmp_file = STATE_FILE + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_file, STATE_FILE)
+    if bull:
+        return "bull"
+    if bear:
+        return "bear"
+    return "sideways"
+
+
+def premium_discount_zone(htf_df, price):
+    swing_low = float(htf_df.iloc[-40:]["low"].min())
+    swing_high = float(htf_df.iloc[-40:]["high"].max())
+    eq = (swing_low + swing_high) / 2.0
+
+    if price < eq:
+        return "discount", swing_low, swing_high, eq
+    return "premium", swing_low, swing_high, eq
+
 
 # =========================================================
-# ANALYSIS HELPERS
+# CANDLE PATTERNS
 # =========================================================
-def analyze_timeframe(candles):
-    closed = candles[:-1] if len(candles) > 2 else candles[:]
-    if len(closed) < 60:
-        raise ValueError("Yeterli kapalı mum verisi yok")
 
-    closes = [c["close"] for c in closed]
-    highs = [c["high"] for c in closed]
-    lows = [c["low"] for c in closed]
-    volumes = [c["volume"] for c in closed]
+def bullish_pin_bar(row):
+    body = safe_float(row["body"])
+    rng = safe_float(row["range"])
+    uw = safe_float(row["upper_wick"])
+    lw = safe_float(row["lower_wick"])
+    if rng <= 0:
+        return False
+    if body / rng > MAX_BODY_TO_RANGE_FOR_PIN:
+        return False
+    return lw >= body * MIN_PIN_WICK_RATIO and uw <= body * 1.25
 
-    ema9 = ema_series(closes, 9)
-    ema21 = ema_series(closes, 21)
-    ema50 = ema_series(closes, 50)
-    rsi14 = rsi_series(closes, 14)
-    macd_line, macd_signal, macd_hist = macd_series(closes, 12, 26, 9)
 
-    return {
-        "close": closes[-1],
-        "prev_close": closes[-2] if len(closes) >= 2 else closes[-1],
-        "ema9": ema9[-1],
-        "ema21": ema21[-1],
-        "ema50": ema50[-1],
-        "rsi14": rsi14[-1],
-        "macd": macd_line[-1],
-        "macd_signal": macd_signal[-1],
-        "macd_hist": macd_hist[-1],
-        "atr14": atr(closed, 14),
-        "swing_high_20": highest_high(closed, 20),
-        "swing_low_20": lowest_low(closed, 20),
-        "vol_last": volumes[-1],
-        "vol_sma20": sma(volumes, 20),
-        "high_last": highs[-1],
-        "low_last": lows[-1],
-    }
+def bearish_pin_bar(row):
+    body = safe_float(row["body"])
+    rng = safe_float(row["range"])
+    uw = safe_float(row["upper_wick"])
+    lw = safe_float(row["lower_wick"])
+    if rng <= 0:
+        return False
+    if body / rng > MAX_BODY_TO_RANGE_FOR_PIN:
+        return False
+    return uw >= body * MIN_PIN_WICK_RATIO and lw <= body * 1.25
 
-def calc_tf_bias(tf):
-    score = 0
-    reasons = []
 
-    if tf["ema9"] and tf["ema21"] and tf["ema50"]:
-        if tf["ema9"] > tf["ema21"] > tf["ema50"]:
-            score += 2
-            reasons.append("ema bull stack")
-        elif tf["ema9"] < tf["ema21"] < tf["ema50"]:
-            score -= 2
-            reasons.append("ema bear stack")
-
-    if tf["close"] > (tf["ema21"] or 0):
-        score += 1
-        reasons.append("close > ema21")
-    else:
-        score -= 1
-        reasons.append("close < ema21")
-
-    if tf["rsi14"] is not None:
-        if tf["rsi14"] >= 56:
-            score += 1
-            reasons.append(f"rsi bullish {round(tf['rsi14'],2)}")
-        elif tf["rsi14"] <= 44:
-            score -= 1
-            reasons.append(f"rsi bearish {round(tf['rsi14'],2)}")
-
-    if tf["macd_hist"] is not None:
-        if tf["macd_hist"] > 0:
-            score += 1
-            reasons.append("macd hist positive")
-        elif tf["macd_hist"] < 0:
-            score -= 1
-            reasons.append("macd hist negative")
-
-    if score >= 2:
-        return "LONG", score, reasons
-    if score <= -2:
-        return "SHORT", score, reasons
-    return "NEUTRAL", score, reasons
-
-def get_btc_regime():
-    if not USE_BTC_FILTER:
+def detect_inside_bar(df):
+    if len(df) < 4:
+        return None
+    mb = df.iloc[-3]
+    ib = df.iloc[-2]
+    if ib["high"] < mb["high"] and ib["low"] > mb["low"]:
         return {
-            "bias": "NEUTRAL",
-            "score": 0.0,
-            "reason": "BTC filter disabled",
-            "block_new_signals": False
+            "mother_high": float(mb["high"]),
+            "mother_low": float(mb["low"]),
+            "inside_high": float(ib["high"]),
+            "inside_low": float(ib["low"]),
         }
+    return None
 
-    try:
-        btc_15m = analyze_timeframe(get_klines(BTC_SYMBOL, "15m", 200))
-        btc_1h = analyze_timeframe(get_klines(BTC_SYMBOL, "1h", 200))
-        btc_4h = analyze_timeframe(get_klines(BTC_SYMBOL, "4h", 200))
 
-        bias_15m, score_15m, _ = calc_tf_bias(btc_15m)
-        bias_1h, score_1h, _ = calc_tf_bias(btc_1h)
-        bias_4h, score_4h, _ = calc_tf_bias(btc_4h)
+def detect_inside_break(df):
+    st = detect_inside_bar(df)
+    if not st:
+        return None
+    last = df.iloc[-1]
+    if last["close"] > st["inside_high"]:
+        return {"direction": "long", "pattern": "inside_break_long", **st}
+    if last["close"] < st["inside_low"]:
+        return {"direction": "short", "pattern": "inside_break_short", **st}
+    return None
 
-        move_15m = pct_change(btc_15m["prev_close"], btc_15m["close"])
-        move_1h = pct_change(btc_1h["prev_close"], btc_1h["close"])
-        move_4h = pct_change(btc_4h["prev_close"], btc_4h["close"])
 
-        long_score = 0.0
-        short_score = 0.0
-        reasons = []
+def detect_fakey(df):
+    if len(df) < 5:
+        return None
 
-        if bias_15m == "LONG":
-            long_score += 1.3
-            reasons.append("btc 15m long")
-        elif bias_15m == "SHORT":
-            short_score += 1.3
-            reasons.append("btc 15m short")
+    mb = df.iloc[-4]
+    ib = df.iloc[-3]
+    fake = df.iloc[-2]
+    conf = df.iloc[-1]
+    atr = safe_float(conf["atr"])
+    if atr <= 0:
+        return None
 
-        if bias_1h == "LONG":
-            long_score += 1.8
-            reasons.append("btc 1h long")
-        elif bias_1h == "SHORT":
-            short_score += 1.8
-            reasons.append("btc 1h short")
+    if not (ib["high"] < mb["high"] and ib["low"] > mb["low"]):
+        return None
 
-        if bias_4h == "LONG":
-            long_score += 2.4
-            reasons.append("btc 4h long")
-        elif bias_4h == "SHORT":
-            short_score += 2.4
-            reasons.append("btc 4h short")
-
-        if move_15m >= BTC_15M_TREND_THRESHOLD:
-            long_score += 0.8
-            reasons.append(f"btc 15m move {round(move_15m,3)}%")
-        elif move_15m <= -BTC_15M_TREND_THRESHOLD:
-            short_score += 0.8
-            reasons.append(f"btc 15m move {round(move_15m,3)}%")
-
-        if move_1h >= BTC_1H_TREND_THRESHOLD:
-            long_score += 1.0
-            reasons.append(f"btc 1h move {round(move_1h,3)}%")
-        elif move_1h <= -BTC_1H_TREND_THRESHOLD:
-            short_score += 1.0
-            reasons.append(f"btc 1h move {round(move_1h,3)}%")
-
-        if move_4h >= BTC_4H_TREND_THRESHOLD:
-            long_score += 1.2
-            reasons.append(f"btc 4h move {round(move_4h,3)}%")
-        elif move_4h <= -BTC_4H_TREND_THRESHOLD:
-            short_score += 1.2
-            reasons.append(f"btc 4h move {round(move_4h,3)}%")
-
-        block_new_signals = False
-        if move_15m <= BTC_DUMP_BLOCK_PCT:
-            block_new_signals = True
-            reasons.append("btc dump block active")
-        elif move_15m >= BTC_PUMP_BLOCK_PCT:
-            block_new_signals = True
-            reasons.append("btc pump block active")
-
-        if long_score > short_score + 1.0:
-            bias = "LONG"
-            final_score = long_score
-        elif short_score > long_score + 1.0:
-            bias = "SHORT"
-            final_score = short_score
-        else:
-            bias = "NEUTRAL"
-            final_score = max(long_score, short_score)
-
-        return {
-            "bias": bias,
-            "score": round(final_score, 2),
-            "reason": " | ".join(reasons[:10]),
-            "block_new_signals": block_new_signals,
-            "move_15m": round(move_15m, 3),
-            "move_1h": round(move_1h, 3),
-            "move_4h": round(move_4h, 3),
-            "tf": {
-                "15m": btc_15m,
-                "1h": btc_1h,
-                "4h": btc_4h
-            }
-        }
-    except Exception as e:
-        return {
-            "bias": "NEUTRAL",
-            "score": 0.0,
-            "reason": f"BTC fail-open: {e}",
-            "block_new_signals": False
-        }
-
-def classify_swing(tf_name, tf):
-    score = 0
-    notes = []
-
-    if tf["ema21"] and tf["ema50"]:
-        if tf["close"] > tf["ema21"] > tf["ema50"]:
-            score += 2
-            notes.append("trend up")
-        elif tf["close"] < tf["ema21"] < tf["ema50"]:
-            score -= 2
-            notes.append("trend down")
-
-    if tf["rsi14"] is not None:
-        if 53 <= tf["rsi14"] <= 72:
-            score += 1
-            notes.append("rsi strong")
-        elif 28 <= tf["rsi14"] <= 47:
-            score -= 1
-            notes.append("rsi weak")
-
-    if tf["macd_hist"] is not None:
-        if tf["macd_hist"] > 0:
-            score += 1
-            notes.append("macd+")
-        elif tf["macd_hist"] < 0:
-            score -= 1
-            notes.append("macd-")
-
-    if tf["vol_last"] and tf["vol_sma20"]:
-        if tf["vol_last"] > tf["vol_sma20"] * 1.10:
-            if score > 0:
-                score += 1
-                notes.append("volume confirm up")
-            elif score < 0:
-                score -= 1
-                notes.append("volume confirm down")
-
-    if score >= 3:
-        verdict = "UYGUN"
-    elif score <= -3:
-        verdict = "UYGUN DEGIL"
-    else:
-        verdict = "TEMKINLI"
-
-    return {
-        "tf": tf_name,
-        "score": score,
-        "verdict": verdict,
-        "notes": notes[:5]
-    }
-
-# =========================================================
-# WHALE ANALYSIS
-# =========================================================
-def get_trade_pressure(symbol: str):
-    try:
-        trades = get_agg_trades(symbol, AGGTRADE_LIMIT)
-        if not isinstance(trades, list) or not trades:
+    if fake["high"] > ib["high"] and fake["close"] <= ib["high"]:
+        if (fake["high"] - ib["high"]) >= atr * SWEEP_MIN_ATR:
             return {
-                "dominant": "NEUTRAL",
-                "buy_notional": 0.0,
-                "sell_notional": 0.0,
-                "large_buy_count": 0,
-                "large_sell_count": 0,
-                "dominance_pct": 50.0
+                "direction": "short",
+                "pattern": "fakey_short_pin" if bearish_pin_bar(fake) else "fakey_short",
+                "mother_high": float(mb["high"]),
+                "mother_low": float(mb["low"]),
+                "inside_high": float(ib["high"]),
+                "inside_low": float(ib["low"]),
+                "fake_high": float(fake["high"]),
+                "fake_low": float(fake["low"]),
             }
 
-        buy_notional = 0.0
-        sell_notional = 0.0
-        large_buy_count = 0
-        large_sell_count = 0
+    if fake["low"] < ib["low"] and fake["close"] >= ib["low"]:
+        if (ib["low"] - fake["low"]) >= atr * SWEEP_MIN_ATR:
+            return {
+                "direction": "long",
+                "pattern": "fakey_long_pin" if bullish_pin_bar(fake) else "fakey_long",
+                "mother_high": float(mb["high"]),
+                "mother_low": float(mb["low"]),
+                "inside_high": float(ib["high"]),
+                "inside_low": float(ib["low"]),
+                "fake_high": float(fake["high"]),
+                "fake_low": float(fake["low"]),
+            }
 
-        for t in trades:
-            price = safe_float(t.get("p"))
-            qty = safe_float(t.get("q"))
-            is_buyer_maker = bool(t.get("m"))  # True ise satıcı agresif
-            if price is None or qty is None:
-                continue
-            notional = price * qty
+    return None
 
-            if is_buyer_maker:
-                sell_notional += notional
-                if notional >= LARGE_TRADE_NOTIONAL_USDT:
-                    large_sell_count += 1
-            else:
-                buy_notional += notional
-                if notional >= LARGE_TRADE_NOTIONAL_USDT:
-                    large_buy_count += 1
-
-        total = buy_notional + sell_notional
-        dominance_pct = (max(buy_notional, sell_notional) / total * 100.0) if total > 0 else 50.0
-
-        if total <= 0:
-            dominant = "NEUTRAL"
-        elif buy_notional > sell_notional and dominance_pct >= TRADE_PRESSURE_DOMINANCE_PCT:
-            dominant = "LONG"
-        elif sell_notional > buy_notional and dominance_pct >= TRADE_PRESSURE_DOMINANCE_PCT:
-            dominant = "SHORT"
-        else:
-            dominant = "NEUTRAL"
-
-        return {
-            "dominant": dominant,
-            "buy_notional": round(buy_notional, 2),
-            "sell_notional": round(sell_notional, 2),
-            "large_buy_count": large_buy_count,
-            "large_sell_count": large_sell_count,
-            "dominance_pct": round(dominance_pct, 2)
-        }
-    except Exception as e:
-        return {
-            "dominant": "NEUTRAL",
-            "buy_notional": 0.0,
-            "sell_notional": 0.0,
-            "large_buy_count": 0,
-            "large_sell_count": 0,
-            "dominance_pct": 50.0,
-            "error": str(e)
-        }
-
-def get_whale_bias(symbol: str):
-    result = {
-        "bias": "NEUTRAL",
-        "score": 0.0,
-        "reason": "no whale data"
-    }
-
-    try:
-        flow = get_trade_pressure(symbol)
-        score = 0.0
-        reasons = []
-
-        if flow["dominant"] == "LONG":
-            score += 1.8
-            reasons.append(f"trade pressure long {flow['dominance_pct']}%")
-            if flow["large_buy_count"] > flow["large_sell_count"]:
-                score += 0.8
-                reasons.append(f"large buys {flow['large_buy_count']}")
-        elif flow["dominant"] == "SHORT":
-            score -= 1.8
-            reasons.append(f"trade pressure short {flow['dominance_pct']}%")
-            if flow["large_sell_count"] > flow["large_buy_count"]:
-                score -= 0.8
-                reasons.append(f"large sells {flow['large_sell_count']}")
-
-        if MARKET_TYPE == "futures":
-            oi_hist = get_open_interest_hist(symbol, "5m", 12)
-            if len(oi_hist) >= 2:
-                prev_oi = safe_float(oi_hist[-2].get("sumOpenInterest"))
-                last_oi = safe_float(oi_hist[-1].get("sumOpenInterest"))
-                oi_chg = pct_change(prev_oi, last_oi)
-
-                mark_price = get_mark_price(symbol)
-                kl_5m = analyze_timeframe(get_klines(symbol, "5m", 120))
-                price_chg_5m = pct_change(kl_5m["prev_close"], kl_5m["close"])
-
-                if oi_chg >= OI_ALERT_THRESHOLD_PCT and price_chg_5m > 0:
-                    score += 1.6
-                    reasons.append(f"oi up {round(oi_chg,2)}% + price up")
-                elif oi_chg >= OI_ALERT_THRESHOLD_PCT and price_chg_5m < 0:
-                    score -= 1.6
-                    reasons.append(f"oi up {round(oi_chg,2)}% + price down")
-
-                if abs(oi_chg) >= OI_ALERT_THRESHOLD_PCT:
-                    reasons.append(f"oi delta {round(oi_chg,2)}% @ {fmt_price(mark_price)}")
-
-        if score >= 2.0:
-            result["bias"] = "LONG"
-        elif score <= -2.0:
-            result["bias"] = "SHORT"
-        else:
-            result["bias"] = "NEUTRAL"
-
-        result["score"] = round(abs(score), 2)
-        result["reason"] = " | ".join(reasons[:8]) if reasons else "flow mixed"
-
-        return result
-    except Exception as e:
-        result["reason"] = f"whale fail-open: {e}"
-        return result
-
-def maybe_send_whale_alert(state):
-    if not ENABLE_WHALE_ALERTS:
-        return
-
-    if minutes_since(state.get("last_whale_alert_ts")) < WHALE_ALERT_COOLDOWN_MINUTES:
-        return
-
-    whale = get_whale_bias(SYMBOL)
-    if whale["bias"] not in ("LONG", "SHORT"):
-        return
-
-    emoji = "🐋🟢" if whale["bias"] == "LONG" else "🐋🔴"
-    msg = (
-        f"{emoji} BALINA BASKI UYARISI\n"
-        f"Sembol: {SYMBOL}\n"
-        f"Yön: {whale['bias']}\n"
-        f"Güç: {whale['score']}\n"
-        f"Detay: {whale['reason']}\n"
-        f"Zaman: {now_local_str()}"
-    )
-    if tg_send(msg):
-        state["last_whale_alert_ts"] = utc_ts()
-        log(f"Whale alert gönderildi: {whale['bias']}")
 
 # =========================================================
-# NEWS / EVENT
+# PDH / PDL
 # =========================================================
-def parse_rss_items(feed_url: str):
-    items = []
-    try:
-        xml_text = http_get_text(feed_url)
-        root = ET.fromstring(xml_text)
 
-        for item in root.findall(".//item"):
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub_date = (item.findtext("pubDate") or "").strip()
-
-            items.append({
-                "title": title,
-                "link": link,
-                "pub_date": pub_date
-            })
-
-        # Atom fallback
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for entry in root.findall(".//atom:entry", ns):
-            title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
-            link_el = entry.find("atom:link", ns)
-            link = link_el.attrib.get("href", "").strip() if link_el is not None else ""
-            pub_date = (
-                entry.findtext("atom:updated", default="", namespaces=ns)
-                or entry.findtext("atom:published", default="", namespaces=ns)
-                or ""
-            ).strip()
-
-            if title:
-                items.append({
-                    "title": title,
-                    "link": link,
-                    "pub_date": pub_date
-                })
-
-    except Exception as e:
-        log(f"RSS parse hata: {feed_url} | {e}")
-
-    return items
-
-def news_item_key(item):
-    return normalize_text(f"{item.get('title','')}|{item.get('link','')}")
-
-def score_news_title(title: str):
-    txt = normalize_text(title)
-    score = 0
-    hits = []
-
-    for kw in NEWS_KEYWORDS_HIGH:
-        if kw in txt:
-            score += 3
-            hits.append(kw)
-
-    for kw in NEWS_KEYWORDS_CRYPTO:
-        if kw in txt:
-            score += 1
-            hits.append(kw)
-
-    if SYMBOL.replace("USDT", "").lower()[:3] in txt or "ethereum" in txt or "eth" in txt:
-        score += 2
-        hits.append("eth")
-
-    if "bitcoin" in txt or "btc" in txt:
-        score += 2
-        hits.append("btc")
-
-    if score >= 8:
-        level = "HIGH"
-    elif score >= 4:
-        level = "MEDIUM"
-    else:
-        level = "LOW"
-
-    return level, score, list(dict.fromkeys(hits))
-
-def detect_news_risk(state):
-    if not ENABLE_NEWS_ALERTS:
+def get_previous_day_levels(day_df):
+    if day_df is None or len(day_df) < 3:
         return None
-
-    fresh_candidates = []
-    known_keys = set(state.get("sent_news_keys", []))
-
-    for feed in NEWS_FEEDS:
-        items = parse_rss_items(feed)
-        for item in items[:15]:
-            title = item.get("title", "")
-            if not title:
-                continue
-
-            level, score, hits = score_news_title(title)
-            if level == "LOW":
-                continue
-
-            key = news_item_key(item)
-            if key in known_keys:
-                continue
-
-            fresh_candidates.append({
-                "title": title,
-                "link": item.get("link", ""),
-                "level": level,
-                "score": score,
-                "hits": hits,
-                "key": key
-            })
-
-    if not fresh_candidates:
-        return None
-
-    fresh_candidates.sort(key=lambda x: x["score"], reverse=True)
-    return fresh_candidates[0]
-
-def maybe_send_news_alert(state):
-    if not ENABLE_NEWS_ALERTS:
-        return
-
-    if minutes_since(state.get("last_news_alert_ts")) < NEWS_ALERT_COOLDOWN_MINUTES:
-        return
-
-    item = detect_news_risk(state)
-    if not item:
-        return
-
-    emoji = "📰🔴" if item["level"] == "HIGH" else "📰🟠"
-    msg = (
-        f"{emoji} KRIPTO HABER RISK UYARISI\n"
-        f"Seviye: {item['level']}\n"
-        f"Başlık: {item['title']}\n"
-        f"Anahtarlar: {', '.join(item['hits'][:8])}\n"
-        f"Link: {item['link'] or '-'}\n"
-        f"Yorum: Haber bazlı volatilite artabilir, işleme girmeden tekrar kontrol et.\n"
-        f"Zaman: {now_local_str()}"
-    )
-
-    if tg_send(msg):
-        state["last_news_alert_ts"] = utc_ts()
-        keys = state.get("sent_news_keys", [])
-        keys.append(item["key"])
-        state["sent_news_keys"] = keys[-100:]
-        log(f"News alert gönderildi: {item['title']}")
-
-def maybe_send_event_prealerts(state):
-    now = now_utc()
-    sent_keys = set(state.get("sent_event_keys", []))
-    new_keys = list(sent_keys)
-
-    for event in UPCOMING_EVENTS:
-        try:
-            event_dt = datetime.strptime(event["time_utc"], "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            delta_hours = (event_dt - now).total_seconds() / 3600.0
-
-            if delta_hours < 0:
-                continue
-
-            for h in EVENT_PREALERT_HOURS:
-                key = f"{event['name']}|{event['time_utc']}|{h}"
-                if key in sent_keys:
-                    continue
-
-                if 0 <= delta_hours <= h + 0.12 and delta_hours >= h - 0.35:
-                    msg = (
-                        f"⏰ MAKRO / EVENT RISK UYARISI\n"
-                        f"Etkinlik: {event['name']}\n"
-                        f"Etki: {event['impact']}\n"
-                        f"Kalan süre: ~{h} saat\n"
-                        f"Event zamanı (UTC): {event['time_utc']}\n"
-                        f"Yorum: Event öncesi spread ve volatilite artabilir.\n"
-                        f"Zaman: {now_local_str()}"
-                    )
-                    if tg_send(msg):
-                        new_keys.append(key)
-        except Exception as e:
-            log(f"Event prealert hata: {e}")
-
-    state["sent_event_keys"] = new_keys[-200:]
-
-# =========================================================
-# SIGNAL / MESSAGE HELPERS
-# =========================================================
-def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, extra=None):
+    prev = day_df.iloc[-2]
     return {
-        "direction": direction.upper(),
-        "entry": round(float(entry), 4),
-        "sl": round(float(sl), 4),
-        "tp1": round(float(tp1), 4),
-        "tp2": round(float(tp2), 4),
-        "tp3": round(float(tp3), 4),
-        "score": round(float(score), 2),
-        "strategy_tag": strategy_tag,
-        "reason": reason,
-        "extra": extra or {},
-        "created_ts": utc_ts(),
-        "updated_ts": utc_ts(),
-        "status": "OPEN"
+        "pdh": float(prev["high"]),
+        "pdl": float(prev["low"]),
+        "pdo": float(prev["open"]),
+        "pdc": float(prev["close"]),
     }
 
-def is_same_direction(a, b):
-    return bool(a and b and a.get("direction") == b.get("direction"))
 
-def is_opposite_direction(a, b):
-    return bool(a and b and a.get("direction") != b.get("direction"))
+# =========================================================
+# ASIAN RANGE / TRAP
+# =========================================================
 
-def entry_distance_pct(sig_a, sig_b):
-    if not sig_a or not sig_b:
-        return 999.0
-    return pct_diff(sig_a.get("entry"), sig_b.get("entry"))
+def get_today_ltf_df(ltf_df):
+    today = now_utc().date()
+    return ltf_df[ltf_df["time"].dt.date == today].copy()
 
-def build_ai_commentary(signal):
-    extra = signal.get("extra", {})
-    btc = extra.get("btc", {})
-    whale = extra.get("whale", {})
-    swing_1h = extra.get("swing_1h", {})
-    swing_2h = extra.get("swing_2h", {})
-    swing_4h = extra.get("swing_4h", {})
-    news_risk = extra.get("news_risk", "UNKNOWN")
 
-    direction = signal.get("direction", "UNKNOWN")
-    score = signal.get("score", 0)
-
-    parts = []
-
-    if direction == "LONG":
-        parts.append("Teknik yapı ağırlıklı olarak yukarı yönlü.")
-    else:
-        parts.append("Teknik yapı ağırlıklı olarak aşağı yönlü.")
-
-    if btc.get("bias") == direction:
-        parts.append("BTC ana rejimi işlemi destekliyor.")
-    elif btc.get("bias") in ("LONG", "SHORT") and btc.get("bias") != direction:
-        parts.append("BTC rejimi bu işleme tam destek vermiyor, temkin gerekli.")
-    else:
-        parts.append("BTC tarafı nötre yakın, ana destek zayıf.")
-
-    if whale.get("bias") == direction:
-        parts.append("Balina akışı aynı yöne baskı kuruyor.")
-    elif whale.get("bias") in ("LONG", "SHORT") and whale.get("bias") != direction:
-        parts.append("Balina akışı ters yönde, fake hareket riski var.")
-
-    swing_bits = []
-    for s in [swing_1h, swing_2h, swing_4h]:
-        if s:
-            swing_bits.append(f"{s['tf']}:{s['verdict']}")
-
-    if swing_bits:
-        parts.append("Swing görünümü " + ", ".join(swing_bits) + ".")
-
-    if news_risk == "HIGH":
-        parts.append("Haber riski yüksek; stop disiplini şart.")
-    elif news_risk == "MEDIUM":
-        parts.append("Haber tarafı orta riskli; girişte teyit önemli.")
-
-    if score >= 12:
-        parts.append("Setup güçlü.")
-    elif score >= 10:
-        parts.append("Setup alınabilir ama seçici olunmalı.")
-    else:
-        parts.append("Setup mevcut fakat agresif değil.")
-
-    return " ".join(parts)
-
-def format_signal_message(sig, current_price):
-    emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-    extra = sig.get("extra", {})
-    btc = extra.get("btc", {})
-    whale = extra.get("whale", {})
-    swing_1h = extra.get("swing_1h", {})
-    swing_2h = extra.get("swing_2h", {})
-    swing_4h = extra.get("swing_4h", {})
-    ai = extra.get("ai_commentary", "-")
-    news_risk = extra.get("news_risk", "UNKNOWN")
-
-    return (
-        f"{emoji} {SYMBOL} {sig['direction']} SINYAL\n"
-        f"Fiyat: {fmt_price(current_price)}\n"
-        f"Entry: {fmt_price(sig['entry'])}\n"
-        f"SL: {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}\n"
-        f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}\n"
-        f"Score: {sig['score']}\n"
-        f"Setup: {sig['strategy_tag']}\n"
-        f"BTC Bias: {btc.get('bias','NEUTRAL')} | {btc.get('reason','-')}\n"
-        f"Whale: {whale.get('bias','NEUTRAL')} | {whale.get('reason','-')}\n"
-        f"News Risk: {news_risk}\n"
-        f"1H Swing: {swing_1h.get('verdict','-')}\n"
-        f"2H Swing: {swing_2h.get('verdict','-')}\n"
-        f"4H Swing: {swing_4h.get('verdict','-')}\n"
-        f"AI Yorum: {ai}\n"
-        f"Neden: {sig['reason']}\n"
-        f"Zaman: {now_local_str()}"
-    )
-
-def format_close_message(sig, close_reason, close_price=None):
-    direction_emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-    reason_map = {
-        "SL_HIT": "Stop oldu",
-        "TP1_HIT": "TP1 görüldü",
-        "TP2_HIT": "TP2 görüldü",
-        "TP3_HIT": "TP3 görüldü",
-        "TIMEOUT": "Süre doldu",
-        "MAX_ACTIVE_AGE_EXCEEDED": "Maks aktif süre doldu",
-        "REVERSED_BY_STRONGER_SIGNAL": "Daha güçlü ters sinyal geldi",
+def get_asian_range(ltf_df):
+    today_df = get_today_ltf_df(ltf_df)
+    if today_df.empty:
+        return None
+    asia = today_df[(today_df["time"].dt.hour >= ASIA_START) & (today_df["time"].dt.hour < ASIA_END)]
+    if asia.empty:
+        return None
+    return {
+        "high": float(asia["high"].max()),
+        "low": float(asia["low"].min()),
     }
-    reason_text = reason_map.get(close_reason, close_reason)
 
-    body = (
-        f"✅ {SYMBOL} SINYAL KAPANDI\n"
-        f"Yön: {direction_emoji} {sig['direction']}\n"
-        f"Entry: {fmt_price(sig.get('entry'))}\n"
-        f"SL: {fmt_price(sig.get('sl'))}\n"
-        f"TP1: {fmt_price(sig.get('tp1'))}\n"
-        f"TP2: {fmt_price(sig.get('tp2'))}\n"
-        f"TP3: {fmt_price(sig.get('tp3'))}\n"
-        f"Kapanış nedeni: {reason_text}\n"
+
+def detect_session_trap(ltf_df, asian_range, pd_levels):
+    """
+    London/NY açılışına yakın:
+    - Asia high sweep + geri dönüş = short trap
+    - Asia low sweep + geri dönüş = long trap
+    - PDH/PDL sweep de ek teyit sayılır
+    """
+    if asian_range is None:
+        return None
+    if not in_trap_window():
+        return None
+
+    last = ltf_df.iloc[-1]
+    prev = ltf_df.iloc[-4:-1]
+    atr = safe_float(last["atr"])
+    if atr <= 0:
+        return None
+
+    asia_high = asian_range["high"]
+    asia_low = asian_range["low"]
+
+    pdh = pd_levels["pdh"] if pd_levels else None
+    pdl = pd_levels["pdl"] if pd_levels else None
+
+    # short trap
+    if last["high"] > asia_high and last["close"] < asia_high:
+        if (last["high"] - asia_high) >= atr * SWEEP_MIN_ATR:
+            extra = False
+            if pdh is not None and last["high"] > pdh and last["close"] < pdh:
+                extra = True
+            return {
+                "direction": "short",
+                "pattern": "session_trap_short_pdh" if extra else "session_trap_short",
+                "swept_level": max(asia_high, pdh if pdh else asia_high)
+            }
+
+    # long trap
+    if last["low"] < asia_low and last["close"] > asia_low:
+        if (asia_low - last["low"]) >= atr * SWEEP_MIN_ATR:
+            extra = False
+            if pdl is not None and last["low"] < pdl and last["close"] > pdl:
+                extra = True
+            return {
+                "direction": "long",
+                "pattern": "session_trap_long_pdl" if extra else "session_trap_long",
+                "swept_level": min(asia_low, pdl if pdl else asia_low)
+            }
+
+    return None
+
+
+# =========================================================
+# FVG
+# =========================================================
+
+def detect_recent_fvg(df):
+    """
+    Basit 3 mumluk FVG:
+    bullish: candle[-3].high < candle[-1].low
+    bearish: candle[-3].low > candle[-1].high
+    """
+    if len(df) < 5:
+        return None
+
+    a = df.iloc[-3]
+    b = df.iloc[-2]
+    c = df.iloc[-1]
+    atr = safe_float(c["atr"])
+    if atr <= 0:
+        return None
+
+    # bullish FVG
+    if a["high"] < c["low"]:
+        gap = c["low"] - a["high"]
+        if gap >= atr * MIN_FVG_ATR:
+            return {
+                "direction": "long",
+                "pattern": "bullish_fvg",
+                "low": float(a["high"]),
+                "high": float(c["low"]),
+            }
+
+    # bearish FVG
+    if a["low"] > c["high"]:
+        gap = a["low"] - c["high"]
+        if gap >= atr * MIN_FVG_ATR:
+            return {
+                "direction": "short",
+                "pattern": "bearish_fvg",
+                "low": float(c["high"]),
+                "high": float(a["low"]),
+            }
+
+    return None
+
+
+def price_in_fvg(price, fvg):
+    if not fvg:
+        return False
+    return fvg["low"] <= price <= fvg["high"]
+
+
+# =========================================================
+# BOS / CHoCH BENZERİ
+# =========================================================
+
+def recent_structure_points(df, lookback=25):
+    sub = df.iloc[-lookback:].copy()
+    highs = []
+    lows = []
+    for i in range(2, len(sub) - 2):
+        if sub.iloc[i]["high"] > sub.iloc[i-1]["high"] and sub.iloc[i]["high"] > sub.iloc[i+1]["high"]:
+            highs.append((sub.iloc[i]["time"], float(sub.iloc[i]["high"])))
+        if sub.iloc[i]["low"] < sub.iloc[i-1]["low"] and sub.iloc[i]["low"] < sub.iloc[i+1]["low"]:
+            lows.append((sub.iloc[i]["time"], float(sub.iloc[i]["low"])))
+    return highs, lows
+
+
+def detect_bos(df):
+    """
+    Basit kullanım:
+    - son kapanış son local high üstünde = bullish BOS
+    - son kapanış son local low altında = bearish BOS
+    """
+    if len(df) < 35:
+        return None
+
+    highs, lows = recent_structure_points(df, 30)
+    if not highs or not lows:
+        return None
+
+    last = df.iloc[-1]
+    recent_high = highs[-1][1]
+    recent_low = lows[-1][1]
+
+    if last["close"] > recent_high:
+        return {"direction": "long", "pattern": "bullish_bos", "level": recent_high}
+    if last["close"] < recent_low:
+        return {"direction": "short", "pattern": "bearish_bos", "level": recent_low}
+
+    return None
+
+
+def detect_choch_like(df):
+    """
+    Dönüşe yakın yapı:
+    - önce lower low sweep, sonra son birkaç mumun tepesini kırarsa bullish reversal
+    - önce higher high sweep, sonra son birkaç mumun dibini kırarsa bearish reversal
+    """
+    if len(df) < 12:
+        return None
+
+    last = df.iloc[-1]
+    prev = df.iloc[-6:-1]
+    atr = safe_float(last["atr"])
+    if atr <= 0:
+        return None
+
+    local_high = float(prev["high"].max())
+    local_low = float(prev["low"].min())
+
+    # bullish reversal
+    if last["close"] > local_high and prev.iloc[-1]["low"] < prev["low"].iloc[:-1].min():
+        return {"direction": "long", "pattern": "choch_like_long", "level": local_high}
+
+    # bearish reversal
+    if last["close"] < local_low and prev.iloc[-1]["high"] > prev["high"].iloc[:-1].max():
+        return {"direction": "short", "pattern": "choch_like_short", "level": local_low}
+
+    return None
+
+
+# =========================================================
+# KALİTE FİLTRELERİ
+# =========================================================
+
+def spread_ok():
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return False
+    return (tick.ask - tick.bid) <= MAX_SPREAD_DOLLAR
+
+
+def ltf_quality_ok(df, direction):
+    last = df.iloc[-1]
+
+    if safe_float(last["adx"]) < MIN_ADX:
+        return False
+
+    if direction == "long":
+        if safe_float(last["rsi"]) < 49:
+            return False
+    else:
+        if safe_float(last["rsi"]) > 51:
+            return False
+
+    return True
+
+
+# =========================================================
+# SİNYAL BİRLEŞTİRME
+# =========================================================
+
+def build_signal(htf_df, ltf_df, day_df):
+    htf_last = htf_df.iloc[-1]
+    ltf_last = ltf_df.iloc[-1]
+
+    htf_atr = safe_float(htf_last["atr"])
+    ltf_atr = safe_float(ltf_last["atr"])
+    if htf_atr <= 0 or ltf_atr <= 0:
+        return None
+
+    price = float(ltf_last["close"])
+    htf_trend = get_htf_trend(htf_df)
+    zone, swing_low, swing_high, eq = premium_discount_zone(htf_df, price)
+
+    supports, resistances = build_htf_levels(htf_df)
+    ns = nearest_level(supports, price)
+    nr = nearest_level(resistances, price)
+    near_support = ns is not None and near_level(price, ns["price"], htf_atr)
+    near_resistance = nr is not None and near_level(price, nr["price"], htf_atr)
+
+    pd_levels = get_previous_day_levels(day_df)
+    asian_range = get_asian_range(ltf_df)
+
+    inside_break = detect_inside_break(ltf_df)
+    fakey = detect_fakey(ltf_df)
+    trap = detect_session_trap(ltf_df, asian_range, pd_levels)
+    bos = detect_bos(ltf_df)
+    choch = detect_choch_like(ltf_df)
+    fvg = detect_recent_fvg(ltf_df)
+
+    # PDH/PDL yakınlık
+    near_pdh = pd_levels is not None and abs(price - pd_levels["pdh"]) <= htf_atr * LEVEL_NEAR_ATR
+    near_pdl = pd_levels is not None and abs(price - pd_levels["pdl"]) <= htf_atr * LEVEL_NEAR_ATR
+
+    # LONG SENARYOSU
+    long_reasons = []
+    long_stop_candidates = []
+
+    if near_support:
+        long_reasons.append("htf_support")
+        long_stop_candidates.append(ns["price"] - ltf_atr * ATR_SL_BUFFER)
+
+    if near_pdl:
+        long_reasons.append("pdl")
+        long_stop_candidates.append(pd_levels["pdl"] - ltf_atr * ATR_SL_BUFFER)
+
+    if zone == "discount":
+        long_reasons.append("discount_zone")
+
+    if fakey and fakey["direction"] == "long":
+        long_reasons.append(fakey["pattern"])
+        long_stop_candidates.append(min(fakey["fake_low"], fakey["mother_low"]) - ltf_atr * ATR_SL_BUFFER)
+
+    if inside_break and inside_break["direction"] == "long":
+        long_reasons.append(inside_break["pattern"])
+        long_stop_candidates.append(inside_break["inside_low"] - ltf_atr * ATR_SL_BUFFER)
+
+    if trap and trap["direction"] == "long":
+        long_reasons.append(trap["pattern"])
+        long_stop_candidates.append(float(ltf_last["low"]) - ltf_atr * ATR_SL_BUFFER)
+
+    if choch and choch["direction"] == "long":
+        long_reasons.append(choch["pattern"])
+
+    if bos and bos["direction"] == "long":
+        long_reasons.append(bos["pattern"])
+
+    if fvg and fvg["direction"] == "long" and price_in_fvg(price, fvg):
+        long_reasons.append("in_bullish_fvg")
+
+    if (
+        ltf_quality_ok(ltf_df, "long")
+        and len(long_reasons) >= 3
+        and ("htf_support" in long_reasons or "pdl" in long_reasons or zone == "discount")
+        and (("fakey_long" in " ".join(long_reasons)) or ("inside_break_long" in " ".join(long_reasons)) or ("session_trap_long" in " ".join(long_reasons)) or ("choch_like_long" in " ".join(long_reasons)))
+        and htf_trend in ["bull", "sideways"]
+    ):
+        stop = min(long_stop_candidates) if long_stop_candidates else price - ltf_atr
+        risk = price - stop
+        if risk > 0 and risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
+            tp1 = price + risk * 1.0
+            tp2 = price + risk * 2.2
+            rr = (tp2 - price) / risk
+            if rr >= MIN_RR:
+                return {
+                    "direction": "long",
+                    "pattern": " + ".join(long_reasons[:5]),
+                    "entry": price,
+                    "stop": stop,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "htf_trend": htf_trend,
+                    "zone": zone,
+                    "level_type": "support/pdl",
+                    "level_price": ns["price"] if ns else (pd_levels["pdl"] if pd_levels else price),
+                    "atr": ltf_atr
+                }
+
+    # SHORT SENARYOSU
+    short_reasons = []
+    short_stop_candidates = []
+
+    if near_resistance:
+        short_reasons.append("htf_resistance")
+        short_stop_candidates.append(nr["price"] + ltf_atr * ATR_SL_BUFFER)
+
+    if near_pdh:
+        short_reasons.append("pdh")
+        short_stop_candidates.append(pd_levels["pdh"] + ltf_atr * ATR_SL_BUFFER)
+
+    if zone == "premium":
+        short_reasons.append("premium_zone")
+
+    if fakey and fakey["direction"] == "short":
+        short_reasons.append(fakey["pattern"])
+        short_stop_candidates.append(max(fakey["fake_high"], fakey["mother_high"]) + ltf_atr * ATR_SL_BUFFER)
+
+    if inside_break and inside_break["direction"] == "short":
+        short_reasons.append(inside_break["pattern"])
+        short_stop_candidates.append(inside_break["inside_high"] + ltf_atr * ATR_SL_BUFFER)
+
+    if trap and trap["direction"] == "short":
+        short_reasons.append(trap["pattern"])
+        short_stop_candidates.append(float(ltf_last["high"]) + ltf_atr * ATR_SL_BUFFER)
+
+    if choch and choch["direction"] == "short":
+        short_reasons.append(choch["pattern"])
+
+    if bos and bos["direction"] == "short":
+        short_reasons.append(bos["pattern"])
+
+    if fvg and fvg["direction"] == "short" and price_in_fvg(price, fvg):
+        short_reasons.append("in_bearish_fvg")
+
+    if (
+        ltf_quality_ok(ltf_df, "short")
+        and len(short_reasons) >= 3
+        and ("htf_resistance" in short_reasons or "pdh" in short_reasons or zone == "premium")
+        and (("fakey_short" in " ".join(short_reasons)) or ("inside_break_short" in " ".join(short_reasons)) or ("session_trap_short" in " ".join(short_reasons)) or ("choch_like_short" in " ".join(short_reasons)))
+        and htf_trend in ["bear", "sideways"]
+    ):
+        stop = max(short_stop_candidates) if short_stop_candidates else price + ltf_atr
+        risk = stop - price
+        if risk > 0 and risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
+            tp1 = price - risk * 1.0
+            tp2 = price - risk * 2.2
+            rr = (price - tp2) / risk
+            if rr >= MIN_RR:
+                return {
+                    "direction": "short",
+                    "pattern": " + ".join(short_reasons[:5]),
+                    "entry": price,
+                    "stop": stop,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "htf_trend": htf_trend,
+                    "zone": zone,
+                    "level_type": "resistance/pdh",
+                    "level_price": nr["price"] if nr else (pd_levels["pdh"] if pd_levels else price),
+                    "atr": ltf_atr
+                }
+
+    return None
+
+
+# =========================================================
+# LOT / EMİR
+# =========================================================
+
+def get_account_balance():
+    acc = mt5.account_info()
+    if acc is None:
+        return 0.0
+    return safe_float(acc.balance)
+
+
+def get_symbol_info():
+    info = mt5.symbol_info(SYMBOL)
+    if info is None:
+        raise RuntimeError(f"{SYMBOL} info yok")
+    return info
+
+
+def calc_lot(entry, stop):
+    info = get_symbol_info()
+    balance = get_account_balance()
+    if balance <= 0:
+        return 0.0
+
+    risk_money = balance * RISK_PER_TRADE
+    sl_distance = abs(entry - stop)
+    if sl_distance <= 0:
+        return 0.0
+
+    tick_value = safe_float(info.trade_tick_value)
+    tick_size = safe_float(info.trade_tick_size)
+    volume_step = safe_float(info.volume_step, 0.01)
+    min_lot = safe_float(info.volume_min, 0.01)
+    max_lot = safe_float(info.volume_max, 100.0)
+
+    if tick_value <= 0 or tick_size <= 0:
+        return 0.0
+
+    loss_per_lot = (sl_distance / tick_size) * tick_value
+    if loss_per_lot <= 0:
+        return 0.0
+
+    lot = risk_money / loss_per_lot
+    lot = math.floor(lot / volume_step) * volume_step
+    lot = max(min_lot, min(lot, max_lot))
+    return round(lot, 2)
+
+
+def current_positions():
+    positions = mt5.positions_get(symbol=SYMBOL)
+    return [] if positions is None else list(positions)
+
+
+def direction_position_exists(direction):
+    positions = current_positions()
+    if direction == "long":
+        return any(p.type == mt5.POSITION_TYPE_BUY for p in positions)
+    return any(p.type == mt5.POSITION_TYPE_SELL for p in positions)
+
+
+def send_market_order(signal):
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        return None
+
+    direction = signal["direction"]
+    entry = tick.ask if direction == "long" else tick.bid
+    stop = signal["stop"]
+    tp2 = signal["tp2"]
+
+    lot = calc_lot(entry, stop)
+    if lot <= 0:
+        log("Lot hesaplanamadı")
+        return None
+
+    order_type = mt5.ORDER_TYPE_BUY if direction == "long" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if direction == "long" else tick.bid
+
+    msg = (
+        f"🚨 XAUUSD V2 SİNYAL\n"
+        f"Yön: {direction}\n"
+        f"Pattern: {signal['pattern']}\n"
+        f"HTF Trend: {signal['htf_trend']}\n"
+        f"Zone: {signal['zone']}\n"
+        f"Seviye: {signal['level_type']} @ {signal['level_price']:.2f}\n"
+        f"Entry: {price:.2f}\n"
+        f"SL: {stop:.2f}\n"
+        f"TP1: {signal['tp1']:.2f}\n"
+        f"TP2: {tp2:.2f}\n"
+        f"Lot: {lot}"
     )
+    log(msg)
+    send_telegram(msg)
 
-    if close_price is not None:
-        body += f"Kapanış fiyatı: {fmt_price(close_price)}\n"
+    if not LIVE_TRADING:
+        log("Dry run mod")
+        return {"dry_run": True}
 
-    body += f"İlk score: {sig.get('score')}\nZaman: {now_local_str()}"
-    return body
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": lot,
+        "type": order_type,
+        "price": price,
+        "sl": stop,
+        "tp": tp2,
+        "deviation": 20,
+        "magic": MAGIC,
+        "comment": "XAUUSD_V2_PRO",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        return None
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        err = f"Emir reddedildi retcode={result.retcode}"
+        log(err)
+        send_telegram(err)
+        return None
+
+    ok = f"✅ XAUUSD V2 emir açıldı ticket={result.order} lot={lot}"
+    log(ok)
+    send_telegram(ok)
+    return result
+
 
 # =========================================================
-# ACTIVE SIGNAL MGMT
+# POZİSYON YÖNETİMİ
 # =========================================================
-def close_active_signal(state, close_reason, current_price=None, notify_telegram=True):
-    active = state.get("active_signal")
-    if not active:
+
+def modify_position_sl_tp(ticket, new_sl=None, new_tp=None):
+    pos = mt5.positions_get(ticket=ticket)
+    if pos is None or len(pos) == 0:
+        return False
+    p = pos[0]
+
+    request = {
+        "action": mt5.TRADE_ACTION_SLTP,
+        "position": p.ticket,
+        "symbol": p.symbol,
+        "sl": p.sl if new_sl is None else new_sl,
+        "tp": p.tp if new_tp is None else new_tp,
+        "magic": MAGIC,
+    }
+
+    result = mt5.order_send(request)
+    return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+
+def partial_close(ticket, volume):
+    pos = mt5.positions_get(ticket=ticket)
+    if pos is None or len(pos) == 0:
+        return False
+    p = pos[0]
+
+    tick = mt5.symbol_info_tick(p.symbol)
+    if tick is None:
+        return False
+
+    close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": p.symbol,
+        "volume": volume,
+        "type": close_type,
+        "position": p.ticket,
+        "price": price,
+        "deviation": 20,
+        "magic": MAGIC,
+        "comment": "partial_close",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    result = mt5.order_send(request)
+    return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+
+def manage_positions():
+    positions = current_positions()
+    if not positions:
         return
 
-    active["status"] = "CLOSED"
-    active["close_reason"] = close_reason
-    active["closed_ts"] = utc_ts()
+    for p in positions:
+        if p.symbol != SYMBOL:
+            continue
 
-    if current_price is not None:
-        active["close_price"] = round(float(current_price), 4)
+        entry = safe_float(p.price_open)
+        sl = safe_float(p.sl)
+        volume = safe_float(p.volume)
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick is None:
+            continue
 
-    if notify_telegram:
-        tg_send(format_close_message(active, close_reason, current_price))
+        current_price = tick.bid if p.type == mt5.POSITION_TYPE_BUY else tick.ask
+        risk = abs(entry - sl)
+        if risk <= 0:
+            continue
 
-    state["signal_history"].append(active)
-    state["signal_history"] = state["signal_history"][-300:]
-    state["active_signal"] = None
-    log(f"Aktif sinyal kapatildi: {close_reason}")
+        if p.type == mt5.POSITION_TYPE_BUY:
+            tp1 = entry + risk * 1.0
+            if current_price >= tp1:
+                partial_vol = round(volume * PARTIAL_CLOSE_AT_TP1, 2)
+                if partial_vol > 0 and partial_vol < volume:
+                    partial_close(p.ticket, partial_vol)
+                if MOVE_SL_TO_BE_AFTER_TP1:
+                    modify_position_sl_tp(p.ticket, new_sl=entry)
 
-def is_tp1_hit(signal, current_price):
-    if not signal:
-        return False
-    direction = signal["direction"]
-    tp1 = safe_float(signal.get("tp1"))
-    cp = safe_float(current_price)
-    if tp1 is None or cp is None:
-        return False
-    return cp >= tp1 if direction == "LONG" else cp <= tp1
+        else:
+            tp1 = entry - risk * 1.0
+            if current_price <= tp1:
+                partial_vol = round(volume * PARTIAL_CLOSE_AT_TP1, 2)
+                if partial_vol > 0 and partial_vol < volume:
+                    partial_close(p.ticket, partial_vol)
+                if MOVE_SL_TO_BE_AFTER_TP1:
+                    modify_position_sl_tp(p.ticket, new_sl=entry)
 
-def is_tp2_hit(signal, current_price):
-    if not signal:
-        return False
-    direction = signal["direction"]
-    tp2 = safe_float(signal.get("tp2"))
-    cp = safe_float(current_price)
-    if tp2 is None or cp is None:
-        return False
-    return cp >= tp2 if direction == "LONG" else cp <= tp2
 
-def is_tp3_hit(signal, current_price):
-    if not signal:
-        return False
-    direction = signal["direction"]
-    tp3 = safe_float(signal.get("tp3"))
-    cp = safe_float(current_price)
-    if tp3 is None or cp is None:
-        return False
-    return cp >= tp3 if direction == "LONG" else cp <= tp3
+# =========================================================
+# BAR KONTROL
+# =========================================================
 
-def is_sl_hit(signal, current_price):
-    if not signal:
-        return False
-    direction = signal["direction"]
-    sl = safe_float(signal.get("sl"))
-    cp = safe_float(current_price)
-    if sl is None or cp is None:
-        return False
-    return cp <= sl if direction == "LONG" else cp >= sl
+last_bar_time = None
 
-def is_expired(signal):
-    if not signal:
+def is_new_ltf_bar(df):
+    global last_bar_time
+    t = df.iloc[-1]["time"]
+    if last_bar_time is None:
+        last_bar_time = t
         return True
-    return minutes_since(signal.get("created_ts")) >= SIGNAL_TIMEOUT_MINUTES
-
-def refresh_active_signal_if_needed(state, current_price):
-    active = state.get("active_signal")
-    if not active:
-        return
-
-    if is_sl_hit(active, current_price):
-        close_active_signal(state, "SL_HIT", current_price, notify_telegram=True)
-        return
-
-    if is_tp3_hit(active, current_price):
-        close_active_signal(state, "TP3_HIT", current_price, notify_telegram=True)
-        return
-
-    if is_tp2_hit(active, current_price):
-        close_active_signal(state, "TP2_HIT", current_price, notify_telegram=True)
-        return
-
-    if is_tp1_hit(active, current_price):
-        close_active_signal(state, "TP1_HIT", current_price, notify_telegram=True)
-        return
-
-    if is_expired(active):
-        close_active_signal(state, "TIMEOUT", current_price, notify_telegram=True)
-        return
-
-def recent_gap_blocked(state, new_signal):
-    last_signal = state.get("last_signal")
-    if not last_signal:
-        return False
-
-    mins = minutes_since(last_signal.get("created_ts"))
-    if mins >= MIN_SIGNAL_GAP_MINUTES:
-        return False
-
-    if is_same_direction(last_signal, new_signal):
-        dist = entry_distance_pct(last_signal, new_signal)
-        if dist < MIN_PRICE_DISTANCE_PCT:
-            return True
-
+    if t != last_bar_time:
+        last_bar_time = t
+        return True
     return False
 
-def should_send_signal(state, new_signal, current_price):
-    refresh_active_signal_if_needed(state, current_price)
-    active = state.get("active_signal")
-
-    if not active:
-        if recent_gap_blocked(state, new_signal):
-            return False, "RECENT_DUPLICATE_GAP"
-        return True, "NO_ACTIVE_SIGNAL"
-
-    active_age = minutes_since(active.get("created_ts"))
-    if active_age >= MAX_ACTIVE_SIGNAL_AGE_MINUTES:
-        close_active_signal(state, "MAX_ACTIVE_AGE_EXCEEDED", current_price, notify_telegram=True)
-        if recent_gap_blocked(state, new_signal):
-            return False, "RECENT_DUPLICATE_GAP"
-        return True, "ACTIVE_TOO_OLD"
-
-    if is_opposite_direction(active, new_signal):
-        active_score = safe_float(active.get("score"), 0.0)
-        new_score = safe_float(new_signal.get("score"), 0.0)
-
-        if new_score >= active_score + REVERSE_SIGNAL_STRENGTH_BONUS:
-            close_active_signal(state, "REVERSED_BY_STRONGER_SIGNAL", current_price, notify_telegram=True)
-            return True, "OPPOSITE_STRONG_SIGNAL"
-
-        return False, "OPPOSITE_SIGNAL_NOT_STRONG_ENOUGH"
-
-    dist_pct = entry_distance_pct(active, new_signal)
-    if dist_pct >= MIN_PRICE_DISTANCE_PCT:
-        return True, "SAME_DIRECTION_NEW_ZONE"
-
-    active_score = safe_float(active.get("score"), 0.0)
-    new_score = safe_float(new_signal.get("score"), 0.0)
-    if new_score >= active_score + SAME_DIRECTION_SCORE_BONUS:
-        return True, "SAME_DIRECTION_MUCH_STRONGER"
-
-    return False, "SIMILAR_ACTIVE_SIGNAL_STILL_OPEN"
-
-def register_sent_signal(state, sent_signal):
-    sent_signal["created_ts"] = utc_ts()
-    sent_signal["updated_ts"] = utc_ts()
-    sent_signal["status"] = "OPEN"
-    state["active_signal"] = sent_signal
-    state["last_signal"] = sent_signal
 
 # =========================================================
-# CORE SIGNAL ENGINE
+# ANA ÇALIŞMA
 # =========================================================
-def build_trade_signal():
-    candles_15m = get_klines(SYMBOL, "15m", 200)
-    candles_5m = get_klines(SYMBOL, "5m", 200)
-    candles_1h = get_klines(SYMBOL, "1h", 200)
-    candles_2h = get_klines(SYMBOL, "2h", 200)
-    candles_4h = get_klines(SYMBOL, "4h", 200)
 
-    tf15 = analyze_timeframe(candles_15m)
-    tf5 = analyze_timeframe(candles_5m)
-    tf1h = analyze_timeframe(candles_1h)
-    tf2h = analyze_timeframe(candles_2h)
-    tf4h = analyze_timeframe(candles_4h)
-
-    current_price = tf5["close"]
-    btc = get_btc_regime()
-    whale = get_whale_bias(SYMBOL)
-
-    swing_1h = classify_swing("1H", tf1h)
-    swing_2h = classify_swing("2H", tf2h)
-    swing_4h = classify_swing("4H", tf4h)
-
-    long_score = 0.0
-    short_score = 0.0
-    reasons_long = []
-    reasons_short = []
-
-    # -----------------------------------------------------
-    # 15m trend
-    # -----------------------------------------------------
-    if tf15["ema9"] and tf15["ema21"] and tf15["ema50"]:
-        if tf15["ema9"] > tf15["ema21"] > tf15["ema50"]:
-            long_score += 3.0
-            reasons_long.append("15m ema bull stack")
-        if tf15["ema9"] < tf15["ema21"] < tf15["ema50"]:
-            short_score += 3.0
-            reasons_short.append("15m ema bear stack")
-
-    if tf15["close"] > (tf15["ema21"] or 0):
-        long_score += 1.5
-        reasons_long.append("15m close > ema21")
-    else:
-        short_score += 1.5
-        reasons_short.append("15m close < ema21")
-
-    if tf15["rsi14"] is not None:
-        if 52 <= tf15["rsi14"] <= 72:
-            long_score += 1.5
-            reasons_long.append(f"15m rsi strong {round(tf15['rsi14'], 2)}")
-        if 28 <= tf15["rsi14"] <= 48:
-            short_score += 1.5
-            reasons_short.append(f"15m rsi weak {round(tf15['rsi14'], 2)}")
-
-    if tf15["macd_hist"] is not None:
-        if tf15["macd_hist"] > 0:
-            long_score += 1.25
-            reasons_long.append("15m macd hist > 0")
-        if tf15["macd_hist"] < 0:
-            short_score += 1.25
-            reasons_short.append("15m macd hist < 0")
-
-    # -----------------------------------------------------
-    # 1h stronger filter
-    # -----------------------------------------------------
-    if tf1h["ema21"] and tf1h["ema50"]:
-        if tf1h["close"] > tf1h["ema21"] and tf1h["ema21"] > tf1h["ema50"]:
-            long_score += 1.5
-            reasons_long.append("1h strong long trend")
-        if tf1h["close"] < tf1h["ema21"] and tf1h["ema21"] < tf1h["ema50"]:
-            short_score += 1.5
-            reasons_short.append("1h strong short trend")
-
-    if tf1h["rsi14"] is not None:
-        if tf1h["rsi14"] >= 52:
-            long_score += 0.5
-            reasons_long.append(f"1h rsi bullish {round(tf1h['rsi14'], 2)}")
-        elif tf1h["rsi14"] <= 48:
-            short_score += 0.5
-            reasons_short.append(f"1h rsi bearish {round(tf1h['rsi14'], 2)}")
-
-    # -----------------------------------------------------
-    # 2h / 4h swing alignment
-    # -----------------------------------------------------
-    if swing_2h["verdict"] == "UYGUN":
-        long_score += 0.75
-        reasons_long.append("2h swing aligned")
-    elif swing_2h["verdict"] == "UYGUN DEGIL":
-        short_score += 0.75
-        reasons_short.append("2h swing aligned")
-
-    if swing_4h["verdict"] == "UYGUN":
-        long_score += 1.1
-        reasons_long.append("4h swing aligned")
-    elif swing_4h["verdict"] == "UYGUN DEGIL":
-        short_score += 1.1
-        reasons_short.append("4h swing aligned")
-
-    # -----------------------------------------------------
-    # BTC directional filter
-    # -----------------------------------------------------
-    if btc["block_new_signals"]:
-        return None, current_price, "BTC_VOLATILITY_BLOCK"
-
-    if btc["bias"] == "LONG":
-        long_score += 1.2
-        short_score -= 0.8
-        reasons_long.append("btc supports long")
-        reasons_short.append("btc against short")
-    elif btc["bias"] == "SHORT":
-        short_score += 1.2
-        long_score -= 0.8
-        reasons_short.append("btc supports short")
-        reasons_long.append("btc against long")
-    else:
-        long_score -= 0.2
-        short_score -= 0.2
-
-    # -----------------------------------------------------
-    # Whale directional effect
-    # -----------------------------------------------------
-    if whale["bias"] == "LONG":
-        long_score += 1.0
-        reasons_long.append("whale flow long")
-    elif whale["bias"] == "SHORT":
-        short_score += 1.0
-        reasons_short.append("whale flow short")
-
-    # -----------------------------------------------------
-    # 5m entry
-    # -----------------------------------------------------
-    long_entry_ok = False
-    short_entry_ok = False
-
-    if tf5["ema9"] and tf5["ema21"] and tf5["ema50"]:
-        if (
-            current_price > tf5["ema21"] and
-            tf5["ema9"] >= tf5["ema21"] and
-            tf5["ema21"] >= tf5["ema50"] and
-            tf5["rsi14"] is not None and 48 <= tf5["rsi14"] <= 68 and
-            tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] >= tf5["macd_signal"]
-        ):
-            long_score += 3.0
-            reasons_long.append("5m entry aligned")
-            long_entry_ok = True
-
-        if (
-            current_price < tf5["ema21"] and
-            tf5["ema9"] <= tf5["ema21"] and
-            tf5["ema21"] <= tf5["ema50"] and
-            tf5["rsi14"] is not None and 32 <= tf5["rsi14"] <= 52 and
-            tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] <= tf5["macd_signal"]
-        ):
-            short_score += 3.0
-            reasons_short.append("5m entry aligned")
-            short_entry_ok = True
-
-    # -----------------------------------------------------
-    # Volume confirm
-    # -----------------------------------------------------
-    if tf5["vol_last"] and tf5["vol_sma20"]:
-        if tf5["vol_last"] > tf5["vol_sma20"] * 1.08:
-            if long_entry_ok:
-                long_score += 1.0
-                reasons_long.append("5m vol strong confirm")
-            if short_entry_ok:
-                short_score += 1.0
-                reasons_short.append("5m vol strong confirm")
-
-    atr5 = tf5["atr14"]
-    if atr5 is None or atr5 <= 0:
-        return None, current_price, "ATR_UNAVAILABLE"
-
-    # Haber riski notu
-    news_item = detect_news_risk(load_state())
-    if news_item:
-        if news_item["level"] == "HIGH":
-            long_score -= 0.75
-            short_score -= 0.75
-            news_risk = "HIGH"
-        else:
-            long_score -= 0.35
-            short_score -= 0.35
-            news_risk = "MEDIUM"
-    else:
-        news_risk = "LOW"
-
-    candidates = []
-
-    # -----------------------------------------------------
-    # LONG candidate
-    # -----------------------------------------------------
-    if long_entry_ok and long_score >= LONG_SCORE_THRESHOLD:
-        entry = current_price
-        sl = entry - (atr5 * ATR_SL_MULTIPLIER)
-        tp1 = entry + (atr5 * ATR_TP1_MULTIPLIER)
-        tp2 = entry + (atr5 * ATR_TP2_MULTIPLIER)
-        tp3 = entry + (atr5 * ATR_TP3_MULTIPLIER)
-
-        risk = entry - sl
-        reward = tp1 - entry
-        rr = reward / risk if risk > 0 else 0
-
-        if rr >= MIN_RR:
-            extra = {
-                "btc": btc,
-                "whale": whale,
-                "swing_1h": swing_1h,
-                "swing_2h": swing_2h,
-                "swing_4h": swing_4h,
-                "news_risk": news_risk
-            }
-            payload = build_signal_payload(
-                direction="LONG",
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                score=long_score,
-                strategy_tag="ETH_15M_TREND_5M_ENTRY_PRO_PLUS_AI",
-                reason=" | ".join(reasons_long[:10]) + f" | BTC:{btc['bias']} | Whale:{whale['bias']} | RR:{round(rr, 2)}",
-                extra=extra
-            )
-            payload["extra"]["ai_commentary"] = build_ai_commentary(payload)
-            candidates.append(payload)
-
-    # -----------------------------------------------------
-    # SHORT candidate
-    # -----------------------------------------------------
-    if short_entry_ok and short_score >= SHORT_SCORE_THRESHOLD:
-        entry = current_price
-        sl = entry + (atr5 * ATR_SL_MULTIPLIER)
-        tp1 = entry - (atr5 * ATR_TP1_MULTIPLIER)
-        tp2 = entry - (atr5 * ATR_TP2_MULTIPLIER)
-        tp3 = entry - (atr5 * ATR_TP3_MULTIPLIER)
-
-        risk = sl - entry
-        reward = entry - tp1
-        rr = reward / risk if risk > 0 else 0
-
-        if rr >= MIN_RR:
-            extra = {
-                "btc": btc,
-                "whale": whale,
-                "swing_1h": swing_1h,
-                "swing_2h": swing_2h,
-                "swing_4h": swing_4h,
-                "news_risk": news_risk
-            }
-            payload = build_signal_payload(
-                direction="SHORT",
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                score=short_score,
-                strategy_tag="ETH_15M_TREND_5M_ENTRY_PRO_PLUS_AI",
-                reason=" | ".join(reasons_short[:10]) + f" | BTC:{btc['bias']} | Whale:{whale['bias']} | RR:{round(rr, 2)}",
-                extra=extra
-            )
-            payload["extra"]["ai_commentary"] = build_ai_commentary(payload)
-            candidates.append(payload)
-
-    if not candidates:
-        return None, current_price, f"NO_VALID_SIGNAL | long={round(long_score,2)} short={round(short_score,2)}"
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
-    return best, current_price, f"SIGNAL_READY | long={round(long_score,2)} short={round(short_score,2)}"
-
-# =========================================================
-# MAIN LOOP
-# =========================================================
 def run_once():
-    state = load_state()
+    if not in_main_sessions():
+        log("Ana session dışında")
+        return
 
-    try:
-        maybe_send_event_prealerts(state)
-        maybe_send_news_alert(state)
-        maybe_send_whale_alert(state)
+    if not spread_ok():
+        log("Spread yüksek")
+        return
 
-        signal, current_price, info = build_trade_signal()
-        refresh_active_signal_if_needed(state, current_price)
+    htf_df = get_rates(SYMBOL, HTF, HTF_BARS)
+    ltf_df = get_rates(SYMBOL, LTF, LTF_BARS)
+    day_df = get_rates(SYMBOL, DAY_TF, DAY_BARS)
 
-        if signal:
-            can_send, reason_code = should_send_signal(
-                state=state,
-                new_signal=signal,
-                current_price=current_price
-            )
+    if htf_df is None or ltf_df is None or day_df is None:
+        log("Veri alınamadı")
+        return
 
-            if can_send:
-                message = format_signal_message(signal, current_price)
-                sent = tg_send(message)
-                if sent:
-                    register_sent_signal(state, signal)
-                    log(
-                        f"YENI SINYAL GONDERILDI | {signal['direction']} | "
-                        f"entry={signal['entry']} sl={signal['sl']} tp1={signal['tp1']} tp2={signal['tp2']} tp3={signal['tp3']} "
-                        f"score={signal['score']} | {reason_code}"
-                    )
-                else:
-                    log("Sinyal bulundu ama Telegram gönderimi başarısız.")
-            else:
-                log(
-                    f"Sinyal var ama gönderilmedi: {reason_code} | "
-                    f"Yön={signal['direction']} Entry={signal['entry']} Score={signal['score']}"
-                )
-        else:
-            log(f"Yeni valid sinyal yok. {info}")
+    htf_df = add_indicators(htf_df)
+    ltf_df = add_indicators(ltf_df)
+    day_df = add_indicators(day_df)
 
-    except Exception as e:
-        log(f"Analiz exception: {e}")
-        traceback.print_exc()
+    manage_positions()
 
-    try:
-        save_state(state)
-    except Exception as e:
-        log(f"State save exception: {e}")
+    if not is_new_ltf_bar(ltf_df):
+        return
 
-def send_startup_message():
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        tg_send(
-            f"🤖 ETH SuperBot PRO+ AI başladı.\n"
-            f"Zaman: {now_local_str()}\n"
-            f"Sembol: {SYMBOL}\n"
-            f"Market: {MARKET_TYPE}\n"
-            f"Özellikler: BTC regime | Whale alerts | AI yorum | 1H-2H-4H swing | News risk"
-        )
-        log("Başlangıç mesajı gönderildi.")
-    else:
-        log("Başlangıç mesajı gönderilemedi: Telegram ENV eksik.")
+    signal = build_signal(htf_df, ltf_df, day_df)
+    if signal is None:
+        log("Sinyal yok")
+        return
+
+    if direction_position_exists(signal["direction"]):
+        log(f"Aynı yönde açık pozisyon var: {signal['direction']}")
+        return
+
+    send_market_order(signal)
+
 
 def main():
-    log("Bot başlıyor...")
-    send_startup_message()
+    init_mt5()
+    log("XAUUSD V2 PRO başladı")
+    send_telegram("🤖 XAUUSD V2 PRO başlatıldı")
 
     while True:
-        log("Analiz yapılıyor...")
-        run_once()
+        try:
+            run_once()
+        except Exception as e:
+            err = f"HATA: {e}\n{traceback.format_exc()}"
+            log(err)
+            send_telegram(err)
         time.sleep(CHECK_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
