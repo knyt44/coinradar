@@ -1,29 +1,4 @@
-# =========================
-# DOSYA: bot.py
-# =========================
 # -*- coding: utf-8 -*-
-"""
-XAUUSD SIGNAL BOT - GITHUB ACTIONS + OANDA + TELEGRAM
------------------------------------------------------
-Amaç:
-- XAUUSD için sinyal üretmek
-- H4 trend + M15 entry mantığı
-- Destek/direnç + inside bar + fakey + sweep + PDH/PDL
-- Telegram'a mesaj atmak
-- İşlem açmaz, sadece sinyal gönderir
-
-GEREKEN GITHUB SECRETS:
-- OANDA_API_KEY
-- OANDA_ACCOUNT_ID
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
-- OANDA_BASE_URL
-
-NOT:
-- OANDA instrument adı hesap tipine göre değişebilir.
-- Varsayılan: XAU_USD
-"""
-
 import os
 import json
 import traceback
@@ -33,26 +8,24 @@ import requests
 import pandas as pd
 import numpy as np
 
-
 # =========================================================
 # CONFIG
 # =========================================================
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "").strip()
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-OANDA_BASE_URL = os.getenv("OANDA_BASE_URL", "https://api-fxpractice.oanda.com").strip()
-INSTRUMENT = os.getenv("OANDA_INSTRUMENT", "XAU_USD").strip()
+SYMBOL = os.getenv("SYMBOL", "XAU/USD").strip()
+TIMEZONE = os.getenv("MARKET_TIMEZONE", "UTC").strip()
 
-HTF_GRANULARITY = "H4"
-LTF_GRANULARITY = "M15"
-DAY_GRANULARITY = "D"
+HTF_INTERVAL = "4h"
+LTF_INTERVAL = "15min"
+DAY_INTERVAL = "1day"
 
-HTF_COUNT = 300
-LTF_COUNT = 500
-DAY_COUNT = 10
+HTF_OUTPUTSIZE = 300
+LTF_OUTPUTSIZE = 500
+DAY_OUTPUTSIZE = 30
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -88,7 +61,6 @@ TRAP_LOOK_WINDOW_START = 6
 TRAP_LOOK_WINDOW_END = 15
 
 STATE_FILE = "signal_state.json"
-
 
 # =========================================================
 # HELPERS
@@ -127,24 +99,14 @@ def in_trap_window():
 
 def ensure_env():
     missing = []
-    if not OANDA_API_KEY:
-        missing.append("OANDA_API_KEY")
-    if not OANDA_ACCOUNT_ID:
-        missing.append("OANDA_ACCOUNT_ID")
+    if not TWELVE_DATA_API_KEY:
+        missing.append("TWELVE_DATA_API_KEY")
     if not TELEGRAM_BOT_TOKEN:
         missing.append("TELEGRAM_BOT_TOKEN")
     if not TELEGRAM_CHAT_ID:
         missing.append("TELEGRAM_CHAT_ID")
-
     if missing:
         raise RuntimeError(f"Eksik environment/secrets: {', '.join(missing)}")
-
-
-def oanda_headers():
-    return {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
 
 # =========================================================
@@ -152,10 +114,6 @@ def oanda_headers():
 # =========================================================
 
 def send_telegram(msg: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram secrets eksik.")
-        return False
-
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         resp = requests.post(
@@ -163,13 +121,10 @@ def send_telegram(msg: str) -> bool:
             json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=20
         )
-
         log(f"Telegram status: {resp.status_code}")
-        log(f"Telegram response: {resp.text}")
-
+        log(f"Telegram response: {resp.text[:400]}")
         if resp.status_code != 200:
             return False
-
         data = resp.json()
         return bool(data.get("ok", False))
     except Exception as e:
@@ -178,70 +133,51 @@ def send_telegram(msg: str) -> bool:
 
 
 # =========================================================
-# OANDA DATA
+# TWELVE DATA
 # =========================================================
 
-def fetch_candles(instrument: str, granularity: str, count: int) -> pd.DataFrame:
-    url = f"{OANDA_BASE_URL}/v3/instruments/{instrument}/candles"
+def fetch_twelve_data(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
+    url = "https://api.twelvedata.com/time_series"
     params = {
-        "granularity": granularity,
-        "count": count,
-        "price": "M"
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "timezone": TIMEZONE,
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+        "order": "ASC",
     }
 
-    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=30)
-    log(f"OANDA candles status [{granularity}]: {resp.status_code}")
+    resp = requests.get(url, params=params, timeout=30)
+    log(f"Twelve Data [{interval}] status: {resp.status_code}")
     log(resp.text[:500])
 
     if resp.status_code != 200:
-        raise RuntimeError(f"OANDA candle fetch failed [{granularity}]: {resp.status_code} {resp.text}")
+        raise RuntimeError(f"Twelve Data HTTP hata: {resp.status_code}")
 
     data = resp.json()
-    candles = data.get("candles", [])
-    rows = []
+    if "status" in data and data["status"] == "error":
+        raise RuntimeError(f"Twelve Data API hata: {data}")
 
-    for c in candles:
-        if not c.get("complete", False):
-            continue
-        mid = c.get("mid", {})
+    values = data.get("values")
+    if not values:
+        raise RuntimeError(f"Twelve Data veri yok: {data}")
+
+    rows = []
+    for x in values:
         rows.append({
-            "time": pd.to_datetime(c["time"], utc=True),
-            "open": safe_float(mid.get("o")),
-            "high": safe_float(mid.get("h")),
-            "low": safe_float(mid.get("l")),
-            "close": safe_float(mid.get("c")),
-            "volume": safe_float(c.get("volume"))
+            "time": pd.to_datetime(x["datetime"], utc=True),
+            "open": safe_float(x["open"]),
+            "high": safe_float(x["high"]),
+            "low": safe_float(x["low"]),
+            "close": safe_float(x["close"]),
+            "volume": safe_float(x.get("volume"))
         })
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise RuntimeError(f"Boş candle verisi [{granularity}]")
+        raise RuntimeError("Boş dataframe döndü")
     return df
-
-
-def fetch_latest_price(instrument: str) -> float:
-    url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    params = {"instruments": instrument}
-    resp = requests.get(url, headers=oanda_headers(), params=params, timeout=20)
-
-    log(f"OANDA pricing status: {resp.status_code}")
-    log(resp.text[:500])
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"OANDA pricing failed: {resp.status_code} {resp.text}")
-
-    data = resp.json()
-    prices = data.get("prices", [])
-    if not prices:
-        raise RuntimeError("Fiyat verisi yok")
-
-    p = prices[0]
-    bids = p.get("bids", [])
-    asks = p.get("asks", [])
-    bid = safe_float(bids[0]["price"]) if bids else 0.0
-    ask = safe_float(asks[0]["price"]) if asks else 0.0
-    mid = (bid + ask) / 2.0 if bid and ask else 0.0
-    return mid
 
 
 # =========================================================
@@ -453,7 +389,6 @@ def detect_inside_break(df: pd.DataFrame):
     if not st:
         return None
     last = df.iloc[-1]
-
     if last["close"] > st["inside_high"]:
         return {"direction": "long", "pattern": "inside_break_long", **st}
     if last["close"] < st["inside_low"]:
@@ -633,7 +568,7 @@ def detect_choch_like(df: pd.DataFrame):
 
 
 # =========================================================
-# QUALITY / SIGNAL
+# SIGNAL
 # =========================================================
 
 def ltf_quality_ok(df: pd.DataFrame, direction: str) -> bool:
@@ -643,13 +578,8 @@ def ltf_quality_ok(df: pd.DataFrame, direction: str) -> bool:
         return False
 
     if direction == "long":
-        if safe_float(last["rsi"]) < 49:
-            return False
-    else:
-        if safe_float(last["rsi"]) > 51:
-            return False
-
-    return True
+        return safe_float(last["rsi"]) >= 49
+    return safe_float(last["rsi"]) <= 51
 
 
 def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFrame):
@@ -663,7 +593,7 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
 
     price = float(ltf_last["close"])
     htf_trend = get_htf_trend(htf_df)
-    zone, swing_low, swing_high, eq = premium_discount_zone(htf_df, price)
+    zone, *_ = premium_discount_zone(htf_df, price)
 
     supports, resistances = build_htf_levels(htf_df)
     ns = nearest_level(supports, price)
@@ -689,29 +619,22 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
     if near_support:
         long_reasons.append("htf_support")
         long_stop_candidates.append(ns["price"] - ltf_atr * ATR_SL_BUFFER)
-
     if near_pdl:
         long_reasons.append("pdl")
         long_stop_candidates.append(pd_levels["pdl"] - ltf_atr * ATR_SL_BUFFER)
-
     if zone == "discount":
         long_reasons.append("discount_zone")
-
     if fakey and fakey["direction"] == "long":
         long_reasons.append(fakey["pattern"])
         long_stop_candidates.append(min(fakey["fake_low"], fakey["mother_low"]) - ltf_atr * ATR_SL_BUFFER)
-
     if inside_break and inside_break["direction"] == "long":
         long_reasons.append(inside_break["pattern"])
         long_stop_candidates.append(inside_break["inside_low"] - ltf_atr * ATR_SL_BUFFER)
-
     if trap and trap["direction"] == "long":
         long_reasons.append(trap["pattern"])
         long_stop_candidates.append(float(ltf_last["low"]) - ltf_atr * ATR_SL_BUFFER)
-
     if choch and choch["direction"] == "long":
         long_reasons.append(choch["pattern"])
-
     if bos and bos["direction"] == "long":
         long_reasons.append(bos["pattern"])
 
@@ -719,18 +642,13 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
         ltf_quality_ok(ltf_df, "long")
         and len(long_reasons) >= 3
         and ("htf_support" in long_reasons or "pdl" in long_reasons or zone == "discount")
-        and (
-            ("fakey_long" in " ".join(long_reasons)) or
-            ("inside_break_long" in " ".join(long_reasons)) or
-            ("session_trap_long" in " ".join(long_reasons)) or
-            ("choch_like_long" in " ".join(long_reasons))
-        )
+        and any(k in " ".join(long_reasons) for k in ["fakey_long", "inside_break_long", "session_trap_long", "choch_like_long"])
         and htf_trend in ["bull", "sideways"]
     ):
         stop = min(long_stop_candidates) if long_stop_candidates else price - ltf_atr
         risk = price - stop
         if risk > 0 and risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
-            tp1 = price + risk * 1.0
+            tp1 = price + risk
             tp2 = price + risk * 2.2
             rr = (tp2 - price) / risk
             if rr >= MIN_RR:
@@ -754,29 +672,22 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
     if near_resistance:
         short_reasons.append("htf_resistance")
         short_stop_candidates.append(nr["price"] + ltf_atr * ATR_SL_BUFFER)
-
     if near_pdh:
         short_reasons.append("pdh")
         short_stop_candidates.append(pd_levels["pdh"] + ltf_atr * ATR_SL_BUFFER)
-
     if zone == "premium":
         short_reasons.append("premium_zone")
-
     if fakey and fakey["direction"] == "short":
         short_reasons.append(fakey["pattern"])
         short_stop_candidates.append(max(fakey["fake_high"], fakey["mother_high"]) + ltf_atr * ATR_SL_BUFFER)
-
     if inside_break and inside_break["direction"] == "short":
         short_reasons.append(inside_break["pattern"])
         short_stop_candidates.append(inside_break["inside_high"] + ltf_atr * ATR_SL_BUFFER)
-
     if trap and trap["direction"] == "short":
         short_reasons.append(trap["pattern"])
         short_stop_candidates.append(float(ltf_last["high"]) + ltf_atr * ATR_SL_BUFFER)
-
     if choch and choch["direction"] == "short":
         short_reasons.append(choch["pattern"])
-
     if bos and bos["direction"] == "short":
         short_reasons.append(bos["pattern"])
 
@@ -784,18 +695,13 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
         ltf_quality_ok(ltf_df, "short")
         and len(short_reasons) >= 3
         and ("htf_resistance" in short_reasons or "pdh" in short_reasons or zone == "premium")
-        and (
-            ("fakey_short" in " ".join(short_reasons)) or
-            ("inside_break_short" in " ".join(short_reasons)) or
-            ("session_trap_short" in " ".join(short_reasons)) or
-            ("choch_like_short" in " ".join(short_reasons))
-        )
+        and any(k in " ".join(short_reasons) for k in ["fakey_short", "inside_break_short", "session_trap_short", "choch_like_short"])
         and htf_trend in ["bear", "sideways"]
     ):
         stop = max(short_stop_candidates) if short_stop_candidates else price + ltf_atr
         risk = stop - price
         if risk > 0 and risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
-            tp1 = price - risk * 1.0
+            tp1 = price - risk
             tp2 = price - risk * 2.2
             rr = (price - tp2) / risk
             if rr >= MIN_RR:
@@ -846,40 +752,31 @@ def make_signal_key(signal, ltf_df):
 
 def run():
     ensure_env()
+    log("Bot başladı")
+    send_telegram("🤖 XAU/USD Signal Bot başlatıldı")
 
-    log("Bot başladı.")
-    send_telegram("🤖 XAUUSD Signal Bot başlatıldı.")
-
-    if not in_main_sessions():
-        log("Ana seans dışında. Yine de veri kontrol edilecek.")
-
-    htf_df = fetch_candles(INSTRUMENT, HTF_GRANULARITY, HTF_COUNT)
-    ltf_df = fetch_candles(INSTRUMENT, LTF_GRANULARITY, LTF_COUNT)
-    day_df = fetch_candles(INSTRUMENT, DAY_GRANULARITY, DAY_COUNT)
-
-    htf_df = add_indicators(htf_df)
-    ltf_df = add_indicators(ltf_df)
-    day_df = add_indicators(day_df)
+    htf_df = add_indicators(fetch_twelve_data(SYMBOL, HTF_INTERVAL, HTF_OUTPUTSIZE))
+    ltf_df = add_indicators(fetch_twelve_data(SYMBOL, LTF_INTERVAL, LTF_OUTPUTSIZE))
+    day_df = add_indicators(fetch_twelve_data(SYMBOL, DAY_INTERVAL, DAY_OUTPUTSIZE))
 
     signal = build_signal(htf_df, ltf_df, day_df)
+
     if signal is None:
-        log("Sinyal yok.")
-        send_telegram("ℹ️ XAUUSD: uygun sinyal yok.")
+        log("Sinyal yok")
+        send_telegram("ℹ️ XAU/USD: uygun sinyal yok")
         return
 
     state = load_state()
     key = make_signal_key(signal, ltf_df)
-    last_key = state.get("last_signal_key")
-
-    if key == last_key:
-        log("Aynı sinyal daha önce gönderilmiş.")
+    if key == state.get("last_signal_key"):
+        log("Aynı sinyal daha önce gönderilmiş")
         return
 
     state["last_signal_key"] = key
     save_state(state)
 
     msg = (
-        f"🚨 XAUUSD SİNYAL\n"
+        f"🚨 XAU/USD SİNYAL\n"
         f"Yön: {signal['direction'].upper()}\n"
         f"Pattern: {signal['pattern']}\n"
         f"HTF Trend: {signal['htf_trend']}\n"
@@ -890,12 +787,10 @@ def run():
         f"TP1: {signal['tp1']:.2f}\n"
         f"TP2: {signal['tp2']:.2f}\n"
         f"ATR: {signal['atr']:.2f}\n"
-        f"Enstrüman: {INSTRUMENT}"
+        f"Sembol: {SYMBOL}"
     )
-
     log(msg)
-    ok = send_telegram(msg)
-    log(f"Telegram gönderim sonucu: {ok}")
+    send_telegram(msg)
 
 
 if __name__ == "__main__":
@@ -909,64 +804,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
-# =========================
-# DOSYA: requirements.txt
-# =========================
-# Bu kısmı ayrı dosyaya kaydet:
-# pandas
-# numpy
-# requests
-
-
-# =========================
-# DOSYA: .github/workflows/xau-signal-bot.yml
-# =========================
-# Bu kısmı ayrı dosyaya kaydet:
-#
-# name: XAUUSD Signal Bot
-#
-# on:
-#   workflow_dispatch:
-#   schedule:
-#     - cron: "*/15 * * * *"
-#
-# jobs:
-#   run-bot:
-#     runs-on: ubuntu-latest
-#
-#     permissions:
-#       contents: write
-#
-#     steps:
-#       - name: Repo çek
-#         uses: actions/checkout@v4
-#
-#       - name: Python kur
-#         uses: actions/setup-python@v5
-#         with:
-#           python-version: "3.11"
-#
-#       - name: Paketleri kur
-#         run: |
-#           python -m pip install --upgrade pip
-#           pip install -r requirements.txt
-#
-#       - name: Botu çalıştır
-#         env:
-#           OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
-#           OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
-#           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-#           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-#           OANDA_BASE_URL: ${{ secrets.OANDA_BASE_URL }}
-#           OANDA_INSTRUMENT: XAU_USD
-#         run: python bot.py
-#
-#       - name: State dosyasını commit et
-#         run: |
-#           git config user.name "github-actions[bot]"
-#           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-#           git add signal_state.json || true
-#           git diff --cached --quiet || git commit -m "Update signal state"
-#           git push || true
