@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import time
 import traceback
 from datetime import datetime, timezone
 
@@ -24,12 +25,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SYMBOL = os.getenv("SYMBOL", "XAU/USD").strip()
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "Europe/London").strip()
 
-HTF_INTERVAL = "4h"
-LTF_INTERVAL = "15min"
+TREND_INTERVAL = "4h"
+SETUP_INTERVAL = "1h"
+CONFIRM_INTERVAL = "30min"
 DAY_INTERVAL = "1day"
 
-HTF_OUTPUTSIZE = 300
-LTF_OUTPUTSIZE = 500
+TREND_OUTPUTSIZE = 300
+SETUP_OUTPUTSIZE = 400
+CONFIRM_OUTPUTSIZE = 400
 DAY_OUTPUTSIZE = 60
 
 EMA_FAST = 20
@@ -39,9 +42,10 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-MIN_ADX = 14
-MIN_RR = 1.35
-MIN_SIGNAL_SCORE = 4.2
+MIN_ADX_1H = 16
+MIN_ADX_30M = 14
+MIN_RR = 1.30
+MIN_SIGNAL_SCORE = 5.0
 
 PIVOT_LEFT = 3
 PIVOT_RIGHT = 3
@@ -51,20 +55,12 @@ LEVEL_NEAR_ATR = 0.70
 LEVEL_MERGE_ATR = 0.40
 SWEEP_MIN_ATR = 0.15
 ATR_SL_BUFFER = 0.22
-MAX_ENTRY_DISTANCE_ATR = 1.50
+MAX_ENTRY_DISTANCE_ATR = 1.60
 
 MIN_PIN_WICK_RATIO = 2.0
 MAX_BODY_TO_RANGE_FOR_PIN = 0.45
 
-ASIA_START = 0
-ASIA_END = 6
-LONDON_START = 7
-LONDON_END = 16
-NEWYORK_START = 12
-NEWYORK_END = 21
-TRAP_LOOK_WINDOW_START = 6
-TRAP_LOOK_WINDOW_END = 16
-
+CHECK_EVERY_SECONDS = 180
 STATE_FILE = "signal_state.json"
 
 # =========================================================
@@ -72,7 +68,7 @@ STATE_FILE = "signal_state.json"
 # =========================================================
 
 def log(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def safe_float(x, default=0.0):
@@ -91,24 +87,6 @@ def get_tz():
         return ZoneInfo(MARKET_TIMEZONE)
     except Exception:
         return timezone.utc
-
-
-def now_market():
-    return datetime.now(get_tz())
-
-
-def market_hour():
-    return now_market().hour
-
-
-def in_main_sessions():
-    h = market_hour()
-    return (LONDON_START <= h < LONDON_END) or (NEWYORK_START <= h < NEWYORK_END)
-
-
-def in_trap_window():
-    h = market_hour()
-    return TRAP_LOOK_WINDOW_START <= h < TRAP_LOOK_WINDOW_END
 
 
 def ensure_env():
@@ -168,7 +146,6 @@ def fetch_twelve_data(symbol: str, interval: str, outputsize: int) -> pd.DataFra
 
     resp = requests.get(url, params=params, timeout=30)
     log(f"Twelve Data [{interval}] status: {resp.status_code}")
-    log(resp.text[:500])
 
     if resp.status_code != 200:
         raise RuntimeError(f"Twelve Data HTTP hata: {resp.status_code}")
@@ -331,23 +308,21 @@ def near_level(price: float, level_price: float, atr: float) -> bool:
 
 
 # =========================================================
-# MARKET STRUCTURE
+# STRUCTURE
 # =========================================================
 
-def get_htf_trend(df: pd.DataFrame) -> str:
+def get_trend_4h(df: pd.DataFrame) -> str:
     last = df.iloc[-1]
-
     bull = (
         last["ema20"] > last["ema50"] > last["ema200"] and
         last["close"] >= last["ema20"] and
-        safe_float(last["rsi"]) >= 49
+        safe_float(last["rsi"]) >= 50
     )
     bear = (
         last["ema20"] < last["ema50"] < last["ema200"] and
         last["close"] <= last["ema20"] and
-        safe_float(last["rsi"]) <= 51
+        safe_float(last["rsi"]) <= 50
     )
-
     if bull:
         return "bull"
     if bear:
@@ -365,37 +340,12 @@ def premium_discount_zone(htf_df: pd.DataFrame, price: float):
 
 
 def get_previous_day_levels(day_df: pd.DataFrame):
-    if day_df is None or len(day_df) < 3:
+    if len(day_df) < 3:
         return None
     prev = day_df.iloc[-2]
     return {
         "pdh": float(prev["high"]),
         "pdl": float(prev["low"]),
-        "pdo": float(prev["open"]),
-        "pdc": float(prev["close"]),
-    }
-
-
-def get_today_ltf_df(ltf_df: pd.DataFrame):
-    today = now_market().date()
-    return ltf_df[ltf_df["time"].dt.date == today].copy()
-
-
-def get_asian_range(ltf_df: pd.DataFrame):
-    today_df = get_today_ltf_df(ltf_df)
-    if today_df.empty:
-        return None
-
-    asia = today_df[
-        (today_df["time"].dt.hour >= ASIA_START) &
-        (today_df["time"].dt.hour < ASIA_END)
-    ]
-    if asia.empty:
-        return None
-
-    return {
-        "high": float(asia["high"].max()),
-        "low": float(asia["low"].min()),
     }
 
 
@@ -427,52 +377,6 @@ def bearish_pin_bar(row) -> bool:
     return uw >= max(body * MIN_PIN_WICK_RATIO, rng * 0.35) and lw <= body * 1.35
 
 
-def detect_inside_bar(df: pd.DataFrame):
-    if len(df) < 3:
-        return None
-    mother = df.iloc[-2]
-    inside = df.iloc[-1]
-
-    if inside["high"] < mother["high"] and inside["low"] > mother["low"]:
-        return {
-            "pattern": "inside_bar",
-            "mother_high": float(mother["high"]),
-            "mother_low": float(mother["low"]),
-            "inside_high": float(inside["high"]),
-            "inside_low": float(inside["low"]),
-        }
-    return None
-
-
-def detect_inside_break(df: pd.DataFrame):
-    if len(df) < 4:
-        return None
-    mother = df.iloc[-3]
-    inside = df.iloc[-2]
-    confirm = df.iloc[-1]
-
-    if inside["high"] < mother["high"] and inside["low"] > mother["low"]:
-        if confirm["close"] > inside["high"]:
-            return {
-                "direction": "long",
-                "pattern": "inside_break_long",
-                "mother_high": float(mother["high"]),
-                "mother_low": float(mother["low"]),
-                "inside_high": float(inside["high"]),
-                "inside_low": float(inside["low"]),
-            }
-        if confirm["close"] < inside["low"]:
-            return {
-                "direction": "short",
-                "pattern": "inside_break_short",
-                "mother_high": float(mother["high"]),
-                "mother_low": float(mother["low"]),
-                "inside_high": float(inside["high"]),
-                "inside_low": float(inside["low"]),
-            }
-    return None
-
-
 def detect_engulfing(df: pd.DataFrame):
     if len(df) < 2:
         return None
@@ -489,14 +393,14 @@ def detect_engulfing(df: pd.DataFrame):
         prev_bear and last_bull and
         last["open"] <= prev["close"] and
         last["close"] >= prev["open"] and
-        last["body"] > prev["body"] * 0.9
+        last["body"] >= prev["body"] * 0.9
     )
 
     bearish = (
         prev_bull and last_bear and
         last["open"] >= prev["close"] and
         last["close"] <= prev["open"] and
-        last["body"] > prev["body"] * 0.9
+        last["body"] >= prev["body"] * 0.9
     )
 
     if bullish:
@@ -504,20 +408,42 @@ def detect_engulfing(df: pd.DataFrame):
             "direction": "long",
             "pattern": "bullish_engulf",
             "ref_low": float(min(prev["low"], last["low"])),
-            "ref_high": float(last["high"]),
         }
     if bearish:
         return {
             "direction": "short",
             "pattern": "bearish_engulf",
             "ref_high": float(max(prev["high"], last["high"])),
-            "ref_low": float(last["low"]),
         }
     return None
 
 
+def detect_inside_break(df: pd.DataFrame):
+    if len(df) < 3:
+        return None
+
+    mother = df.iloc[-3]
+    inside = df.iloc[-2]
+    confirm = df.iloc[-1]
+
+    if inside["high"] < mother["high"] and inside["low"] > mother["low"]:
+        if confirm["close"] > inside["high"]:
+            return {
+                "direction": "long",
+                "pattern": "inside_break_long",
+                "inside_low": float(inside["low"]),
+            }
+        if confirm["close"] < inside["low"]:
+            return {
+                "direction": "short",
+                "pattern": "inside_break_short",
+                "inside_high": float(inside["high"]),
+            }
+    return None
+
+
 def detect_fakey(df: pd.DataFrame):
-    if len(df) < 5:
+    if len(df) < 4:
         return None
 
     mb = df.iloc[-4]
@@ -536,12 +462,7 @@ def detect_fakey(df: pd.DataFrame):
             return {
                 "direction": "short",
                 "pattern": "fakey_short_pin" if bearish_pin_bar(fake) else "fakey_short",
-                "mother_high": float(mb["high"]),
-                "mother_low": float(mb["low"]),
-                "inside_high": float(ib["high"]),
-                "inside_low": float(ib["low"]),
-                "fake_high": float(fake["high"]),
-                "fake_low": float(fake["low"]),
+                "ref_high": float(max(fake["high"], mb["high"])),
             }
 
     if fake["low"] < ib["low"] and fake["close"] >= ib["low"]:
@@ -549,97 +470,24 @@ def detect_fakey(df: pd.DataFrame):
             return {
                 "direction": "long",
                 "pattern": "fakey_long_pin" if bullish_pin_bar(fake) else "fakey_long",
-                "mother_high": float(mb["high"]),
-                "mother_low": float(mb["low"]),
-                "inside_high": float(ib["high"]),
-                "inside_low": float(ib["low"]),
-                "fake_high": float(fake["high"]),
-                "fake_low": float(fake["low"]),
+                "ref_low": float(min(fake["low"], mb["low"])),
             }
 
     return None
 
 
-def detect_session_trap(ltf_df: pd.DataFrame, asian_range, pd_levels):
-    if asian_range is None or not in_trap_window():
+def detect_ema_pullback(df: pd.DataFrame, trend: str):
+    if len(df) < 3:
         return None
 
-    last = ltf_df.iloc[-1]
-    atr = safe_float(last["atr"])
-    if atr <= 0:
-        return None
-
-    asia_high = asian_range["high"]
-    asia_low = asian_range["low"]
-    pdh = pd_levels["pdh"] if pd_levels else None
-    pdl = pd_levels["pdl"] if pd_levels else None
-
-    if last["high"] > asia_high and last["close"] < asia_high:
-        if (last["high"] - asia_high) >= atr * SWEEP_MIN_ATR:
-            extra = bool(pdh is not None and last["high"] > pdh and last["close"] < pdh)
-            return {
-                "direction": "short",
-                "pattern": "session_trap_short_pdh" if extra else "session_trap_short"
-            }
-
-    if last["low"] < asia_low and last["close"] > asia_low:
-        if (asia_low - last["low"]) >= atr * SWEEP_MIN_ATR:
-            extra = bool(pdl is not None and last["low"] < pdl and last["close"] > pdl)
-            return {
-                "direction": "long",
-                "pattern": "session_trap_long_pdl" if extra else "session_trap_long"
-            }
-
-    return None
-
-
-def recent_structure_points(df: pd.DataFrame, lookback=25):
-    sub = df.iloc[-lookback:].copy()
-    highs = []
-    lows = []
-
-    for i in range(2, len(sub) - 2):
-        if sub.iloc[i]["high"] > sub.iloc[i - 1]["high"] and sub.iloc[i]["high"] > sub.iloc[i + 1]["high"]:
-            highs.append((sub.iloc[i]["time"], float(sub.iloc[i]["high"])))
-        if sub.iloc[i]["low"] < sub.iloc[i - 1]["low"] and sub.iloc[i]["low"] < sub.iloc[i + 1]["low"]:
-            lows.append((sub.iloc[i]["time"], float(sub.iloc[i]["low"])))
-    return highs, lows
-
-
-def detect_bos(df: pd.DataFrame):
-    if len(df) < 35:
-        return None
-
-    highs, lows = recent_structure_points(df, 30)
-    if not highs or not lows:
-        return None
-
+    prev = df.iloc[-2]
     last = df.iloc[-1]
-    recent_high = highs[-1][1]
-    recent_low = lows[-1][1]
-
-    if last["close"] > recent_high:
-        return {"direction": "long", "pattern": "bullish_bos", "level": recent_high}
-    if last["close"] < recent_low:
-        return {"direction": "short", "pattern": "bearish_bos", "level": recent_low}
-    return None
-
-
-def detect_ema_pullback_continuation(ltf_df: pd.DataFrame, htf_trend: str):
-    if len(ltf_df) < 6:
-        return None
-
-    last = ltf_df.iloc[-1]
-    prev = ltf_df.iloc[-2]
     atr = safe_float(last["atr"])
     if atr <= 0:
         return None
 
-    if htf_trend == "bull":
-        touched = (
-            prev["low"] <= prev["ema20"] + atr * 0.18 and
-            prev["close"] >= prev["ema20"] - atr * 0.18
-        )
+    if trend == "bull":
+        touched = prev["low"] <= prev["ema20"] + atr * 0.20
         reclaim = last["close"] > last["ema20"] and last["close"] > prev["high"]
         if touched and reclaim:
             return {
@@ -648,11 +496,8 @@ def detect_ema_pullback_continuation(ltf_df: pd.DataFrame, htf_trend: str):
                 "ref_low": float(min(prev["low"], last["low"]))
             }
 
-    if htf_trend == "bear":
-        touched = (
-            prev["high"] >= prev["ema20"] - atr * 0.18 and
-            prev["close"] <= prev["ema20"] + atr * 0.18
-        )
+    if trend == "bear":
+        touched = prev["high"] >= prev["ema20"] - atr * 0.20
         reject = last["close"] < last["ema20"] and last["close"] < prev["low"]
         if touched and reject:
             return {
@@ -664,12 +509,12 @@ def detect_ema_pullback_continuation(ltf_df: pd.DataFrame, htf_trend: str):
     return None
 
 
-def detect_breakout_retest(ltf_df: pd.DataFrame, pd_levels, htf_trend: str):
-    if len(ltf_df) < 4 or pd_levels is None:
+def detect_breakout_retest(df: pd.DataFrame, pd_levels, trend: str):
+    if len(df) < 2 or pd_levels is None:
         return None
 
-    last = ltf_df.iloc[-1]
-    prev = ltf_df.iloc[-2]
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
     atr = safe_float(last["atr"])
     if atr <= 0:
         return None
@@ -677,25 +522,23 @@ def detect_breakout_retest(ltf_df: pd.DataFrame, pd_levels, htf_trend: str):
     pdh = pd_levels["pdh"]
     pdl = pd_levels["pdl"]
 
-    if htf_trend in ["bull", "sideways"]:
+    if trend in ["bull", "sideways"]:
         broke = prev["close"] > pdh
         retest = last["low"] <= pdh + atr * 0.25 and last["close"] > pdh
         if broke and retest:
             return {
                 "direction": "long",
                 "pattern": "pdh_break_retest_long",
-                "level": float(pdh),
                 "ref_low": float(min(prev["low"], last["low"]))
             }
 
-    if htf_trend in ["bear", "sideways"]:
+    if trend in ["bear", "sideways"]:
         broke = prev["close"] < pdl
         retest = last["high"] >= pdl - atr * 0.25 and last["close"] < pdl
         if broke and retest:
             return {
                 "direction": "short",
                 "pattern": "pdl_break_retest_short",
-                "level": float(pdl),
                 "ref_high": float(max(prev["high"], last["high"]))
             }
 
@@ -718,292 +561,241 @@ def calc_rr(entry, stop, tp2, direction):
     return reward / risk
 
 
-def base_quality_checks(ltf_df, direction):
-    last = ltf_df.iloc[-1]
-    adx = safe_float(last["adx"])
-    rsi = safe_float(last["rsi"])
-
-    if adx < MIN_ADX:
-        return False
-
-    if direction == "long" and rsi < 44:
-        return False
-    if direction == "short" and rsi > 56:
-        return False
-
-    return True
-
-
 def choose_stop_long(price, atr, candidates):
     vals = [x for x in candidates if x is not None and x < price]
-    if not vals:
-        return price - atr * 0.95
-    return min(vals)
+    return min(vals) if vals else price - atr * 0.95
 
 
 def choose_stop_short(price, atr, candidates):
     vals = [x for x in candidates if x is not None and x > price]
-    if not vals:
-        return price + atr * 0.95
-    return max(vals)
+    return max(vals) if vals else price + atr * 0.95
 
 
-def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFrame):
-    htf_last = htf_df.iloc[-1]
-    ltf_last = ltf_df.iloc[-1]
+def quality_ok(df: pd.DataFrame, direction: str, min_adx: float) -> bool:
+    last = df.iloc[-1]
+    adx = safe_float(last["adx"])
+    rsi = safe_float(last["rsi"])
 
-    htf_atr = safe_float(htf_last["atr"])
-    ltf_atr = safe_float(ltf_last["atr"])
-    if htf_atr <= 0 or ltf_atr <= 0:
-        log(f"DEBUG | ATR invalid | htf_atr={htf_atr} ltf_atr={ltf_atr}")
+    if adx < min_adx:
+        return False
+    if direction == "long" and rsi < 46:
+        return False
+    if direction == "short" and rsi > 54:
+        return False
+    return True
+
+
+def score_setup(df: pd.DataFrame, trend: str, zone: str, near_support: bool, near_resistance: bool, near_pdh: bool, near_pdl: bool, pd_levels):
+    price = float(df.iloc[-1]["close"])
+    atr = safe_float(df.iloc[-1]["atr"])
+
+    engulf = detect_engulfing(df)
+    inside_break = detect_inside_break(df)
+    fakey = detect_fakey(df)
+    ema_pb = detect_ema_pullback(df, trend)
+    br_retest = detect_breakout_retest(df, pd_levels, trend)
+
+    long_score = 0.0
+    long_reasons = []
+    long_stops = []
+
+    short_score = 0.0
+    short_reasons = []
+    short_stops = []
+
+    if trend == "bull":
+        long_score += 1.4
+        long_reasons.append("trend_bull")
+    elif trend == "bear":
+        short_score += 1.4
+        short_reasons.append("trend_bear")
+
+    if zone == "discount":
+        long_score += 1.0
+        long_reasons.append("discount_zone")
+    elif zone == "premium":
+        short_score += 1.0
+        short_reasons.append("premium_zone")
+
+    if near_support:
+        long_score += 1.1
+        long_reasons.append("htf_support")
+    if near_resistance:
+        short_score += 1.1
+        short_reasons.append("htf_resistance")
+
+    if near_pdl:
+        long_score += 0.9
+        long_reasons.append("near_pdl")
+    if near_pdh:
+        short_score += 0.9
+        short_reasons.append("near_pdh")
+
+    if engulf and engulf["direction"] == "long":
+        long_score += 1.6
+        long_reasons.append(engulf["pattern"])
+        long_stops.append(engulf["ref_low"] - atr * ATR_SL_BUFFER)
+    elif engulf and engulf["direction"] == "short":
+        short_score += 1.6
+        short_reasons.append(engulf["pattern"])
+        short_stops.append(engulf["ref_high"] + atr * ATR_SL_BUFFER)
+
+    if inside_break and inside_break["direction"] == "long":
+        long_score += 1.4
+        long_reasons.append(inside_break["pattern"])
+        long_stops.append(inside_break["inside_low"] - atr * ATR_SL_BUFFER)
+    elif inside_break and inside_break["direction"] == "short":
+        short_score += 1.4
+        short_reasons.append(inside_break["pattern"])
+        short_stops.append(inside_break["inside_high"] + atr * ATR_SL_BUFFER)
+
+    if fakey and fakey["direction"] == "long":
+        long_score += 1.5
+        long_reasons.append(fakey["pattern"])
+        long_stops.append(fakey["ref_low"] - atr * ATR_SL_BUFFER)
+    elif fakey and fakey["direction"] == "short":
+        short_score += 1.5
+        short_reasons.append(fakey["pattern"])
+        short_stops.append(fakey["ref_high"] + atr * ATR_SL_BUFFER)
+
+    if ema_pb and ema_pb["direction"] == "long":
+        long_score += 1.3
+        long_reasons.append(ema_pb["pattern"])
+        long_stops.append(ema_pb["ref_low"] - atr * ATR_SL_BUFFER)
+    elif ema_pb and ema_pb["direction"] == "short":
+        short_score += 1.3
+        short_reasons.append(ema_pb["pattern"])
+        short_stops.append(ema_pb["ref_high"] + atr * ATR_SL_BUFFER)
+
+    if br_retest and br_retest["direction"] == "long":
+        long_score += 1.3
+        long_reasons.append(br_retest["pattern"])
+        long_stops.append(br_retest["ref_low"] - atr * ATR_SL_BUFFER)
+    elif br_retest and br_retest["direction"] == "short":
+        short_score += 1.3
+        short_reasons.append(br_retest["pattern"])
+        short_stops.append(br_retest["ref_high"] + atr * ATR_SL_BUFFER)
+
+    return {
+        "long": {
+            "score": round(long_score, 2),
+            "reasons": long_reasons,
+            "stops": long_stops,
+        },
+        "short": {
+            "score": round(short_score, 2),
+            "reasons": short_reasons,
+            "stops": short_stops,
+        }
+    }
+
+
+def build_signal(trend_df: pd.DataFrame, setup_df: pd.DataFrame, confirm_df: pd.DataFrame, day_df: pd.DataFrame):
+    trend_last = trend_df.iloc[-1]
+    setup_last = setup_df.iloc[-1]
+    confirm_last = confirm_df.iloc[-1]
+
+    trend_atr = safe_float(trend_last["atr"])
+    setup_atr = safe_float(setup_last["atr"])
+    confirm_atr = safe_float(confirm_last["atr"])
+
+    if trend_atr <= 0 or setup_atr <= 0 or confirm_atr <= 0:
+        log("DEBUG | ATR invalid")
         return None
 
-    price = float(ltf_last["close"])
-    htf_trend = get_htf_trend(htf_df)
-    zone, *_ = premium_discount_zone(htf_df, price)
+    price = float(confirm_last["close"])
+    trend = get_trend_4h(trend_df)
+    zone, *_ = premium_discount_zone(trend_df, price)
+    pd_levels = get_previous_day_levels(day_df)
 
-    supports, resistances = build_htf_levels(htf_df)
+    supports, resistances = build_htf_levels(trend_df)
     ns = nearest_level(supports, price)
     nr = nearest_level(resistances, price)
-    near_support = ns is not None and near_level(price, ns["price"], htf_atr)
-    near_resistance = nr is not None and near_level(price, nr["price"], htf_atr)
 
-    pd_levels = get_previous_day_levels(day_df)
-    asian_range = get_asian_range(ltf_df)
+    near_support = ns is not None and near_level(price, ns["price"], trend_atr)
+    near_resistance = nr is not None and near_level(price, nr["price"], trend_atr)
+    near_pdh = pd_levels is not None and abs(price - pd_levels["pdh"]) <= trend_atr * LEVEL_NEAR_ATR
+    near_pdl = pd_levels is not None and abs(price - pd_levels["pdl"]) <= trend_atr * LEVEL_NEAR_ATR
 
-    inside_bar = detect_inside_bar(ltf_df)
-    inside_break = detect_inside_break(ltf_df)
-    engulf = detect_engulfing(ltf_df)
-    fakey = detect_fakey(ltf_df)
-    trap = detect_session_trap(ltf_df, asian_range, pd_levels)
-    bos = detect_bos(ltf_df)
-    ema_cont = detect_ema_pullback_continuation(ltf_df, htf_trend)
-    breakout_retest = detect_breakout_retest(ltf_df, pd_levels, htf_trend)
+    log(f"DEBUG | trend={trend} zone={zone} price={price:.2f} near_support={near_support} near_resistance={near_resistance} near_pdh={near_pdh} near_pdl={near_pdl}")
 
-    near_pdh = pd_levels is not None and abs(price - pd_levels["pdh"]) <= htf_atr * LEVEL_NEAR_ATR
-    near_pdl = pd_levels is not None and abs(price - pd_levels["pdl"]) <= htf_atr * LEVEL_NEAR_ATR
+    setup_scores = score_setup(setup_df, trend, zone, near_support, near_resistance, near_pdh, near_pdl, pd_levels)
+    confirm_scores = score_setup(confirm_df, trend, zone, near_support, near_resistance, near_pdh, near_pdl, pd_levels)
 
-    signals = []
+    candidates = []
 
     # LONG
-    if base_quality_checks(ltf_df, "long"):
-        score = 0.0
-        reasons = []
-        stop_candidates = []
+    if trend == "bull":
+        if quality_ok(setup_df, "long", MIN_ADX_1H) and quality_ok(confirm_df, "long", MIN_ADX_30M):
+            total_score = setup_scores["long"]["score"] * 0.65 + confirm_scores["long"]["score"] * 0.35
+            reasons = list(dict.fromkeys(setup_scores["long"]["reasons"] + confirm_scores["long"]["reasons"]))
+            stops = setup_scores["long"]["stops"] + confirm_scores["long"]["stops"]
 
-        if htf_trend == "bull":
-            score += 1.3
-            reasons.append("htf_bull")
-        elif htf_trend == "sideways":
-            score += 0.5
-            reasons.append("htf_sideways")
-
-        if zone == "discount":
-            score += 1.0
-            reasons.append("discount_zone")
-
-        if near_support:
-            score += 1.2
-            reasons.append("htf_support")
-            stop_candidates.append(ns["price"] - ltf_atr * ATR_SL_BUFFER)
-
-        if near_pdl:
-            score += 1.2
-            reasons.append("pdl")
-            stop_candidates.append(pd_levels["pdl"] - ltf_atr * ATR_SL_BUFFER)
-
-        if engulf and engulf["direction"] == "long":
-            score += 1.5
-            reasons.append(engulf["pattern"])
-            stop_candidates.append(engulf["ref_low"] - ltf_atr * ATR_SL_BUFFER)
-
-        if inside_break and inside_break["direction"] == "long":
-            score += 1.3
-            reasons.append(inside_break["pattern"])
-            stop_candidates.append(inside_break["inside_low"] - ltf_atr * ATR_SL_BUFFER)
-
-        elif inside_bar and near_support:
-            score += 0.6
-            reasons.append("inside_bar_compression")
-
-        if fakey and fakey["direction"] == "long":
-            score += 1.4
-            reasons.append(fakey["pattern"])
-            stop_candidates.append(min(fakey["fake_low"], fakey["mother_low"]) - ltf_atr * ATR_SL_BUFFER)
-
-        if trap and trap["direction"] == "long":
-            score += 1.5
-            reasons.append(trap["pattern"])
-            stop_candidates.append(float(ltf_last["low"]) - ltf_atr * ATR_SL_BUFFER)
-
-        if bos and bos["direction"] == "long":
-            score += 0.9
-            reasons.append(bos["pattern"])
-
-        if ema_cont and ema_cont["direction"] == "long":
-            score += 1.4
-            reasons.append(ema_cont["pattern"])
-            stop_candidates.append(ema_cont["ref_low"] - ltf_atr * ATR_SL_BUFFER)
-
-        if breakout_retest and breakout_retest["direction"] == "long":
-            score += 1.4
-            reasons.append(breakout_retest["pattern"])
-            stop_candidates.append(breakout_retest["ref_low"] - ltf_atr * ATR_SL_BUFFER)
-
-        if in_main_sessions():
-            score += 0.4
-            reasons.append("main_session")
-
-        stop = choose_stop_long(price, ltf_atr, stop_candidates)
-        risk = price - stop
-
-        if 0 < risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
-            tp1 = price + risk * 1.0
-            tp2 = price + risk * 1.6
-            rr = calc_rr(price, stop, tp2, "long")
-            log(f"LONG CHECK | score={score:.2f} rr={rr:.2f} risk={risk:.2f} reasons={reasons}")
-            if rr >= MIN_RR and score >= MIN_SIGNAL_SCORE:
-                signals.append({
-                    "direction": "long",
-                    "pattern": " + ".join(reasons[:6]),
-                    "entry": price,
-                    "stop": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "htf_trend": htf_trend,
-                    "zone": zone,
-                    "level_type": "support/pdl/continuation",
-                    "level_price": ns["price"] if ns else (pd_levels["pdl"] if pd_levels else price),
-                    "atr": ltf_atr,
-                    "score": round(score, 2),
-                    "rr": round(rr, 2)
-                })
+            stop = choose_stop_long(price, confirm_atr, stops)
+            risk = price - stop
+            if 0 < risk <= confirm_atr * MAX_ENTRY_DISTANCE_ATR:
+                tp1 = price + risk * 1.0
+                tp2 = price + risk * 1.6
+                rr = calc_rr(price, stop, tp2, "long")
+                log(f"LONG CHECK | setup_score={setup_scores['long']['score']:.2f} confirm_score={confirm_scores['long']['score']:.2f} total={total_score:.2f} rr={rr:.2f} reasons={reasons}")
+                if total_score >= MIN_SIGNAL_SCORE and rr >= MIN_RR and len(reasons) >= 3:
+                    candidates.append({
+                        "direction": "long",
+                        "pattern": " + ".join(reasons[:6]),
+                        "entry": price,
+                        "stop": stop,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "rr": round(rr, 2),
+                        "score": round(total_score, 2),
+                        "trend": trend,
+                        "zone": zone,
+                        "level_price": ns["price"] if ns else (pd_levels["pdl"] if pd_levels else price),
+                        "level_type": "4H support / PDL",
+                        "atr": confirm_atr
+                    })
         else:
-            log(f"LONG BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f}")
-
-    else:
-        log(f"LONG BLOCKED | quality_check_failed | adx={safe_float(ltf_last['adx']):.2f} rsi={safe_float(ltf_last['rsi']):.2f}")
+            log("LONG BLOCKED | 1H/30M quality failed")
 
     # SHORT
-    if base_quality_checks(ltf_df, "short"):
-        score = 0.0
-        reasons = []
-        stop_candidates = []
+    if trend == "bear":
+        if quality_ok(setup_df, "short", MIN_ADX_1H) and quality_ok(confirm_df, "short", MIN_ADX_30M):
+            total_score = setup_scores["short"]["score"] * 0.65 + confirm_scores["short"]["score"] * 0.35
+            reasons = list(dict.fromkeys(setup_scores["short"]["reasons"] + confirm_scores["short"]["reasons"]))
+            stops = setup_scores["short"]["stops"] + confirm_scores["short"]["stops"]
 
-        if htf_trend == "bear":
-            score += 1.3
-            reasons.append("htf_bear")
-        elif htf_trend == "sideways":
-            score += 0.5
-            reasons.append("htf_sideways")
-
-        if zone == "premium":
-            score += 1.0
-            reasons.append("premium_zone")
-
-        if near_resistance:
-            score += 1.2
-            reasons.append("htf_resistance")
-            stop_candidates.append(nr["price"] + ltf_atr * ATR_SL_BUFFER)
-
-        if near_pdh:
-            score += 1.2
-            reasons.append("pdh")
-            stop_candidates.append(pd_levels["pdh"] + ltf_atr * ATR_SL_BUFFER)
-
-        if engulf and engulf["direction"] == "short":
-            score += 1.5
-            reasons.append(engulf["pattern"])
-            stop_candidates.append(engulf["ref_high"] + ltf_atr * ATR_SL_BUFFER)
-
-        if inside_break and inside_break["direction"] == "short":
-            score += 1.3
-            reasons.append(inside_break["pattern"])
-            stop_candidates.append(inside_break["inside_high"] + ltf_atr * ATR_SL_BUFFER)
-
-        elif inside_bar and near_resistance:
-            score += 0.6
-            reasons.append("inside_bar_compression")
-
-        if fakey and fakey["direction"] == "short":
-            score += 1.4
-            reasons.append(fakey["pattern"])
-            stop_candidates.append(max(fakey["fake_high"], fakey["mother_high"]) + ltf_atr * ATR_SL_BUFFER)
-
-        if trap and trap["direction"] == "short":
-            score += 1.5
-            reasons.append(trap["pattern"])
-            stop_candidates.append(float(ltf_last["high"]) + ltf_atr * ATR_SL_BUFFER)
-
-        if bos and bos["direction"] == "short":
-            score += 0.9
-            reasons.append(bos["pattern"])
-
-        if ema_cont and ema_cont["direction"] == "short":
-            score += 1.4
-            reasons.append(ema_cont["pattern"])
-            stop_candidates.append(ema_cont["ref_high"] + ltf_atr * ATR_SL_BUFFER)
-
-        if breakout_retest and breakout_retest["direction"] == "short":
-            score += 1.4
-            reasons.append(breakout_retest["pattern"])
-            stop_candidates.append(breakout_retest["ref_high"] + ltf_atr * ATR_SL_BUFFER)
-
-        if in_main_sessions():
-            score += 0.4
-            reasons.append("main_session")
-
-        stop = choose_stop_short(price, ltf_atr, stop_candidates)
-        risk = stop - price
-
-        if 0 < risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
-            tp1 = price - risk * 1.0
-            tp2 = price - risk * 1.6
-            rr = calc_rr(price, stop, tp2, "short")
-            log(f"SHORT CHECK | score={score:.2f} rr={rr:.2f} risk={risk:.2f} reasons={reasons}")
-            if rr >= MIN_RR and score >= MIN_SIGNAL_SCORE:
-                signals.append({
-                    "direction": "short",
-                    "pattern": " + ".join(reasons[:6]),
-                    "entry": price,
-                    "stop": stop,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "htf_trend": htf_trend,
-                    "zone": zone,
-                    "level_type": "resistance/pdh/continuation",
-                    "level_price": nr["price"] if nr else (pd_levels["pdh"] if pd_levels else price),
-                    "atr": ltf_atr,
-                    "score": round(score, 2),
-                    "rr": round(rr, 2)
-                })
+            stop = choose_stop_short(price, confirm_atr, stops)
+            risk = stop - price
+            if 0 < risk <= confirm_atr * MAX_ENTRY_DISTANCE_ATR:
+                tp1 = price - risk * 1.0
+                tp2 = price - risk * 1.6
+                rr = calc_rr(price, stop, tp2, "short")
+                log(f"SHORT CHECK | setup_score={setup_scores['short']['score']:.2f} confirm_score={confirm_scores['short']['score']:.2f} total={total_score:.2f} rr={rr:.2f} reasons={reasons}")
+                if total_score >= MIN_SIGNAL_SCORE and rr >= MIN_RR and len(reasons) >= 3:
+                    candidates.append({
+                        "direction": "short",
+                        "pattern": " + ".join(reasons[:6]),
+                        "entry": price,
+                        "stop": stop,
+                        "tp1": tp1,
+                        "tp2": tp2,
+                        "rr": round(rr, 2),
+                        "score": round(total_score, 2),
+                        "trend": trend,
+                        "zone": zone,
+                        "level_price": nr["price"] if nr else (pd_levels["pdh"] if pd_levels else price),
+                        "level_type": "4H resistance / PDH",
+                        "atr": confirm_atr
+                    })
         else:
-            log(f"SHORT BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f}")
+            log("SHORT BLOCKED | 1H/30M quality failed")
 
-    else:
-        log(f"SHORT BLOCKED | quality_check_failed | adx={safe_float(ltf_last['adx']):.2f} rsi={safe_float(ltf_last['rsi']):.2f}")
-
-    log(
-        f"DEBUG | price={price:.2f} | htf_trend={htf_trend} | zone={zone} | "
-        f"near_support={near_support} | near_resistance={near_resistance} | "
-        f"near_pdh={near_pdh} | near_pdl={near_pdl} | "
-        f"engulf={engulf['pattern'] if engulf else None} | "
-        f"inside_bar={'inside_bar' if inside_bar else None} | "
-        f"inside_break={inside_break['pattern'] if inside_break else None} | "
-        f"fakey={fakey['pattern'] if fakey else None} | "
-        f"trap={trap['pattern'] if trap else None} | "
-        f"bos={bos['pattern'] if bos else None} | "
-        f"ema_cont={ema_cont['pattern'] if ema_cont else None} | "
-        f"breakout_retest={breakout_retest['pattern'] if breakout_retest else None}"
-    )
-
-    if not signals:
-        log("DEBUG | no signal candidate passed final filters")
+    if not candidates:
+        log("DEBUG | no candidate passed final filters")
         return None
 
-    signals = sorted(signals, key=lambda x: (x["score"], x["rr"]), reverse=True)
-    log(f"DEBUG | selected signal | direction={signals[0]['direction']} score={signals[0]['score']} rr={signals[0]['rr']}")
-    return signals[0]
+    candidates = sorted(candidates, key=lambda x: (x["score"], x["rr"]), reverse=True)
+    return candidates[0]
 
 
 # =========================================================
@@ -1025,11 +817,9 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def make_signal_key(signal, ltf_df):
-    bar_time = str(ltf_df.iloc[-1]["time"])
-    side = signal["direction"]
-    entry = round(signal["entry"], 2)
-    return f"{bar_time}|{side}|{entry}|{signal['pattern'][:80]}"
+def make_signal_key(signal, confirm_df):
+    bar_time = str(confirm_df.iloc[-1]["time"])
+    return f"{bar_time}|{signal['direction']}|{round(signal['entry'], 2)}|{signal['pattern'][:80]}"
 
 
 # =========================================================
@@ -1040,20 +830,21 @@ def run():
     ensure_env()
     log("Bot çalışıyor...")
 
-    htf_df = add_indicators(fetch_twelve_data(SYMBOL, HTF_INTERVAL, HTF_OUTPUTSIZE))
-    ltf_df = add_indicators(fetch_twelve_data(SYMBOL, LTF_INTERVAL, LTF_OUTPUTSIZE))
+    trend_df = add_indicators(fetch_twelve_data(SYMBOL, TREND_INTERVAL, TREND_OUTPUTSIZE))
+    setup_df = add_indicators(fetch_twelve_data(SYMBOL, SETUP_INTERVAL, SETUP_OUTPUTSIZE))
+    confirm_df = add_indicators(fetch_twelve_data(SYMBOL, CONFIRM_INTERVAL, CONFIRM_OUTPUTSIZE))
     day_df = add_indicators(fetch_twelve_data(SYMBOL, DAY_INTERVAL, DAY_OUTPUTSIZE))
 
-    signal = build_signal(htf_df, ltf_df, day_df)
+    signal = build_signal(trend_df, setup_df, confirm_df, day_df)
     if signal is None:
         log("Sinyal yok, mesaj gönderilmedi.")
         return
 
     state = load_state()
-    key = make_signal_key(signal, ltf_df)
+    key = make_signal_key(signal, confirm_df)
 
     if key == state.get("last_signal_key"):
-        log("Aynı sinyal daha önce gönderilmiş, tekrar atılmadı.")
+        log("Aynı sinyal tekrar gönderilmedi.")
         return
 
     state["last_signal_key"] = key
@@ -1062,9 +853,9 @@ def run():
     msg = (
         f"🚨 XAU/USD İŞLEM SİNYALİ\n"
         f"Yön: {signal['direction'].upper()}\n"
-        f"Setup: {signal['pattern']}\n"
-        f"HTF Trend: {signal['htf_trend']}\n"
+        f"4H Trend: {signal['trend']}\n"
         f"Zone: {signal['zone']}\n"
+        f"Setup: {signal['pattern']}\n"
         f"Seviye: {signal['level_type']} @ {signal['level_price']:.2f}\n"
         f"Entry: {signal['entry']:.2f}\n"
         f"SL: {signal['stop']:.2f}\n"
@@ -1072,9 +863,9 @@ def run():
         f"TP2: {signal['tp2']:.2f}\n"
         f"RR: {signal['rr']:.2f}\n"
         f"Skor: {signal['score']:.2f}\n"
-        f"ATR: {signal['atr']:.2f}\n"
+        f"ATR(30m): {signal['atr']:.2f}\n"
         f"Sembol: {SYMBOL}\n"
-        f"Saat Dilimi: {MARKET_TIMEZONE}"
+        f"TF: 4H trend + 1H setup + 30M confirm"
     )
 
     log(msg)
@@ -1082,13 +873,14 @@ def run():
 
 
 if __name__ == "__main__":
-    try:
-        run()
-    except Exception as e:
-        err = f"HATA: {e}\n{traceback.format_exc()}"
-        log(err)
+    while True:
         try:
-            send_telegram(err[:3500])
-        except Exception:
-            pass
-        raise
+            run()
+        except Exception as e:
+            err = f"HATA: {e}\n{traceback.format_exc()}"
+            log(err)
+            try:
+                send_telegram(err[:3500])
+            except Exception:
+                pass
+        time.sleep(CHECK_EVERY_SECONDS)
