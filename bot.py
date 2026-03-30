@@ -39,20 +39,19 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-# Daha agresif
-MIN_ADX = 13
-MIN_RR = 1.25
-MIN_SIGNAL_SCORE = 3.6
+MIN_ADX = 14
+MIN_RR = 1.35
+MIN_SIGNAL_SCORE = 4.2
 
 PIVOT_LEFT = 3
 PIVOT_RIGHT = 3
 MAX_HTF_LEVEL_AGE = 160
 
-LEVEL_NEAR_ATR = 0.75
+LEVEL_NEAR_ATR = 0.70
 LEVEL_MERGE_ATR = 0.40
 SWEEP_MIN_ATR = 0.15
 ATR_SL_BUFFER = 0.22
-MAX_ENTRY_DISTANCE_ATR = 1.55
+MAX_ENTRY_DISTANCE_ATR = 1.50
 
 MIN_PIN_WICK_RATIO = 2.0
 MAX_BODY_TO_RANGE_FOR_PIN = 0.45
@@ -152,7 +151,7 @@ def send_telegram(msg: str) -> bool:
 
 
 # =========================================================
-# TWELVE DATA
+# DATA
 # =========================================================
 
 def fetch_twelve_data(symbol: str, interval: str, outputsize: int) -> pd.DataFrame:
@@ -332,7 +331,7 @@ def near_level(price: float, level_price: float, atr: float) -> bool:
 
 
 # =========================================================
-# TREND / ZONE
+# MARKET STRUCTURE
 # =========================================================
 
 def get_htf_trend(df: pd.DataFrame) -> str:
@@ -360,10 +359,44 @@ def premium_discount_zone(htf_df: pd.DataFrame, price: float):
     swing_low = float(htf_df.iloc[-40:]["low"].min())
     swing_high = float(htf_df.iloc[-40:]["high"].max())
     eq = (swing_low + swing_high) / 2.0
-
     if price < eq:
         return "discount", swing_low, swing_high, eq
     return "premium", swing_low, swing_high, eq
+
+
+def get_previous_day_levels(day_df: pd.DataFrame):
+    if day_df is None or len(day_df) < 3:
+        return None
+    prev = day_df.iloc[-2]
+    return {
+        "pdh": float(prev["high"]),
+        "pdl": float(prev["low"]),
+        "pdo": float(prev["open"]),
+        "pdc": float(prev["close"]),
+    }
+
+
+def get_today_ltf_df(ltf_df: pd.DataFrame):
+    today = now_market().date()
+    return ltf_df[ltf_df["time"].dt.date == today].copy()
+
+
+def get_asian_range(ltf_df: pd.DataFrame):
+    today_df = get_today_ltf_df(ltf_df)
+    if today_df.empty:
+        return None
+
+    asia = today_df[
+        (today_df["time"].dt.hour >= ASIA_START) &
+        (today_df["time"].dt.hour < ASIA_END)
+    ]
+    if asia.empty:
+        return None
+
+    return {
+        "high": float(asia["high"].max()),
+        "low": float(asia["low"].min()),
+    }
 
 
 # =========================================================
@@ -395,30 +428,91 @@ def bearish_pin_bar(row) -> bool:
 
 
 def detect_inside_bar(df: pd.DataFrame):
-    if len(df) < 4:
+    if len(df) < 3:
         return None
-    mb = df.iloc[-3]
-    ib = df.iloc[-2]
+    mother = df.iloc[-2]
+    inside = df.iloc[-1]
 
-    if ib["high"] < mb["high"] and ib["low"] > mb["low"]:
+    if inside["high"] < mother["high"] and inside["low"] > mother["low"]:
         return {
-            "mother_high": float(mb["high"]),
-            "mother_low": float(mb["low"]),
-            "inside_high": float(ib["high"]),
-            "inside_low": float(ib["low"]),
+            "pattern": "inside_bar",
+            "mother_high": float(mother["high"]),
+            "mother_low": float(mother["low"]),
+            "inside_high": float(inside["high"]),
+            "inside_low": float(inside["low"]),
         }
     return None
 
 
 def detect_inside_break(df: pd.DataFrame):
-    st = detect_inside_bar(df)
-    if not st:
+    if len(df) < 4:
         return None
+    mother = df.iloc[-3]
+    inside = df.iloc[-2]
+    confirm = df.iloc[-1]
+
+    if inside["high"] < mother["high"] and inside["low"] > mother["low"]:
+        if confirm["close"] > inside["high"]:
+            return {
+                "direction": "long",
+                "pattern": "inside_break_long",
+                "mother_high": float(mother["high"]),
+                "mother_low": float(mother["low"]),
+                "inside_high": float(inside["high"]),
+                "inside_low": float(inside["low"]),
+            }
+        if confirm["close"] < inside["low"]:
+            return {
+                "direction": "short",
+                "pattern": "inside_break_short",
+                "mother_high": float(mother["high"]),
+                "mother_low": float(mother["low"]),
+                "inside_high": float(inside["high"]),
+                "inside_low": float(inside["low"]),
+            }
+    return None
+
+
+def detect_engulfing(df: pd.DataFrame):
+    if len(df) < 2:
+        return None
+
+    prev = df.iloc[-2]
     last = df.iloc[-1]
-    if last["close"] > st["inside_high"]:
-        return {"direction": "long", "pattern": "inside_break_long", **st}
-    if last["close"] < st["inside_low"]:
-        return {"direction": "short", "pattern": "inside_break_short", **st}
+
+    prev_bear = prev["close"] < prev["open"]
+    prev_bull = prev["close"] > prev["open"]
+    last_bull = last["close"] > last["open"]
+    last_bear = last["close"] < last["open"]
+
+    bullish = (
+        prev_bear and last_bull and
+        last["open"] <= prev["close"] and
+        last["close"] >= prev["open"] and
+        last["body"] > prev["body"] * 0.9
+    )
+
+    bearish = (
+        prev_bull and last_bear and
+        last["open"] >= prev["close"] and
+        last["close"] <= prev["open"] and
+        last["body"] > prev["body"] * 0.9
+    )
+
+    if bullish:
+        return {
+            "direction": "long",
+            "pattern": "bullish_engulf",
+            "ref_low": float(min(prev["low"], last["low"])),
+            "ref_high": float(last["high"]),
+        }
+    if bearish:
+        return {
+            "direction": "short",
+            "pattern": "bearish_engulf",
+            "ref_high": float(max(prev["high"], last["high"])),
+            "ref_low": float(last["low"]),
+        }
     return None
 
 
@@ -466,41 +560,6 @@ def detect_fakey(df: pd.DataFrame):
     return None
 
 
-def get_previous_day_levels(day_df: pd.DataFrame):
-    if day_df is None or len(day_df) < 3:
-        return None
-    prev = day_df.iloc[-2]
-    return {
-        "pdh": float(prev["high"]),
-        "pdl": float(prev["low"]),
-        "pdo": float(prev["open"]),
-        "pdc": float(prev["close"]),
-    }
-
-
-def get_today_ltf_df(ltf_df: pd.DataFrame):
-    today = now_market().date()
-    return ltf_df[ltf_df["time"].dt.date == today].copy()
-
-
-def get_asian_range(ltf_df: pd.DataFrame):
-    today_df = get_today_ltf_df(ltf_df)
-    if today_df.empty:
-        return None
-
-    asia = today_df[
-        (today_df["time"].dt.hour >= ASIA_START) &
-        (today_df["time"].dt.hour < ASIA_END)
-    ]
-    if asia.empty:
-        return None
-
-    return {
-        "high": float(asia["high"].max()),
-        "low": float(asia["low"].min()),
-    }
-
-
 def detect_session_trap(ltf_df: pd.DataFrame, asian_range, pd_levels):
     if asian_range is None or not in_trap_window():
         return None
@@ -520,8 +579,7 @@ def detect_session_trap(ltf_df: pd.DataFrame, asian_range, pd_levels):
             extra = bool(pdh is not None and last["high"] > pdh and last["close"] < pdh)
             return {
                 "direction": "short",
-                "pattern": "session_trap_short_pdh" if extra else "session_trap_short",
-                "swept_level": max(asia_high, pdh if pdh else asia_high)
+                "pattern": "session_trap_short_pdh" if extra else "session_trap_short"
             }
 
     if last["low"] < asia_low and last["close"] > asia_low:
@@ -529,8 +587,7 @@ def detect_session_trap(ltf_df: pd.DataFrame, asian_range, pd_levels):
             extra = bool(pdl is not None and last["low"] < pdl and last["close"] > pdl)
             return {
                 "direction": "long",
-                "pattern": "session_trap_long_pdl" if extra else "session_trap_long",
-                "swept_level": min(asia_low, pdl if pdl else asia_low)
+                "pattern": "session_trap_long_pdl" if extra else "session_trap_long"
             }
 
     return None
@@ -568,25 +625,6 @@ def detect_bos(df: pd.DataFrame):
     return None
 
 
-def detect_choch_like(df: pd.DataFrame):
-    if len(df) < 12:
-        return None
-
-    last = df.iloc[-1]
-    prev = df.iloc[-6:-1]
-
-    local_high = float(prev["high"].max())
-    local_low = float(prev["low"].min())
-
-    if last["close"] > local_high and prev.iloc[-1]["low"] < prev["low"].iloc[:-1].min():
-        return {"direction": "long", "pattern": "choch_like_long", "level": local_high}
-
-    if last["close"] < local_low and prev.iloc[-1]["high"] > prev["high"].iloc[:-1].max():
-        return {"direction": "short", "pattern": "choch_like_short", "level": local_low}
-
-    return None
-
-
 def detect_ema_pullback_continuation(ltf_df: pd.DataFrame, htf_trend: str):
     if len(ltf_df) < 6:
         return None
@@ -598,37 +636,29 @@ def detect_ema_pullback_continuation(ltf_df: pd.DataFrame, htf_trend: str):
         return None
 
     if htf_trend == "bull":
-        touched_ema20 = (
+        touched = (
             prev["low"] <= prev["ema20"] + atr * 0.18 and
             prev["close"] >= prev["ema20"] - atr * 0.18
         )
-        reclaim = (
-            last["close"] > last["ema20"] and
-            last["close"] > prev["high"]
-        )
-        if touched_ema20 and reclaim:
+        reclaim = last["close"] > last["ema20"] and last["close"] > prev["high"]
+        if touched and reclaim:
             return {
                 "direction": "long",
                 "pattern": "ema20_pullback_long",
-                "ref_low": float(min(prev["low"], last["low"])),
-                "ref_high": float(last["high"])
+                "ref_low": float(min(prev["low"], last["low"]))
             }
 
     if htf_trend == "bear":
-        touched_ema20 = (
+        touched = (
             prev["high"] >= prev["ema20"] - atr * 0.18 and
             prev["close"] <= prev["ema20"] + atr * 0.18
         )
-        reject = (
-            last["close"] < last["ema20"] and
-            last["close"] < prev["low"]
-        )
-        if touched_ema20 and reject:
+        reject = last["close"] < last["ema20"] and last["close"] < prev["low"]
+        if touched and reject:
             return {
                 "direction": "short",
                 "pattern": "ema20_pullback_short",
-                "ref_high": float(max(prev["high"], last["high"])),
-                "ref_low": float(last["low"])
+                "ref_high": float(max(prev["high"], last["high"]))
             }
 
     return None
@@ -696,9 +726,9 @@ def base_quality_checks(ltf_df, direction):
     if adx < MIN_ADX:
         return False
 
-    if direction == "long" and rsi < 43:
+    if direction == "long" and rsi < 44:
         return False
-    if direction == "short" and rsi > 57:
+    if direction == "short" and rsi > 56:
         return False
 
     return True
@@ -741,11 +771,12 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
     pd_levels = get_previous_day_levels(day_df)
     asian_range = get_asian_range(ltf_df)
 
+    inside_bar = detect_inside_bar(ltf_df)
     inside_break = detect_inside_break(ltf_df)
+    engulf = detect_engulfing(ltf_df)
     fakey = detect_fakey(ltf_df)
     trap = detect_session_trap(ltf_df, asian_range, pd_levels)
     bos = detect_bos(ltf_df)
-    choch = detect_choch_like(ltf_df)
     ema_cont = detect_ema_pullback_continuation(ltf_df, htf_trend)
     breakout_retest = detect_breakout_retest(ltf_df, pd_levels, htf_trend)
 
@@ -754,15 +785,14 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
 
     signals = []
 
-    # ---------------- LONG ----------------
-    long_quality = base_quality_checks(ltf_df, "long")
-    if long_quality:
+    # LONG
+    if base_quality_checks(ltf_df, "long"):
         score = 0.0
         reasons = []
         stop_candidates = []
 
         if htf_trend == "bull":
-            score += 1.2
+            score += 1.3
             reasons.append("htf_bull")
         elif htf_trend == "sideways":
             score += 0.5
@@ -778,39 +808,40 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
             stop_candidates.append(ns["price"] - ltf_atr * ATR_SL_BUFFER)
 
         if near_pdl:
-            score += 1.1
+            score += 1.2
             reasons.append("pdl")
             stop_candidates.append(pd_levels["pdl"] - ltf_atr * ATR_SL_BUFFER)
 
-        if near_pdh and htf_trend == "bull":
-            score += 0.3
-            reasons.append("near_pdh")
-
-        if fakey and fakey["direction"] == "long":
+        if engulf and engulf["direction"] == "long":
             score += 1.5
-            reasons.append(fakey["pattern"])
-            stop_candidates.append(min(fakey["fake_low"], fakey["mother_low"]) - ltf_atr * ATR_SL_BUFFER)
+            reasons.append(engulf["pattern"])
+            stop_candidates.append(engulf["ref_low"] - ltf_atr * ATR_SL_BUFFER)
 
         if inside_break and inside_break["direction"] == "long":
-            score += 1.0
+            score += 1.3
             reasons.append(inside_break["pattern"])
             stop_candidates.append(inside_break["inside_low"] - ltf_atr * ATR_SL_BUFFER)
 
+        elif inside_bar and near_support:
+            score += 0.6
+            reasons.append("inside_bar_compression")
+
+        if fakey and fakey["direction"] == "long":
+            score += 1.4
+            reasons.append(fakey["pattern"])
+            stop_candidates.append(min(fakey["fake_low"], fakey["mother_low"]) - ltf_atr * ATR_SL_BUFFER)
+
         if trap and trap["direction"] == "long":
-            score += 1.6
+            score += 1.5
             reasons.append(trap["pattern"])
             stop_candidates.append(float(ltf_last["low"]) - ltf_atr * ATR_SL_BUFFER)
-
-        if choch and choch["direction"] == "long":
-            score += 0.9
-            reasons.append(choch["pattern"])
 
         if bos and bos["direction"] == "long":
             score += 0.9
             reasons.append(bos["pattern"])
 
         if ema_cont and ema_cont["direction"] == "long":
-            score += 1.5
+            score += 1.4
             reasons.append(ema_cont["pattern"])
             stop_candidates.append(ema_cont["ref_low"] - ltf_atr * ATR_SL_BUFFER)
 
@@ -820,17 +851,17 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
             stop_candidates.append(breakout_retest["ref_low"] - ltf_atr * ATR_SL_BUFFER)
 
         if in_main_sessions():
-            score += 0.35
+            score += 0.4
             reasons.append("main_session")
 
         stop = choose_stop_long(price, ltf_atr, stop_candidates)
         risk = price - stop
+
         if 0 < risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
             tp1 = price + risk * 1.0
-            tp2 = price + risk * 1.5
+            tp2 = price + risk * 1.6
             rr = calc_rr(price, stop, tp2, "long")
             log(f"LONG CHECK | score={score:.2f} rr={rr:.2f} risk={risk:.2f} reasons={reasons}")
-
             if rr >= MIN_RR and score >= MIN_SIGNAL_SCORE:
                 signals.append({
                     "direction": "long",
@@ -848,19 +879,19 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
                     "rr": round(rr, 2)
                 })
         else:
-            log(f"LONG BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f} reasons={reasons}")
+            log(f"LONG BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f}")
+
     else:
         log(f"LONG BLOCKED | quality_check_failed | adx={safe_float(ltf_last['adx']):.2f} rsi={safe_float(ltf_last['rsi']):.2f}")
 
-    # ---------------- SHORT ----------------
-    short_quality = base_quality_checks(ltf_df, "short")
-    if short_quality:
+    # SHORT
+    if base_quality_checks(ltf_df, "short"):
         score = 0.0
         reasons = []
         stop_candidates = []
 
         if htf_trend == "bear":
-            score += 1.2
+            score += 1.3
             reasons.append("htf_bear")
         elif htf_trend == "sideways":
             score += 0.5
@@ -876,39 +907,40 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
             stop_candidates.append(nr["price"] + ltf_atr * ATR_SL_BUFFER)
 
         if near_pdh:
-            score += 1.1
+            score += 1.2
             reasons.append("pdh")
             stop_candidates.append(pd_levels["pdh"] + ltf_atr * ATR_SL_BUFFER)
 
-        if near_pdl and htf_trend == "bear":
-            score += 0.3
-            reasons.append("near_pdl")
-
-        if fakey and fakey["direction"] == "short":
+        if engulf and engulf["direction"] == "short":
             score += 1.5
-            reasons.append(fakey["pattern"])
-            stop_candidates.append(max(fakey["fake_high"], fakey["mother_high"]) + ltf_atr * ATR_SL_BUFFER)
+            reasons.append(engulf["pattern"])
+            stop_candidates.append(engulf["ref_high"] + ltf_atr * ATR_SL_BUFFER)
 
         if inside_break and inside_break["direction"] == "short":
-            score += 1.0
+            score += 1.3
             reasons.append(inside_break["pattern"])
             stop_candidates.append(inside_break["inside_high"] + ltf_atr * ATR_SL_BUFFER)
 
+        elif inside_bar and near_resistance:
+            score += 0.6
+            reasons.append("inside_bar_compression")
+
+        if fakey and fakey["direction"] == "short":
+            score += 1.4
+            reasons.append(fakey["pattern"])
+            stop_candidates.append(max(fakey["fake_high"], fakey["mother_high"]) + ltf_atr * ATR_SL_BUFFER)
+
         if trap and trap["direction"] == "short":
-            score += 1.6
+            score += 1.5
             reasons.append(trap["pattern"])
             stop_candidates.append(float(ltf_last["high"]) + ltf_atr * ATR_SL_BUFFER)
-
-        if choch and choch["direction"] == "short":
-            score += 0.9
-            reasons.append(choch["pattern"])
 
         if bos and bos["direction"] == "short":
             score += 0.9
             reasons.append(bos["pattern"])
 
         if ema_cont and ema_cont["direction"] == "short":
-            score += 1.5
+            score += 1.4
             reasons.append(ema_cont["pattern"])
             stop_candidates.append(ema_cont["ref_high"] + ltf_atr * ATR_SL_BUFFER)
 
@@ -918,17 +950,17 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
             stop_candidates.append(breakout_retest["ref_high"] + ltf_atr * ATR_SL_BUFFER)
 
         if in_main_sessions():
-            score += 0.35
+            score += 0.4
             reasons.append("main_session")
 
         stop = choose_stop_short(price, ltf_atr, stop_candidates)
         risk = stop - price
+
         if 0 < risk <= ltf_atr * MAX_ENTRY_DISTANCE_ATR:
             tp1 = price - risk * 1.0
-            tp2 = price - risk * 1.5
+            tp2 = price - risk * 1.6
             rr = calc_rr(price, stop, tp2, "short")
             log(f"SHORT CHECK | score={score:.2f} rr={rr:.2f} risk={risk:.2f} reasons={reasons}")
-
             if rr >= MIN_RR and score >= MIN_SIGNAL_SCORE:
                 signals.append({
                     "direction": "short",
@@ -946,7 +978,8 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
                     "rr": round(rr, 2)
                 })
         else:
-            log(f"SHORT BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f} reasons={reasons}")
+            log(f"SHORT BLOCKED | invalid risk | risk={risk:.2f} max_allowed={ltf_atr * MAX_ENTRY_DISTANCE_ATR:.2f}")
+
     else:
         log(f"SHORT BLOCKED | quality_check_failed | adx={safe_float(ltf_last['adx']):.2f} rsi={safe_float(ltf_last['rsi']):.2f}")
 
@@ -954,11 +987,12 @@ def build_signal(htf_df: pd.DataFrame, ltf_df: pd.DataFrame, day_df: pd.DataFram
         f"DEBUG | price={price:.2f} | htf_trend={htf_trend} | zone={zone} | "
         f"near_support={near_support} | near_resistance={near_resistance} | "
         f"near_pdh={near_pdh} | near_pdl={near_pdl} | "
+        f"engulf={engulf['pattern'] if engulf else None} | "
+        f"inside_bar={'inside_bar' if inside_bar else None} | "
         f"inside_break={inside_break['pattern'] if inside_break else None} | "
         f"fakey={fakey['pattern'] if fakey else None} | "
         f"trap={trap['pattern'] if trap else None} | "
         f"bos={bos['pattern'] if bos else None} | "
-        f"choch={choch['pattern'] if choch else None} | "
         f"ema_cont={ema_cont['pattern'] if ema_cont else None} | "
         f"breakout_retest={breakout_retest['pattern'] if breakout_retest else None}"
     )
