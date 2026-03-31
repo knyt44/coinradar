@@ -54,7 +54,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "crypto-pro-futures-debug-bot/3.0"})
+HTTP.headers.update({"User-Agent": "mexc-pro-futures-bot/1.0"})
 
 retry = Retry(
     total=3,
@@ -71,31 +71,25 @@ HTTP.mount("http://", adapter)
 # =========================================================
 # CONFIG
 # =========================================================
-LOG_FILE = "crypto_pro_futures_debug.log"
-STATE_FILE = "crypto_pro_futures_debug_state.json"
+LOG_FILE = "mexc_pro_futures.log"
+STATE_FILE = "mexc_pro_futures_state.json"
 
-BASE_URL_SPOT = "https://api.binance.com"
-BASE_URL_FUTURES = "https://fapi.binance.com"
+MEXC_BASE_URL = "https://api.mexc.com"
 
-MARKET_TYPE = "futures"
-
-SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "PAXGUSDT",
+# MEXC futures contract symbols underscore ile kullanılır
+REQUESTED_SYMBOLS = [
+    "BTC_USDT",
+    "ETH_USDT",
+    "PAXG_USDT",
 ]
 
-BTC_SYMBOL = "BTCUSDT"
+BTC_SYMBOL = "BTC_USDT"
 
 CHECK_EVERY_SECONDS = 60
 
-TF_TREND = "4h"
-TF_SETUP = "1h"
-TF_ENTRY = "30m"
-
-LIMIT_4H = 320
-LIMIT_1H = 420
-LIMIT_30M = 520
+TF_TREND = "Hour4"
+TF_SETUP = "Min60"
+TF_ENTRY = "Min30"
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -150,14 +144,13 @@ SAME_DIRECTION_SCORE_BONUS = 2.50
 TOP_N_SIGNALS = 3
 MIN_SCORE_SEND = 9
 
-# debug / summary
 SUMMARY_EVERY_MINUTES = 120
 SEND_EMPTY_STATUS = True
 
 # =========================================================
 # LOGGING
 # =========================================================
-logger = logging.getLogger("crypto_pro_futures_debug_bot")
+logger = logging.getLogger("mexc_pro_futures_bot")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -208,6 +201,7 @@ def default_state():
         "active_signal": {},
         "signal_history": [],
         "last_summary_ts": 0,
+        "active_symbols": [],
     }
 
 def load_state():
@@ -223,6 +217,7 @@ def load_state():
             data.setdefault("active_signal", {})
             data.setdefault("signal_history", [])
             data.setdefault("last_summary_ts", 0)
+            data.setdefault("active_symbols", [])
             return data
     except Exception as e:
         logger.exception("State load exception: %s", e)
@@ -240,45 +235,127 @@ def minutes_since(ts):
     return (now_ts() - int(ts)) / 60.0
 
 # =========================================================
-# MARKET DATA
+# MEXC FUTURES API
 # =========================================================
-def get_klines(symbol: str, interval: str, limit: int = 300):
-    if MARKET_TYPE == "futures":
-        url = f"{BASE_URL_FUTURES}/fapi/v1/klines"
-    else:
-        url = f"{BASE_URL_SPOT}/api/v3/klines"
-
+def mexc_get(path: str, params=None):
+    url = f"{MEXC_BASE_URL}{path}"
     try:
-        r = HTTP.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=20)
-        r.raise_for_status()
+        r = HTTP.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            logger.error("MEXC HTTP ERROR | path=%s status=%s body=%s", path, r.status_code, r.text[:500])
+            return None
         data = r.json()
+        return data
     except Exception as e:
-        logger.warning("Kline alınamadı %s %s: %s", symbol, interval, e)
+        logger.exception("MEXC GET exception | path=%s | %s", path, e)
         return None
 
-    if not data or not isinstance(data, list):
+def get_contract_detail():
+    data = mexc_get("/api/v1/contract/detail")
+    if not data or not isinstance(data, dict):
+        return []
+
+    if not data.get("success", False):
+        logger.error("Contract detail fail: %s", str(data)[:500])
+        return []
+
+    result = data.get("data", [])
+    if not isinstance(result, list):
+        return []
+    return result
+
+def get_active_symbols(requested_symbols):
+    details = get_contract_detail()
+    if not details:
+        logger.warning("Contract detail boş geldi.")
+        return []
+
+    active = []
+    available = set()
+
+    for item in details:
+        symbol = str(item.get("symbol", "")).upper()
+        available.add(symbol)
+
+        # apiAllowed alanı docs change log'da eklenmişti; yoksa True varsay
+        api_allowed = item.get("apiAllowed", True)
+        if symbol in requested_symbols and api_allowed:
+            active.append(symbol)
+
+    missing = [s for s in requested_symbols if s not in available]
+    for s in missing:
+        logger.warning("İstenen symbol bulunamadı: %s", s)
+
+    return sorted(list(set(active)))
+
+def get_klines(symbol: str, interval: str, bars: int = 320):
+    # MEXC futures kline endpoint start/end second timestamp ile çalışıyor.
+    # İstenen bar sayısına göre zaman aralığı kuruyoruz.
+    interval_sec_map = {
+        "Min1": 60,
+        "Min5": 300,
+        "Min15": 900,
+        "Min30": 1800,
+        "Min60": 3600,
+        "Hour4": 14400,
+        "Hour8": 28800,
+        "Day1": 86400,
+        "Week1": 604800,
+        "Month1": 2592000,
+    }
+    sec = interval_sec_map.get(interval, 60)
+    end_ts = int(time.time())
+    start_ts = end_ts - (bars * sec)
+
+    data = mexc_get(
+        f"/api/v1/contract/kline/{symbol}",
+        params={"interval": interval, "start": start_ts, "end": end_ts}
+    )
+    if not data or not isinstance(data, dict):
+        return None
+
+    if not data.get("success", False):
+        logger.error("KLINE FAIL | symbol=%s interval=%s data=%s", symbol, interval, str(data)[:500])
+        return None
+
+    k = data.get("data", {})
+    if not isinstance(k, dict):
+        logger.error("KLINE DATA INVALID | symbol=%s interval=%s", symbol, interval)
+        return None
+
+    times = k.get("time", [])
+    opens = k.get("open", [])
+    highs = k.get("high", [])
+    lows = k.get("low", [])
+    closes = k.get("close", [])
+    vols = k.get("vol", k.get("volume", []))
+
+    lens = [len(times), len(opens), len(highs), len(lows), len(closes), len(vols)]
+    if min(lens) == 0 or len(set(lens)) != 1:
+        logger.error("KLINE LENGTH MISMATCH | symbol=%s interval=%s lens=%s", symbol, interval, lens)
         return None
 
     rows = []
     try:
-        for x in data:
+        for i in range(len(times)):
             rows.append({
-                "open_time": pd.to_datetime(x[0], unit="ms", utc=True).tz_convert(TZ).tz_localize(None),
-                "open": float(x[1]),
-                "high": float(x[2]),
-                "low": float(x[3]),
-                "close": float(x[4]),
-                "volume": float(x[5]),
-                "close_time": pd.to_datetime(x[6], unit="ms", utc=True).tz_convert(TZ).tz_localize(None),
-                "quote_volume": float(x[7]),
-                "trades": int(x[8]),
+                "open_time": pd.to_datetime(int(times[i]), unit="s", utc=True).tz_convert(TZ).tz_localize(None),
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i]),
+                "volume": float(vols[i]),
             })
+
+        if not rows:
+            return None
 
         df = pd.DataFrame(rows)
         df.set_index("open_time", inplace=True)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
         return df
     except Exception as e:
-        logger.warning("Kline parse hata %s %s: %s", symbol, interval, e)
+        logger.exception("KLINE PARSE FAIL | symbol=%s interval=%s | %s", symbol, interval, e)
         return None
 
 # =========================================================
@@ -351,48 +428,24 @@ def candle_parts(row):
 def bullish_engulf(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 3:
         return False
-
     a = df.iloc[-2]
     b = df.iloc[-1]
     ao, _, _, ac, abody, _, _, _ = candle_parts(a)
     bo, _, _, bc, bbody, _, _, _ = candle_parts(b)
-
-    if ac >= ao:
+    if ac >= ao or bc <= bo or bbody <= abody:
         return False
-    if bc <= bo:
-        return False
-    if bbody <= abody:
-        return False
-
-    prev_body_low = min(ao, ac)
-    prev_body_high = max(ao, ac)
-    curr_body_low = min(bo, bc)
-    curr_body_high = max(bo, bc)
-
-    return curr_body_low <= prev_body_low and curr_body_high >= prev_body_high
+    return min(bo, bc) <= min(ao, ac) and max(bo, bc) >= max(ao, ac)
 
 def bearish_engulf(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 3:
         return False
-
     a = df.iloc[-2]
     b = df.iloc[-1]
     ao, _, _, ac, abody, _, _, _ = candle_parts(a)
     bo, _, _, bc, bbody, _, _, _ = candle_parts(b)
-
-    if ac <= ao:
+    if ac <= ao or bc >= bo or bbody <= abody:
         return False
-    if bc >= bo:
-        return False
-    if bbody <= abody:
-        return False
-
-    prev_body_low = min(ao, ac)
-    prev_body_high = max(ao, ac)
-    curr_body_low = min(bo, bc)
-    curr_body_high = max(bo, bc)
-
-    return curr_body_low <= prev_body_low and curr_body_high >= prev_body_high
+    return min(bo, bc) <= min(ao, ac) and max(bo, bc) >= max(ao, ac)
 
 def bullish_pinbar(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 1:
@@ -465,7 +518,6 @@ def distance_from_ema20_atr(ind: Ind):
 def breakout_quality_long(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
         return False, "NO_DATA"
-
     last = df.iloc[-1]
     _, _, _, c, body, _, upper_wick, _ = candle_parts(last)
     wick_body_ratio = upper_wick / max(body, 1e-12)
@@ -483,7 +535,6 @@ def breakout_quality_long(df: pd.DataFrame, atr: float):
 def breakout_quality_short(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
         return False, "NO_DATA"
-
     last = df.iloc[-1]
     _, _, _, c, body, _, _, lower_wick = candle_parts(last)
     wick_body_ratio = lower_wick / max(body, 1e-12)
@@ -505,17 +556,16 @@ def get_btc_filter_bias():
     if not USE_BTC_FILTER:
         return "NEUTRAL", "BTC_FILTER_DISABLED"
 
+    df = get_klines(BTC_SYMBOL, "Min30", 100)
+    if df is None or len(df) < 8:
+        return "NEUTRAL", "BTC_FILTER_DATA_FAIL"
+
     try:
-        df = get_klines(BTC_SYMBOL, "30m", 100)
-        if df is None or len(df) < 8:
-            return "NEUTRAL", "BTC_FILTER_DATA_FAIL"
-
-        closed = df.iloc[:-1].copy() if len(df) > 5 else df.copy()
-        prev_close = float(closed["close"].iloc[-4])
-        last_close = float(closed["close"].iloc[-1])
+        prev_close = float(df["close"].iloc[-4])
+        last_close = float(df["close"].iloc[-1])
         move = pct_change(prev_close, last_close)
+        ind = compute_ind(df)
 
-        ind = compute_ind(closed)
         if ind is None:
             return "NEUTRAL", f"BTC_FLAT:{round(move, 3)}%"
 
@@ -551,7 +601,6 @@ def rr(direction: str, entry: float, sl: float, target: float):
     else:
         risk = sl - entry
         reward = entry - target
-
     if risk <= 0:
         return None
     return reward / risk
@@ -635,13 +684,9 @@ def is_tp1_hit(signal, current_price):
     direction = signal["direction"]
     tp1 = safe_float(signal.get("tp1"))
     cp = safe_float(current_price)
-
     if tp1 is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp >= tp1
-    return cp <= tp1
+    return cp >= tp1 if direction == "LONG" else cp <= tp1
 
 def is_sl_hit(signal, current_price):
     if not signal:
@@ -649,13 +694,9 @@ def is_sl_hit(signal, current_price):
     direction = signal["direction"]
     sl = safe_float(signal.get("sl"))
     cp = safe_float(current_price)
-
     if sl is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp <= sl
-    return cp >= sl
+    return cp <= sl if direction == "LONG" else cp >= sl
 
 def is_expired(signal):
     if not signal:
@@ -667,15 +708,12 @@ def refresh_active_signal_if_needed(state, symbol, current_price):
     active = state.get("active_signal", {}).get(key)
     if not active:
         return
-
     if is_sl_hit(active, current_price):
         close_active_signal(state, symbol, "SL_HIT", current_price, notify_telegram=True)
         return
-
     if is_tp1_hit(active, current_price):
         close_active_signal(state, symbol, "TP1_HIT", current_price, notify_telegram=True)
         return
-
     if is_expired(active):
         close_active_signal(state, symbol, "TIMEOUT", current_price, notify_telegram=True)
         return
@@ -685,16 +723,13 @@ def recent_gap_blocked(state, symbol, new_signal):
     last_signal = state.get("last_signal", {}).get(key)
     if not last_signal:
         return False
-
     mins = minutes_since(last_signal.get("created_ts"))
     if mins >= MIN_SIGNAL_GAP_MINUTES:
         return False
-
     if is_same_direction(last_signal, new_signal):
         dist = entry_distance_pct(last_signal, new_signal)
         if dist < MIN_PRICE_DISTANCE_PCT:
             return True
-
     return False
 
 def should_send_signal(state, symbol, new_signal, current_price):
@@ -717,11 +752,9 @@ def should_send_signal(state, symbol, new_signal, current_price):
     if is_opposite_direction(active, new_signal):
         active_score = safe_float(active.get("score"), 0.0)
         new_score = safe_float(new_signal.get("score"), 0.0)
-
         if new_score >= active_score + REVERSE_SIGNAL_STRENGTH_BONUS:
             close_active_signal(state, symbol, "REVERSED_BY_STRONGER_SIGNAL", current_price, notify_telegram=True)
             return True, "OPPOSITE_STRONG_SIGNAL"
-
         return False, "OPPOSITE_SIGNAL_NOT_STRONG_ENOUGH"
 
     dist_pct = entry_distance_pct(active, new_signal)
@@ -758,9 +791,9 @@ def evaluate_symbol(symbol: str):
         "debug": {},
     }
 
-    df_4h = get_klines(symbol, TF_TREND, LIMIT_4H)
-    df_1h = get_klines(symbol, TF_SETUP, LIMIT_1H)
-    df_30m = get_klines(symbol, TF_ENTRY, LIMIT_30M)
+    df_4h = get_klines(symbol, TF_TREND, 320)
+    df_1h = get_klines(symbol, TF_SETUP, 420)
+    df_30m = get_klines(symbol, TF_ENTRY, 520)
 
     if df_4h is None or df_1h is None or df_30m is None:
         result["info"] = "DATA_FAIL"
@@ -1009,13 +1042,14 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=long_score,
-                strategy_tag="FUTURES_DEBUG_4H_1H_30M_ENGULF_FAKEFILTER_V3",
+                strategy_tag="MEXC_FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V1",
                 reason=" | ".join(long_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
                 tags=list(dict.fromkeys(long_tags))
             ))
         else:
             result["info"] = f"LONG_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(long_score,2)}"
-    elif trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
+
+    if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
         rr2 = rr("SHORT", entry, sl, tp2)
@@ -1030,28 +1064,25 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=short_score,
-                strategy_tag="FUTURES_DEBUG_4H_1H_30M_ENGULF_FAKEFILTER_V3",
+                strategy_tag="MEXC_FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V1",
                 reason=" | ".join(short_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
                 tags=list(dict.fromkeys(short_tags))
             ))
         else:
             result["info"] = f"SHORT_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(short_score,2)}"
-    else:
-        blockers = []
-        if not trend_4h_long_ok and not trend_4h_short_ok:
-            blockers.append("4H_TREND_FAIL")
-        if not setup_1h_long_ok and not setup_1h_short_ok:
-            blockers.append("1H_SETUP_FAIL")
-        if not entry_30m_long_ok and not entry_30m_short_ok:
-            blockers.append("30M_ENTRY_FAIL")
-        if not long_trigger_ok and not short_trigger_ok:
-            blockers.append("TRIGGER_FAIL")
-
-        if not blockers:
-            blockers.append("NO_CANDIDATE")
-        result["info"] = " | ".join(blockers)
 
     if not candidates:
+        if not result["info"]:
+            blockers = []
+            if not trend_4h_long_ok and not trend_4h_short_ok:
+                blockers.append("4H_TREND_FAIL")
+            if not setup_1h_long_ok and not setup_1h_short_ok:
+                blockers.append("1H_SETUP_FAIL")
+            if not entry_30m_long_ok and not entry_30m_short_ok:
+                blockers.append("30M_ENTRY_FAIL")
+            if not long_trigger_ok and not short_trigger_ok:
+                blockers.append("TRIGGER_FAIL")
+            result["info"] = " | ".join(blockers) if blockers else "NO_CANDIDATE"
         return result
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -1068,7 +1099,7 @@ def format_signal_message(sig, current_price):
     tags = ", ".join(sig.get("tags", [])) if sig.get("tags") else "Normal"
 
     return (
-        f"{emoji} {sig['symbol']} {sig['direction']} FUTURES SİNYAL\n"
+        f"{emoji} {sig['symbol']} {sig['direction']} MEXC FUTURES SİNYAL\n"
         f"Fiyat: {fmt_price(current_price)}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -1103,18 +1134,16 @@ def format_close_message(sig, close_reason, close_price=None):
         f"TP3: {fmt_price(sig.get('tp3'))}\n"
         f"Kapanış nedeni: {reason_text}\n"
     )
-
     if close_price is not None:
         body += f"Kapanış fiyatı: {fmt_price(close_price)}\n"
-
     body += f"İlk score: {sig.get('score')}\nZaman: {now_str()}"
     return body
 
-def format_status_summary(scan_results):
+def format_status_summary(scan_results, active_symbols):
     ts = now_dt().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"📊 CRYPTO PRO FUTURES DURUM ÖZETİ — {ts} TR",
-        f"Market: {MARKET_TYPE}",
+        f"📊 MEXC FUTURES DURUM ÖZETİ — {ts} TR",
+        f"Aktif sözleşmeler: {', '.join(active_symbols) if active_symbols else 'YOK'}",
         f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter",
         ""
     ]
@@ -1148,10 +1177,22 @@ def should_send_summary(state):
 # =========================================================
 def run_once():
     state = load_state()
+
+    active_symbols = get_active_symbols(REQUESTED_SYMBOLS)
+    state["active_symbols"] = active_symbols
+
     raw_candidates = []
     scan_results = []
 
-    for symbol in SYMBOLS:
+    if not active_symbols:
+        logger.warning("Aktif symbol bulunamadı.")
+        if SEND_EMPTY_STATUS and should_send_summary(state):
+            tg_send("⚠️ MEXC contract detail içinde istenen aktif symbol bulunamadı.")
+            state["last_summary_ts"] = now_ts()
+        save_state(state)
+        return
+
+    for symbol in active_symbols:
         try:
             r = evaluate_symbol(symbol)
             scan_results.append(r)
@@ -1192,34 +1233,35 @@ def run_once():
     if raw_candidates:
         raw_candidates.sort(key=lambda x: x[0]["score"], reverse=True)
         selected = raw_candidates[:TOP_N_SIGNALS]
-        sent_list = []
 
         for sig, current_price, reason_code in selected:
             message = format_signal_message(sig, current_price)
             sent = tg_send(message)
-
             if sent:
                 register_sent_signal(state, sig["symbol"], sig)
-                sent_list.append(sig)
                 logger.info(
                     "YENİ SİNYAL GÖNDERİLDİ | %s | %s | entry=%s sl=%s tp1=%s tp2=%s tp3=%s score=%s | %s",
                     sig["symbol"], sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"], sig["score"], reason_code
                 )
 
     if SEND_EMPTY_STATUS and should_send_summary(state):
-        tg_send(format_status_summary(scan_results))
+        tg_send(format_status_summary(scan_results, active_symbols))
         state["last_summary_ts"] = now_ts()
 
     save_state(state)
 
-def send_startup_message():
+def send_startup_message(state):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        active_symbols = get_active_symbols(REQUESTED_SYMBOLS)
+        state["active_symbols"] = active_symbols
+        save_state(state)
+
         tg_send(
-            f"🤖 CRYPTO PRO FUTURES DEBUG BOT başladı.\n"
+            f"🤖 MEXC FUTURES BOT başladı.\n"
             f"Zaman: {now_str()}\n"
-            f"Pariteler: {', '.join(SYMBOLS)}\n"
-            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter + durum özeti\n"
-            f"Market: {MARKET_TYPE}"
+            f"İstenen: {', '.join(REQUESTED_SYMBOLS)}\n"
+            f"Aktif: {', '.join(active_symbols) if active_symbols else 'YOK'}\n"
+            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter + durum özeti"
         )
         logger.info("Başlangıç mesajı gönderildi.")
     else:
@@ -1227,7 +1269,8 @@ def send_startup_message():
 
 def main():
     logger.info("Bot başlıyor...")
-    send_startup_message()
+    state = load_state()
+    send_startup_message(state)
 
     while True:
         try:
