@@ -54,7 +54,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "mexc-pro-futures-bot/1.0"})
+HTTP.headers.update({"User-Agent": "mexc-propp-v2-bot/1.0"})
 
 retry = Retry(
     total=3,
@@ -71,12 +71,10 @@ HTTP.mount("http://", adapter)
 # =========================================================
 # CONFIG
 # =========================================================
-LOG_FILE = "mexc_pro_futures.log"
-STATE_FILE = "mexc_pro_futures_state.json"
-
+LOG_FILE = "mexc_propp_v2.log"
+STATE_FILE = "mexc_propp_v2_state.json"
 MEXC_BASE_URL = "https://api.mexc.com"
 
-# MEXC futures contract symbols underscore ile kullanılır
 REQUESTED_SYMBOLS = [
     "BTC_USDT",
     "ETH_USDT",
@@ -101,23 +99,23 @@ ADX_PERIOD = 14
 MIN_4H_ADX = 18
 MIN_1H_ADX = 16
 
-MIN_4H_RSI_LONG = 52
-MAX_4H_RSI_LONG = 74
-MIN_4H_RSI_SHORT = 26
-MAX_4H_RSI_SHORT = 48
+MIN_4H_RSI_LONG = 50
+MAX_4H_RSI_LONG = 76
+MIN_4H_RSI_SHORT = 24
+MAX_4H_RSI_SHORT = 50
 
-MIN_1H_RSI_LONG = 48
-MAX_1H_RSI_LONG = 66
-MIN_1H_RSI_SHORT = 34
-MAX_1H_RSI_SHORT = 52
+MIN_1H_RSI_LONG = 46
+MAX_1H_RSI_LONG = 68
+MIN_1H_RSI_SHORT = 32
+MAX_1H_RSI_SHORT = 54
 
-MIN_30M_RSI_LONG = 45
-MAX_30M_RSI_LONG = 66
-MIN_30M_RSI_SHORT = 34
-MAX_30M_RSI_SHORT = 55
+MIN_30M_RSI_LONG = 43
+MAX_30M_RSI_LONG = 68
+MIN_30M_RSI_SHORT = 32
+MAX_30M_RSI_SHORT = 57
 
-VOLUME_SURGE_MULT = 1.12
-BOLL_SQUEEZE_Q = 0.30
+VOLUME_SURGE_MULT = 1.08
+BOLL_SQUEEZE_Q = 0.32
 BREAKOUT_LOOKBACK = 20
 
 ATR_SL_MULTIPLIER = 1.25
@@ -125,14 +123,20 @@ ATR_TP1_MULTIPLIER = 1.50
 ATR_TP2_MULTIPLIER = 2.40
 ATR_TP3_MULTIPLIER = 3.40
 
-MIN_RR_TO_TP2 = 1.10
-MAX_LAST_CANDLE_RANGE_ATR = 2.40
-MAX_DISTANCE_FROM_EMA20_ATR = 2.10
+FULL_MIN_RR_TO_TP2 = 1.10
+EARLY_MIN_RR_TO_TP2 = 1.00
+
+MAX_LAST_CANDLE_RANGE_ATR = 2.50
+MAX_DISTANCE_FROM_EMA20_ATR = 2.20
 MAX_BREAKOUT_WICK_BODY_RATIO = 2.60
 MIN_BREAKOUT_BODY_ATR = 0.15
 
 USE_BTC_FILTER = True
 BTC_30M_TREND_THRESHOLD = 0.10
+
+FULL_MIN_SCORE = 9.5
+EARLY_MIN_SCORE = 6.5
+WATCHLIST_MIN_SCORE = 5.0
 
 MIN_SIGNAL_GAP_MINUTES = 35
 MAX_ACTIVE_SIGNAL_AGE_MINUTES = 240
@@ -142,15 +146,13 @@ REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
 SAME_DIRECTION_SCORE_BONUS = 2.50
 
 TOP_N_SIGNALS = 3
-MIN_SCORE_SEND = 9
-
 SUMMARY_EVERY_MINUTES = 120
 SEND_EMPTY_STATUS = True
 
 # =========================================================
 # LOGGING
 # =========================================================
-logger = logging.getLogger("mexc_pro_futures_bot")
+logger = logging.getLogger("mexc_propp_v2_bot")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -201,6 +203,7 @@ def default_state():
         "active_signal": {},
         "signal_history": [],
         "last_summary_ts": 0,
+        "last_watchlist_sent": {},
         "active_symbols": [],
     }
 
@@ -217,6 +220,7 @@ def load_state():
             data.setdefault("active_signal", {})
             data.setdefault("signal_history", [])
             data.setdefault("last_summary_ts", 0)
+            data.setdefault("last_watchlist_sent", {})
             data.setdefault("active_symbols", [])
             return data
     except Exception as e:
@@ -235,7 +239,7 @@ def minutes_since(ts):
     return (now_ts() - int(ts)) / 60.0
 
 # =========================================================
-# MEXC FUTURES API
+# MEXC API
 # =========================================================
 def mexc_get(path: str, params=None):
     url = f"{MEXC_BASE_URL}{path}"
@@ -244,8 +248,7 @@ def mexc_get(path: str, params=None):
         if r.status_code != 200:
             logger.error("MEXC HTTP ERROR | path=%s status=%s body=%s", path, r.status_code, r.text[:500])
             return None
-        data = r.json()
-        return data
+        return r.json()
     except Exception as e:
         logger.exception("MEXC GET exception | path=%s | %s", path, e)
         return None
@@ -260,14 +263,11 @@ def get_contract_detail():
         return []
 
     result = data.get("data", [])
-    if not isinstance(result, list):
-        return []
-    return result
+    return result if isinstance(result, list) else []
 
 def get_active_symbols(requested_symbols):
     details = get_contract_detail()
     if not details:
-        logger.warning("Contract detail boş geldi.")
         return []
 
     active = []
@@ -276,21 +276,17 @@ def get_active_symbols(requested_symbols):
     for item in details:
         symbol = str(item.get("symbol", "")).upper()
         available.add(symbol)
-
-        # apiAllowed alanı docs change log'da eklenmişti; yoksa True varsay
         api_allowed = item.get("apiAllowed", True)
         if symbol in requested_symbols and api_allowed:
             active.append(symbol)
 
-    missing = [s for s in requested_symbols if s not in available]
-    for s in missing:
-        logger.warning("İstenen symbol bulunamadı: %s", s)
+    for s in requested_symbols:
+        if s not in available:
+            logger.warning("İstenen symbol bulunamadı: %s", s)
 
     return sorted(list(set(active)))
 
 def get_klines(symbol: str, interval: str, bars: int = 320):
-    # MEXC futures kline endpoint start/end second timestamp ile çalışıyor.
-    # İstenen bar sayısına göre zaman aralığı kuruyoruz.
     interval_sec_map = {
         "Min1": 60,
         "Min5": 300,
@@ -320,7 +316,6 @@ def get_klines(symbol: str, interval: str, bars: int = 320):
 
     k = data.get("data", {})
     if not isinstance(k, dict):
-        logger.error("KLINE DATA INVALID | symbol=%s interval=%s", symbol, interval)
         return None
 
     times = k.get("time", [])
@@ -346,9 +341,6 @@ def get_klines(symbol: str, interval: str, bars: int = 320):
                 "close": float(closes[i]),
                 "volume": float(vols[i]),
             })
-
-        if not rows:
-            return None
 
         df = pd.DataFrame(rows)
         df.set_index("open_time", inplace=True)
@@ -471,16 +463,13 @@ def bearish_pinbar(df: pd.DataFrame) -> bool:
 def bollinger_squeeze(df: pd.DataFrame):
     if df is None or len(df) < 40:
         return False
-
     bb = BollingerBands(close=df["close"], window=20, window_dev=2)
     mid = bb.bollinger_mavg()
     upper = bb.bollinger_hband()
     lower = bb.bollinger_lband()
-
     width = ((upper - lower) / mid.replace(0, pd.NA)).dropna()
     if len(width) < 20:
         return False
-
     tail = width.iloc[-20:]
     return float(tail.iloc[-1]) <= float(tail.quantile(BOLL_SQUEEZE_Q))
 
@@ -623,7 +612,7 @@ def fmt_price(v):
 # =========================================================
 # SIGNAL PAYLOAD
 # =========================================================
-def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, tags):
+def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, tags, signal_type):
     return {
         "symbol": symbol,
         "direction": direction.upper(),
@@ -636,6 +625,7 @@ def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, str
         "strategy_tag": strategy_tag,
         "reason": reason,
         "tags": tags,
+        "signal_type": signal_type,
         "created_ts": now_ts(),
         "updated_ts": now_ts(),
         "status": "OPEN"
@@ -777,6 +767,16 @@ def register_sent_signal(state, symbol, sent_signal):
     state["last_signal"][key] = sent_signal
 
 # =========================================================
+# WATCHLIST CONTROL
+# =========================================================
+def should_send_watchlist(state, symbol):
+    ts = state.get("last_watchlist_sent", {}).get(symbol, 0)
+    return minutes_since(ts) >= 180  # 3 saat
+
+def mark_watchlist_sent(state, symbol):
+    state["last_watchlist_sent"][symbol] = now_ts()
+
+# =========================================================
 # STRATEGY
 # =========================================================
 def evaluate_symbol(symbol: str):
@@ -788,6 +788,7 @@ def evaluate_symbol(symbol: str):
         "long_score": 0.0,
         "short_score": 0.0,
         "signal": None,
+        "watchlist": None,
         "debug": {},
     }
 
@@ -846,12 +847,29 @@ def evaluate_symbol(symbol: str):
         and MIN_4H_RSI_SHORT <= ind_4h.rsi <= MAX_4H_RSI_SHORT
     )
 
+    # 4H partial dönüş puanı
+    trend_4h_long_partial = (
+        ind_4h.close > ind_4h.ema20 and
+        ind_4h.rsi >= 48
+    )
+    trend_4h_short_partial = (
+        ind_4h.close < ind_4h.ema20 and
+        ind_4h.rsi <= 52
+    )
+
     if trend_4h_long_ok:
         long_score += 3.0
         long_reasons.append("4h trend bullish")
+    elif trend_4h_long_partial:
+        long_score += 1.0
+        long_reasons.append("4h early bullish shift")
+
     if trend_4h_short_ok:
         short_score += 3.0
         short_reasons.append("4h trend bearish")
+    elif trend_4h_short_partial:
+        short_score += 1.0
+        short_reasons.append("4h early bearish shift")
 
     if ind_4h.adx >= 22:
         if trend_4h_long_ok:
@@ -862,16 +880,16 @@ def evaluate_symbol(symbol: str):
             short_reasons.append("4h adx strong")
 
     setup_1h_long_ok = (
-        ind_1h.close > ind_1h.ema50
-        and ind_1h.ema20 > ind_1h.ema50 > ind_1h.ema200
-        and ind_1h.adx >= MIN_1H_ADX
-        and MIN_1H_RSI_LONG <= ind_1h.rsi <= MAX_1H_RSI_LONG
+        ind_1h.close > ind_1h.ema50 and
+        ind_1h.ema20 > ind_1h.ema50 > ind_1h.ema200 and
+        ind_1h.adx >= MIN_1H_ADX and
+        MIN_1H_RSI_LONG <= ind_1h.rsi <= MAX_1H_RSI_LONG
     )
     setup_1h_short_ok = (
-        ind_1h.close < ind_1h.ema50
-        and ind_1h.ema20 < ind_1h.ema50 < ind_1h.ema200
-        and ind_1h.adx >= MIN_1H_ADX
-        and MIN_1H_RSI_SHORT <= ind_1h.rsi <= MAX_1H_RSI_SHORT
+        ind_1h.close < ind_1h.ema50 and
+        ind_1h.ema20 < ind_1h.ema50 < ind_1h.ema200 and
+        ind_1h.adx >= MIN_1H_ADX and
+        MIN_1H_RSI_SHORT <= ind_1h.rsi <= MAX_1H_RSI_SHORT
     )
 
     if setup_1h_long_ok:
@@ -901,12 +919,12 @@ def evaluate_symbol(symbol: str):
         short_score -= 0.20
 
     entry_30m_long_ok = (
-        ind_30m.close > ind_30m.ema20 > ind_30m.ema50 > ind_30m.ema200
-        and MIN_30M_RSI_LONG <= ind_30m.rsi <= MAX_30M_RSI_LONG
+        ind_30m.close > ind_30m.ema20 > ind_30m.ema50 > ind_30m.ema200 and
+        MIN_30M_RSI_LONG <= ind_30m.rsi <= MAX_30M_RSI_LONG
     )
     entry_30m_short_ok = (
-        ind_30m.close < ind_30m.ema20 < ind_30m.ema50 < ind_30m.ema200
-        and MIN_30M_RSI_SHORT <= ind_30m.rsi <= MAX_30M_RSI_SHORT
+        ind_30m.close < ind_30m.ema20 < ind_30m.ema50 < ind_30m.ema200 and
+        MIN_30M_RSI_SHORT <= ind_30m.rsi <= MAX_30M_RSI_SHORT
     )
 
     if entry_30m_long_ok:
@@ -980,6 +998,8 @@ def evaluate_symbol(symbol: str):
         "btc_reason": btc_reason,
         "trend_4h_long_ok": trend_4h_long_ok,
         "trend_4h_short_ok": trend_4h_short_ok,
+        "trend_4h_long_partial": trend_4h_long_partial,
+        "trend_4h_short_partial": trend_4h_short_partial,
         "setup_1h_long_ok": setup_1h_long_ok,
         "setup_1h_short_ok": setup_1h_short_ok,
         "entry_30m_long_ok": entry_30m_long_ok,
@@ -992,8 +1012,6 @@ def evaluate_symbol(symbol: str):
         "breakout_short": trigger_breakout_short,
         "breakout_long_ok": breakout_long_ok,
         "breakout_short_ok": breakout_short_ok,
-        "breakout_long_reason": breakout_long_reason,
-        "breakout_short_reason": breakout_short_reason,
         "trigger_volume": trigger_volume,
         "trigger_squeeze": trigger_squeeze,
         "last_range_atr": round(last_range_atr, 3) if last_range_atr is not None else None,
@@ -1014,25 +1032,28 @@ def evaluate_symbol(symbol: str):
         result["info"] = f"TOO_FAR_FROM_EMA20 atr={round(dist_ema20_atr, 2)}"
         return result
 
-    candidates = []
-
     long_trigger_ok = (
-        (trigger_breakout_long and breakout_long_ok)
-        or engulf_long
-        or (trigger_volume and trigger_squeeze and entry_30m_long_ok)
+        (trigger_breakout_long and breakout_long_ok) or
+        engulf_long or
+        pinbar_long or
+        (trigger_volume and trigger_squeeze and entry_30m_long_ok)
     )
     short_trigger_ok = (
-        (trigger_breakout_short and breakout_short_ok)
-        or engulf_short
-        or (trigger_volume and trigger_squeeze and entry_30m_short_ok)
+        (trigger_breakout_short and breakout_short_ok) or
+        engulf_short or
+        pinbar_short or
+        (trigger_volume and trigger_squeeze and entry_30m_short_ok)
     )
 
+    candidates = []
+
+    # FULL LONG
     if trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
         rr2 = rr("LONG", entry, sl, tp2)
 
-        if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and long_score >= MIN_SCORE_SEND:
+        if rr2 is not None and rr2 >= FULL_MIN_RR_TO_TP2 and long_score >= FULL_MIN_SCORE:
             candidates.append(build_signal_payload(
                 symbol=symbol,
                 direction="LONG",
@@ -1042,19 +1063,19 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=long_score,
-                strategy_tag="MEXC_FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V1",
+                strategy_tag="MEXC_PROPP_V2_FULL",
                 reason=" | ".join(long_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
-                tags=list(dict.fromkeys(long_tags))
+                tags=list(dict.fromkeys(long_tags)),
+                signal_type="FULL"
             ))
-        else:
-            result["info"] = f"LONG_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(long_score,2)}"
 
+    # FULL SHORT
     if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
         rr2 = rr("SHORT", entry, sl, tp2)
 
-        if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and short_score >= MIN_SCORE_SEND:
+        if rr2 is not None and rr2 >= FULL_MIN_RR_TO_TP2 and short_score >= FULL_MIN_SCORE:
             candidates.append(build_signal_payload(
                 symbol=symbol,
                 direction="SHORT",
@@ -1064,31 +1085,111 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=short_score,
-                strategy_tag="MEXC_FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V1",
+                strategy_tag="MEXC_PROPP_V2_FULL",
                 reason=" | ".join(short_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
-                tags=list(dict.fromkeys(short_tags))
+                tags=list(dict.fromkeys(short_tags)),
+                signal_type="FULL"
             ))
-        else:
-            result["info"] = f"SHORT_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(short_score,2)}"
+
+    # EARLY LONG
+    if not candidates and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
+        entry = current_price
+        sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
+        rr2 = rr("LONG", entry, sl, tp2)
+
+        early_bonus = 0.0
+        if trend_4h_long_partial:
+            early_bonus += 1.0
+        if engulf_long:
+            early_bonus += 0.5
+
+        early_score = long_score + early_bonus
+
+        if rr2 is not None and rr2 >= EARLY_MIN_RR_TO_TP2 and early_score >= EARLY_MIN_SCORE:
+            candidates.append(build_signal_payload(
+                symbol=symbol,
+                direction="LONG",
+                entry=entry,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                score=early_score,
+                strategy_tag="MEXC_PROPP_V2_EARLY",
+                reason="EARLY ENTRY | 4H tam onay yok | " + " | ".join(long_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
+                tags=list(dict.fromkeys(long_tags + ["Early"])),
+                signal_type="EARLY"
+            ))
+
+    # EARLY SHORT
+    if not candidates and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
+        entry = current_price
+        sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
+        rr2 = rr("SHORT", entry, sl, tp2)
+
+        early_bonus = 0.0
+        if trend_4h_short_partial:
+            early_bonus += 1.0
+        if engulf_short:
+            early_bonus += 0.5
+
+        early_score = short_score + early_bonus
+
+        if rr2 is not None and rr2 >= EARLY_MIN_RR_TO_TP2 and early_score >= EARLY_MIN_SCORE:
+            candidates.append(build_signal_payload(
+                symbol=symbol,
+                direction="SHORT",
+                entry=entry,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                score=early_score,
+                strategy_tag="MEXC_PROPP_V2_EARLY",
+                reason="EARLY ENTRY | 4H tam onay yok | " + " | ".join(short_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
+                tags=list(dict.fromkeys(short_tags + ["Early"])),
+                signal_type="EARLY"
+            ))
+
+    # WATCHLIST LONG
+    if setup_1h_long_ok and (entry_30m_long_ok or engulf_long or trigger_volume or trigger_squeeze):
+        watch_score = long_score
+        if watch_score >= WATCHLIST_MIN_SCORE:
+            result["watchlist"] = {
+                "symbol": symbol,
+                "direction": "LONG",
+                "score": round(watch_score, 2),
+                "reason": "WATCHLIST LONG | " + " | ".join(long_reasons[:10]) + f" | {btc_reason}"
+            }
+
+    # WATCHLIST SHORT
+    if result["watchlist"] is None and setup_1h_short_ok and (entry_30m_short_ok or engulf_short or trigger_volume or trigger_squeeze):
+        watch_score = short_score
+        if watch_score >= WATCHLIST_MIN_SCORE:
+            result["watchlist"] = {
+                "symbol": symbol,
+                "direction": "SHORT",
+                "score": round(watch_score, 2),
+                "reason": "WATCHLIST SHORT | " + " | ".join(short_reasons[:10]) + f" | {btc_reason}"
+            }
 
     if not candidates:
-        if not result["info"]:
-            blockers = []
-            if not trend_4h_long_ok and not trend_4h_short_ok:
-                blockers.append("4H_TREND_FAIL")
-            if not setup_1h_long_ok and not setup_1h_short_ok:
-                blockers.append("1H_SETUP_FAIL")
-            if not entry_30m_long_ok and not entry_30m_short_ok:
-                blockers.append("30M_ENTRY_FAIL")
-            if not long_trigger_ok and not short_trigger_ok:
-                blockers.append("TRIGGER_FAIL")
-            result["info"] = " | ".join(blockers) if blockers else "NO_CANDIDATE"
+        blockers = []
+        if not trend_4h_long_ok and not trend_4h_short_ok:
+            blockers.append("4H_TREND_FAIL")
+        if not setup_1h_long_ok and not setup_1h_short_ok:
+            blockers.append("1H_SETUP_FAIL")
+        if not entry_30m_long_ok and not entry_30m_short_ok:
+            blockers.append("30M_ENTRY_FAIL")
+        if not long_trigger_ok and not short_trigger_ok:
+            blockers.append("TRIGGER_FAIL")
+        result["info"] = " | ".join(blockers) if blockers else "NO_CANDIDATE"
         return result
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates.sort(key=lambda x: (x["signal_type"] == "FULL", x["score"]), reverse=True)
     result["ok"] = True
     result["signal"] = candidates[0]
-    result["info"] = "SIGNAL_READY"
+    result["info"] = f"SIGNAL_READY:{candidates[0]['signal_type']}"
     return result
 
 # =========================================================
@@ -1096,10 +1197,13 @@ def evaluate_symbol(symbol: str):
 # =========================================================
 def format_signal_message(sig, current_price):
     emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
+    signal_type = sig.get("signal_type", "FULL")
+    prefix = "✅ FULL" if signal_type == "FULL" else "⚡ EARLY"
+
     tags = ", ".join(sig.get("tags", [])) if sig.get("tags") else "Normal"
 
     return (
-        f"{emoji} {sig['symbol']} {sig['direction']} MEXC FUTURES SİNYAL\n"
+        f"{emoji} {prefix} {sig['symbol']} {sig['direction']} MEXC FUTURES SİNYAL\n"
         f"Fiyat: {fmt_price(current_price)}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -1107,9 +1211,18 @@ def format_signal_message(sig, current_price):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"Score: {sig['score']}\n"
+        f"Tip: {signal_type}\n"
         f"Etiket: {tags}\n"
         f"Setup: {sig['strategy_tag']}\n"
         f"Neden: {sig['reason']}\n"
+        f"Zaman: {now_str()}"
+    )
+
+def format_watchlist_message(w):
+    return (
+        f"👀 WATCHLIST {w['symbol']} {w['direction']}\n"
+        f"Score: {w['score']}\n"
+        f"Neden: {w['reason']}\n"
         f"Zaman: {now_str()}"
     )
 
@@ -1127,6 +1240,7 @@ def format_close_message(sig, close_reason, close_price=None):
     body = (
         f"✅ {sig['symbol']} SİNYAL KAPANDI\n"
         f"Yön: {direction_emoji} {sig['direction']}\n"
+        f"Tip: {sig.get('signal_type', 'FULL')}\n"
         f"Entry: {fmt_price(sig.get('entry'))}\n"
         f"SL: {fmt_price(sig.get('sl'))}\n"
         f"TP1: {fmt_price(sig.get('tp1'))}\n"
@@ -1142,9 +1256,9 @@ def format_close_message(sig, close_reason, close_price=None):
 def format_status_summary(scan_results, active_symbols):
     ts = now_dt().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"📊 MEXC FUTURES DURUM ÖZETİ — {ts} TR",
+        f"📊 MEXC PRO++ V2 DURUM ÖZETİ — {ts} TR",
         f"Aktif sözleşmeler: {', '.join(active_symbols) if active_symbols else 'YOK'}",
-        f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter",
+        f"Kurgu: FULL + EARLY + WATCHLIST",
         ""
     ]
 
@@ -1157,6 +1271,7 @@ def format_status_summary(scan_results, active_symbols):
             f"  Durum: {r.get('info')}\n"
             f"  BTC: {dbg.get('btc_bias', '-')}\n"
             f"  4H L/S: {dbg.get('trend_4h_long_ok', False)}/{dbg.get('trend_4h_short_ok', False)}\n"
+            f"  4H early L/S: {dbg.get('trend_4h_long_partial', False)}/{dbg.get('trend_4h_short_partial', False)}\n"
             f"  1H L/S: {dbg.get('setup_1h_long_ok', False)}/{dbg.get('setup_1h_short_ok', False)}\n"
             f"  30M L/S: {dbg.get('entry_30m_long_ok', False)}/{dbg.get('entry_30m_short_ok', False)}\n"
             f"  Engulf L/S: {dbg.get('engulf_long', False)}/{dbg.get('engulf_short', False)}\n"
@@ -1169,8 +1284,7 @@ def format_status_summary(scan_results, active_symbols):
     return "\n".join(lines)
 
 def should_send_summary(state):
-    last_summary_ts = state.get("last_summary_ts", 0)
-    return minutes_since(last_summary_ts) >= SUMMARY_EVERY_MINUTES
+    return minutes_since(state.get("last_summary_ts", 0)) >= SUMMARY_EVERY_MINUTES
 
 # =========================================================
 # RUN
@@ -1201,6 +1315,13 @@ def run_once():
             if current_price is not None:
                 refresh_active_signal_if_needed(state, symbol, current_price)
 
+            # WATCHLIST
+            if r.get("watchlist") and should_send_watchlist(state, symbol):
+                tg_send(format_watchlist_message(r["watchlist"]))
+                mark_watchlist_sent(state, symbol)
+                logger.info("WATCHLIST gönderildi: %s", symbol)
+
+            # SIGNAL
             if r.get("ok") and r.get("signal"):
                 sig = r["signal"]
                 can_send, reason_code = should_send_signal(state, symbol, sig, current_price)
@@ -1225,23 +1346,23 @@ def run_once():
                 "long_score": 0.0,
                 "short_score": 0.0,
                 "signal": None,
+                "watchlist": None,
                 "debug": {},
             })
 
         time.sleep(0.30)
 
     if raw_candidates:
-        raw_candidates.sort(key=lambda x: x[0]["score"], reverse=True)
+        raw_candidates.sort(key=lambda x: (x[0]["signal_type"] == "FULL", x[0]["score"]), reverse=True)
         selected = raw_candidates[:TOP_N_SIGNALS]
 
         for sig, current_price, reason_code in selected:
-            message = format_signal_message(sig, current_price)
-            sent = tg_send(message)
+            sent = tg_send(format_signal_message(sig, current_price))
             if sent:
                 register_sent_signal(state, sig["symbol"], sig)
                 logger.info(
-                    "YENİ SİNYAL GÖNDERİLDİ | %s | %s | entry=%s sl=%s tp1=%s tp2=%s tp3=%s score=%s | %s",
-                    sig["symbol"], sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"], sig["score"], reason_code
+                    "YENİ SİNYAL GÖNDERİLDİ | %s | %s | type=%s | score=%s | %s",
+                    sig["symbol"], sig["direction"], sig["signal_type"], sig["score"], reason_code
                 )
 
     if SEND_EMPTY_STATUS and should_send_summary(state):
@@ -1257,11 +1378,11 @@ def send_startup_message(state):
         save_state(state)
 
         tg_send(
-            f"🤖 MEXC FUTURES BOT başladı.\n"
+            f"🤖 MEXC PRO++ V2 BOT başladı.\n"
             f"Zaman: {now_str()}\n"
             f"İstenen: {', '.join(REQUESTED_SYMBOLS)}\n"
             f"Aktif: {', '.join(active_symbols) if active_symbols else 'YOK'}\n"
-            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter + durum özeti"
+            f"Kurgu: FULL + EARLY + WATCHLIST"
         )
         logger.info("Başlangıç mesajı gönderildi.")
     else:
