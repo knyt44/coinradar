@@ -14,11 +14,6 @@ from ta.volatility import AverageTrueRange, BollingerBands
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-try:
-    import winreg
-except ImportError:
-    winreg = None
-
 # =========================================================
 # GLOBAL
 # =========================================================
@@ -49,41 +44,17 @@ def pct_diff(a, b):
         return 999.0
     return abs(a - b) / a * 100.0
 
-def read_windows_env(name: str, default: str = "") -> str:
-    val = os.getenv(name)
-    if val is not None and str(val).strip():
-        return str(val).strip()
-
-    if winreg is None:
-        return default
-
-    reg_paths = [
-        (winreg.HKEY_CURRENT_USER, r"Environment"),
-        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
-    ]
-
-    for root, path in reg_paths:
-        try:
-            with winreg.OpenKey(root, path) as key:
-                value, _ = winreg.QueryValueEx(key, name)
-                if value is not None and str(value).strip():
-                    return str(value).strip()
-        except Exception:
-            continue
-
-    return default
-
 # =========================================================
 # ENV
 # =========================================================
-TELEGRAM_BOT_TOKEN = read_windows_env("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = read_windows_env("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # =========================================================
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "crypto-propp-bot/1.0"})
+HTTP.headers.update({"User-Agent": "crypto-pro-futures-bot/2.0"})
 
 retry = Retry(
     total=3,
@@ -100,13 +71,13 @@ HTTP.mount("http://", adapter)
 # =========================================================
 # CONFIG
 # =========================================================
-LOG_FILE = "crypto_propp_bot.log"
-STATE_FILE = "crypto_propp_state.json"
+LOG_FILE = "crypto_pro_futures.log"
+STATE_FILE = "crypto_pro_futures_state.json"
 
 BASE_URL_SPOT = "https://api.binance.com"
 BASE_URL_FUTURES = "https://fapi.binance.com"
 
-MARKET_TYPE = "spot"  # "spot" veya "futures"
+MARKET_TYPE = "futures"
 
 SYMBOLS = [
     "BTCUSDT",
@@ -116,15 +87,15 @@ SYMBOLS = [
 
 BTC_SYMBOL = "BTCUSDT"
 
-CHECK_EVERY_SECONDS = 90
+CHECK_EVERY_SECONDS = 60
 
 TF_TREND = "4h"
 TF_SETUP = "1h"
 TF_ENTRY = "30m"
 
-LIMIT_4H = 300
-LIMIT_1H = 400
-LIMIT_30M = 500
+LIMIT_4H = 320
+LIMIT_1H = 420
+LIMIT_30M = 520
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -146,10 +117,10 @@ MAX_1H_RSI_LONG = 66
 MIN_1H_RSI_SHORT = 34
 MAX_1H_RSI_SHORT = 52
 
-MIN_30M_RSI_LONG = 46
-MAX_30M_RSI_LONG = 64
-MIN_30M_RSI_SHORT = 36
-MAX_30M_RSI_SHORT = 54
+MIN_30M_RSI_LONG = 45
+MAX_30M_RSI_LONG = 66
+MIN_30M_RSI_SHORT = 34
+MAX_30M_RSI_SHORT = 55
 
 VOLUME_SURGE_MULT = 1.18
 BOLL_SQUEEZE_Q = 0.30
@@ -161,13 +132,15 @@ ATR_TP2_MULTIPLIER = 2.40
 ATR_TP3_MULTIPLIER = 3.40
 
 MIN_RR_TO_TP2 = 1.25
-MAX_LAST_CANDLE_RANGE_ATR = 2.30
+MAX_LAST_CANDLE_RANGE_ATR = 2.20
 MAX_DISTANCE_FROM_EMA20_ATR = 1.80
+MAX_BREAKOUT_WICK_BODY_RATIO = 2.60
+MIN_BREAKOUT_BODY_ATR = 0.18
 
 USE_BTC_FILTER = True
 BTC_30M_TREND_THRESHOLD = 0.18
 
-MIN_SIGNAL_GAP_MINUTES = 30
+MIN_SIGNAL_GAP_MINUTES = 35
 MAX_ACTIVE_SIGNAL_AGE_MINUTES = 240
 SIGNAL_TIMEOUT_MINUTES = 240
 MIN_PRICE_DISTANCE_PCT = 0.55
@@ -175,12 +148,12 @@ REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
 SAME_DIRECTION_SCORE_BONUS = 2.50
 
 TOP_N_SIGNALS = 3
-MIN_SCORE_SEND = 10
+MIN_SCORE_SEND = 11
 
 # =========================================================
 # LOGGING
 # =========================================================
-logger = logging.getLogger("crypto_propp_bot")
+logger = logging.getLogger("crypto_pro_futures_bot")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -256,7 +229,7 @@ def save_state(state):
     os.replace(tmp_file, STATE_FILE)
 
 # =========================================================
-# BINANCE DATA
+# MARKET DATA
 # =========================================================
 def get_klines(symbol: str, interval: str, limit: int = 300):
     if MARKET_TYPE == "futures":
@@ -350,6 +323,89 @@ def trend_up(ind: Ind) -> bool:
 def trend_down(ind: Ind) -> bool:
     return ind.ema20 < ind.ema50 < ind.ema200 and ind.close < ind.ema20
 
+# =========================================================
+# CANDLE HELPERS
+# =========================================================
+def candle_parts(row):
+    o = float(row["open"])
+    h = float(row["high"])
+    l = float(row["low"])
+    c = float(row["close"])
+    body = abs(c - o)
+    rng = max(h - l, 1e-12)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    return o, h, l, c, body, rng, upper_wick, lower_wick
+
+def bullish_engulf(df: pd.DataFrame) -> bool:
+    if df is None or len(df) < 3:
+        return False
+
+    a = df.iloc[-2]
+    b = df.iloc[-1]
+
+    ao, ah, al, ac, abody, _, _, _ = candle_parts(a)
+    bo, bh, bl, bc, bbody, _, _, _ = candle_parts(b)
+
+    if ac >= ao:
+        return False
+    if bc <= bo:
+        return False
+    if bbody <= abody:
+        return False
+
+    prev_body_low = min(ao, ac)
+    prev_body_high = max(ao, ac)
+    curr_body_low = min(bo, bc)
+    curr_body_high = max(bo, bc)
+
+    return curr_body_low <= prev_body_low and curr_body_high >= prev_body_high
+
+def bearish_engulf(df: pd.DataFrame) -> bool:
+    if df is None or len(df) < 3:
+        return False
+
+    a = df.iloc[-2]
+    b = df.iloc[-1]
+
+    ao, ah, al, ac, abody, _, _, _ = candle_parts(a)
+    bo, bh, bl, bc, bbody, _, _, _ = candle_parts(b)
+
+    if ac <= ao:
+        return False
+    if bc >= bo:
+        return False
+    if bbody <= abody:
+        return False
+
+    prev_body_low = min(ao, ac)
+    prev_body_high = max(ao, ac)
+    curr_body_low = min(bo, bc)
+    curr_body_high = max(bo, bc)
+
+    return curr_body_low <= prev_body_low and curr_body_high >= prev_body_high
+
+def bullish_pinbar(df: pd.DataFrame) -> bool:
+    if df is None or len(df) < 1:
+        return False
+    row = df.iloc[-1]
+    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(row)
+    if rng <= 0:
+        return False
+    return lower_wick >= body * 2.0 and upper_wick <= body * 1.2 and c > o
+
+def bearish_pinbar(df: pd.DataFrame) -> bool:
+    if df is None or len(df) < 1:
+        return False
+    row = df.iloc[-1]
+    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(row)
+    if rng <= 0:
+        return False
+    return upper_wick >= body * 2.0 and lower_wick <= body * 1.2 and c < o
+
+# =========================================================
+# BREAKOUT / FAKE SETUP FILTERS
+# =========================================================
 def bollinger_squeeze(df: pd.DataFrame):
     if df is None or len(df) < 40:
         return False
@@ -396,6 +452,44 @@ def distance_from_ema20_atr(ind: Ind):
     if ind.atr <= 0:
         return 999.0
     return abs(ind.close - ind.ema20) / ind.atr
+
+def breakout_quality_long(df: pd.DataFrame, atr: float):
+    if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
+        return False, "NO_DATA"
+
+    last = df.iloc[-1]
+    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(last)
+    wick_body_ratio = upper_wick / max(body, 1e-12)
+    body_atr = body / atr if atr > 0 else 0.0
+
+    prev_high = float(df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
+
+    if c <= prev_high:
+        return False, "CLOSE_NOT_ABOVE_BREAKOUT"
+    if wick_body_ratio > MAX_BREAKOUT_WICK_BODY_RATIO:
+        return False, "UPPER_WICK_TOO_HIGH"
+    if body_atr < MIN_BREAKOUT_BODY_ATR:
+        return False, "BODY_TOO_SMALL"
+    return True, "OK"
+
+def breakout_quality_short(df: pd.DataFrame, atr: float):
+    if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
+        return False, "NO_DATA"
+
+    last = df.iloc[-1]
+    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(last)
+    wick_body_ratio = lower_wick / max(body, 1e-12)
+    body_atr = body / atr if atr > 0 else 0.0
+
+    prev_low = float(df["low"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].min())
+
+    if c >= prev_low:
+        return False, "CLOSE_NOT_BELOW_BREAKDOWN"
+    if wick_body_ratio > MAX_BREAKOUT_WICK_BODY_RATIO:
+        return False, "LOWER_WICK_TOO_HIGH"
+    if body_atr < MIN_BREAKOUT_BODY_ATR:
+        return False, "BODY_TOO_SMALL"
+    return True, "OK"
 
 # =========================================================
 # BTC FILTER
@@ -536,7 +630,6 @@ def close_active_signal(state, symbol, close_reason, current_price=None, notify_
 def is_tp1_hit(signal, current_price):
     if not signal:
         return False
-
     direction = signal["direction"]
     tp1 = safe_float(signal.get("tp1"))
     cp = safe_float(current_price)
@@ -551,7 +644,6 @@ def is_tp1_hit(signal, current_price):
 def is_sl_hit(signal, current_price):
     if not signal:
         return False
-
     direction = signal["direction"]
     sl = safe_float(signal.get("sl"))
     cp = safe_float(current_price)
@@ -675,6 +767,14 @@ def evaluate_symbol(symbol: str):
     trigger_volume = volume_surge(df_30m, VOLUME_SURGE_MULT)
     trigger_squeeze = bollinger_squeeze(df_30m)
 
+    engulf_long = bullish_engulf(df_30m)
+    engulf_short = bearish_engulf(df_30m)
+    pinbar_long = bullish_pinbar(df_30m)
+    pinbar_short = bearish_pinbar(df_30m)
+
+    breakout_long_ok, breakout_long_reason = breakout_quality_long(df_30m, ind_30m.atr)
+    breakout_short_ok, breakout_short_reason = breakout_quality_short(df_30m, ind_30m.atr)
+
     last_range_atr = last_candle_range_atr(df_30m, ind_30m.atr)
     if last_range_atr is not None and last_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
         return None, current_price, "LAST_BAR_TOO_WIDE"
@@ -757,7 +857,7 @@ def evaluate_symbol(symbol: str):
         long_score -= 0.20
         short_score -= 0.20
 
-    # 30M ENTRY
+    # 30M ENTRY ALIGNMENT
     entry_30m_long_ok = (
         ind_30m.close > ind_30m.ema20 > ind_30m.ema50 > ind_30m.ema200
         and MIN_30M_RSI_LONG <= ind_30m.rsi <= MAX_30M_RSI_LONG
@@ -774,15 +874,45 @@ def evaluate_symbol(symbol: str):
         short_score += 2.0
         short_reasons.append("30m entry aligned")
 
-    if trigger_breakout_long:
+    # PATTERN CONFIRMATION
+    if engulf_long:
         long_score += 2.0
-        long_reasons.append("30m breakout long")
-        long_tags.append("Breakout")
-    if trigger_breakout_short:
+        long_reasons.append("bullish engulf")
+        long_tags.append("Engulf")
+    if engulf_short:
         short_score += 2.0
-        short_reasons.append("30m breakdown short")
-        short_tags.append("Breakdown")
+        short_reasons.append("bearish engulf")
+        short_tags.append("Engulf")
 
+    if pinbar_long:
+        long_score += 1.0
+        long_reasons.append("bullish pinbar")
+        long_tags.append("Pinbar")
+    if pinbar_short:
+        short_score += 1.0
+        short_reasons.append("bearish pinbar")
+        short_tags.append("Pinbar")
+
+    # BREAKOUT / BREAKDOWN
+    if trigger_breakout_long and breakout_long_ok:
+        long_score += 2.0
+        long_reasons.append("30m breakout valid")
+        long_tags.append("Breakout")
+    elif trigger_breakout_long and not breakout_long_ok:
+        long_score -= 1.0
+        long_reasons.append(f"fake long risk:{breakout_long_reason}")
+        long_tags.append("FakeRisk")
+
+    if trigger_breakout_short and breakout_short_ok:
+        short_score += 2.0
+        short_reasons.append("30m breakdown valid")
+        short_tags.append("Breakdown")
+    elif trigger_breakout_short and not breakout_short_ok:
+        short_score -= 1.0
+        short_reasons.append(f"fake short risk:{breakout_short_reason}")
+        short_tags.append("FakeRisk")
+
+    # VOLUME + SQUEEZE
     if trigger_volume:
         if entry_30m_long_ok:
             long_score += 1.0
@@ -806,48 +936,58 @@ def evaluate_symbol(symbol: str):
     candidates = []
 
     # LONG CANDIDATE
-    if trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok:
-        if trigger_breakout_long or (trigger_volume and trigger_squeeze):
-            entry = current_price
-            sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
-            rr2 = rr("LONG", entry, sl, tp2)
+    long_trigger_ok = (
+        (trigger_breakout_long and breakout_long_ok)
+        or engulf_long
+        or (trigger_volume and trigger_squeeze and entry_30m_long_ok)
+    )
 
-            if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and long_score >= MIN_SCORE_SEND:
-                candidates.append(build_signal_payload(
-                    symbol=symbol,
-                    direction="LONG",
-                    entry=entry,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    tp3=tp3,
-                    score=long_score,
-                    strategy_tag="PROPP_4H_1H_30M_LONGSHORT_V1",
-                    reason=" | ".join(long_reasons[:10]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
-                    tags=list(dict.fromkeys(long_tags))
-                ))
+    if trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
+        entry = current_price
+        sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
+        rr2 = rr("LONG", entry, sl, tp2)
+
+        if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and long_score >= MIN_SCORE_SEND:
+            candidates.append(build_signal_payload(
+                symbol=symbol,
+                direction="LONG",
+                entry=entry,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                score=long_score,
+                strategy_tag="FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V2",
+                reason=" | ".join(long_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
+                tags=list(dict.fromkeys(long_tags))
+            ))
 
     # SHORT CANDIDATE
-    if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok:
-        if trigger_breakout_short or (trigger_volume and trigger_squeeze):
-            entry = current_price
-            sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
-            rr2 = rr("SHORT", entry, sl, tp2)
+    short_trigger_ok = (
+        (trigger_breakout_short and breakout_short_ok)
+        or engulf_short
+        or (trigger_volume and trigger_squeeze and entry_30m_short_ok)
+    )
 
-            if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and short_score >= MIN_SCORE_SEND:
-                candidates.append(build_signal_payload(
-                    symbol=symbol,
-                    direction="SHORT",
-                    entry=entry,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    tp3=tp3,
-                    score=short_score,
-                    strategy_tag="PROPP_4H_1H_30M_LONGSHORT_V1",
-                    reason=" | ".join(short_reasons[:10]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
-                    tags=list(dict.fromkeys(short_tags))
-                ))
+    if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
+        entry = current_price
+        sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
+        rr2 = rr("SHORT", entry, sl, tp2)
+
+        if rr2 is not None and rr2 >= MIN_RR_TO_TP2 and short_score >= MIN_SCORE_SEND:
+            candidates.append(build_signal_payload(
+                symbol=symbol,
+                direction="SHORT",
+                entry=entry,
+                sl=sl,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                score=short_score,
+                strategy_tag="FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V2",
+                reason=" | ".join(short_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
+                tags=list(dict.fromkeys(short_tags))
+            ))
 
     if not candidates:
         return None, current_price, f"NO_VALID_SIGNAL | long={round(long_score, 2)} short={round(short_score, 2)}"
@@ -863,7 +1003,7 @@ def format_signal_message(sig, current_price):
     tags = ", ".join(sig.get("tags", [])) if sig.get("tags") else "Normal"
 
     return (
-        f"{emoji} {sig['symbol']} {sig['direction']} SİNYAL\n"
+        f"{emoji} {sig['symbol']} {sig['direction']} FUTURES SİNYAL\n"
         f"Fiyat: {fmt_price(current_price)}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
@@ -908,8 +1048,8 @@ def format_close_message(sig, close_reason, close_price=None):
 def format_top_summary(sent_signals):
     ts = now_dt().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"🚀 CRYPTO PRO++ TOP SİNYALLER — {ts} TR",
-        f"🧠 Kurgu: 4H trend + 1H setup + 30M giriş + aktif sinyal yönetimi",
+        f"🚀 CRYPTO PRO FUTURES TOP SİNYALLER — {ts} TR",
+        f"🧠 Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake setup filter",
         f"📊 Market: {MARKET_TYPE.upper()}",
         ""
     ]
@@ -941,7 +1081,8 @@ def run_once():
     for symbol in SYMBOLS:
         try:
             sig, current_price, info = evaluate_symbol(symbol)
-            refresh_active_signal_if_needed(state, symbol, current_price)
+            if current_price is not None:
+                refresh_active_signal_if_needed(state, symbol, current_price)
 
             if sig:
                 can_send, reason_code = should_send_signal(state, symbol, sig, current_price)
@@ -991,10 +1132,10 @@ def run_once():
 def send_startup_message():
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            f"🤖 CRYPTO PRO++ BOT başladı.\n"
+            f"🤖 CRYPTO PRO FUTURES BOT başladı.\n"
             f"Zaman: {now_str()}\n"
             f"Pariteler: {', '.join(SYMBOLS)}\n"
-            f"Kurgu: 4H trend + 1H setup + 30M giriş\n"
+            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter\n"
             f"Market: {MARKET_TYPE}"
         )
         logger.info("Başlangıç mesajı gönderildi.")
