@@ -54,7 +54,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "crypto-pro-futures-bot/2.0"})
+HTTP.headers.update({"User-Agent": "crypto-pro-futures-debug-bot/3.0"})
 
 retry = Retry(
     total=3,
@@ -71,8 +71,8 @@ HTTP.mount("http://", adapter)
 # =========================================================
 # CONFIG
 # =========================================================
-LOG_FILE = "crypto_pro_futures.log"
-STATE_FILE = "crypto_pro_futures_state.json"
+LOG_FILE = "crypto_pro_futures_debug.log"
+STATE_FILE = "crypto_pro_futures_debug_state.json"
 
 BASE_URL_SPOT = "https://api.binance.com"
 BASE_URL_FUTURES = "https://fapi.binance.com"
@@ -122,7 +122,7 @@ MAX_30M_RSI_LONG = 66
 MIN_30M_RSI_SHORT = 34
 MAX_30M_RSI_SHORT = 55
 
-VOLUME_SURGE_MULT = 1.18
+VOLUME_SURGE_MULT = 1.12
 BOLL_SQUEEZE_Q = 0.30
 BREAKOUT_LOOKBACK = 20
 
@@ -131,14 +131,14 @@ ATR_TP1_MULTIPLIER = 1.50
 ATR_TP2_MULTIPLIER = 2.40
 ATR_TP3_MULTIPLIER = 3.40
 
-MIN_RR_TO_TP2 = 1.25
-MAX_LAST_CANDLE_RANGE_ATR = 2.20
-MAX_DISTANCE_FROM_EMA20_ATR = 1.80
+MIN_RR_TO_TP2 = 1.10
+MAX_LAST_CANDLE_RANGE_ATR = 2.40
+MAX_DISTANCE_FROM_EMA20_ATR = 2.10
 MAX_BREAKOUT_WICK_BODY_RATIO = 2.60
-MIN_BREAKOUT_BODY_ATR = 0.18
+MIN_BREAKOUT_BODY_ATR = 0.15
 
 USE_BTC_FILTER = True
-BTC_30M_TREND_THRESHOLD = 0.18
+BTC_30M_TREND_THRESHOLD = 0.10
 
 MIN_SIGNAL_GAP_MINUTES = 35
 MAX_ACTIVE_SIGNAL_AGE_MINUTES = 240
@@ -148,12 +148,16 @@ REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
 SAME_DIRECTION_SCORE_BONUS = 2.50
 
 TOP_N_SIGNALS = 3
-MIN_SCORE_SEND = 11
+MIN_SCORE_SEND = 9
+
+# debug / summary
+SUMMARY_EVERY_MINUTES = 120
+SEND_EMPTY_STATUS = True
 
 # =========================================================
 # LOGGING
 # =========================================================
-logger = logging.getLogger("crypto_pro_futures_bot")
+logger = logging.getLogger("crypto_pro_futures_debug_bot")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -203,6 +207,7 @@ def default_state():
         "last_signal": {},
         "active_signal": {},
         "signal_history": [],
+        "last_summary_ts": 0,
     }
 
 def load_state():
@@ -217,6 +222,7 @@ def load_state():
             data.setdefault("last_signal", {})
             data.setdefault("active_signal", {})
             data.setdefault("signal_history", [])
+            data.setdefault("last_summary_ts", 0)
             return data
     except Exception as e:
         logger.exception("State load exception: %s", e)
@@ -227,6 +233,11 @@ def save_state(state):
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp_file, STATE_FILE)
+
+def minutes_since(ts):
+    if not ts:
+        return 999999
+    return (now_ts() - int(ts)) / 60.0
 
 # =========================================================
 # MARKET DATA
@@ -343,9 +354,8 @@ def bullish_engulf(df: pd.DataFrame) -> bool:
 
     a = df.iloc[-2]
     b = df.iloc[-1]
-
-    ao, ah, al, ac, abody, _, _, _ = candle_parts(a)
-    bo, bh, bl, bc, bbody, _, _, _ = candle_parts(b)
+    ao, _, _, ac, abody, _, _, _ = candle_parts(a)
+    bo, _, _, bc, bbody, _, _, _ = candle_parts(b)
 
     if ac >= ao:
         return False
@@ -367,9 +377,8 @@ def bearish_engulf(df: pd.DataFrame) -> bool:
 
     a = df.iloc[-2]
     b = df.iloc[-1]
-
-    ao, ah, al, ac, abody, _, _, _ = candle_parts(a)
-    bo, bh, bl, bc, bbody, _, _, _ = candle_parts(b)
+    ao, _, _, ac, abody, _, _, _ = candle_parts(a)
+    bo, _, _, bc, bbody, _, _, _ = candle_parts(b)
 
     if ac <= ao:
         return False
@@ -404,7 +413,7 @@ def bearish_pinbar(df: pd.DataFrame) -> bool:
     return upper_wick >= body * 2.0 and lower_wick <= body * 1.2 and c < o
 
 # =========================================================
-# BREAKOUT / FAKE SETUP FILTERS
+# FILTER HELPERS
 # =========================================================
 def bollinger_squeeze(df: pd.DataFrame):
     if df is None or len(df) < 40:
@@ -458,10 +467,9 @@ def breakout_quality_long(df: pd.DataFrame, atr: float):
         return False, "NO_DATA"
 
     last = df.iloc[-1]
-    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(last)
+    _, _, _, c, body, _, upper_wick, _ = candle_parts(last)
     wick_body_ratio = upper_wick / max(body, 1e-12)
     body_atr = body / atr if atr > 0 else 0.0
-
     prev_high = float(df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
 
     if c <= prev_high:
@@ -477,10 +485,9 @@ def breakout_quality_short(df: pd.DataFrame, atr: float):
         return False, "NO_DATA"
 
     last = df.iloc[-1]
-    o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(last)
+    _, _, _, c, body, _, _, lower_wick = candle_parts(last)
     wick_body_ratio = lower_wick / max(body, 1e-12)
     body_atr = body / atr if atr > 0 else 0.0
-
     prev_low = float(df["low"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].min())
 
     if c >= prev_low:
@@ -587,11 +594,6 @@ def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, str
 
 def signal_key(symbol):
     return symbol.upper()
-
-def minutes_since(ts):
-    if not ts:
-        return 999999
-    return (now_ts() - int(ts)) / 60.0
 
 def is_same_direction(a, b):
     return bool(a and b and a.get("direction") == b.get("direction"))
@@ -745,21 +747,36 @@ def register_sent_signal(state, symbol, sent_signal):
 # STRATEGY
 # =========================================================
 def evaluate_symbol(symbol: str):
+    result = {
+        "symbol": symbol,
+        "ok": False,
+        "current_price": None,
+        "info": "",
+        "long_score": 0.0,
+        "short_score": 0.0,
+        "signal": None,
+        "debug": {},
+    }
+
     df_4h = get_klines(symbol, TF_TREND, LIMIT_4H)
     df_1h = get_klines(symbol, TF_SETUP, LIMIT_1H)
     df_30m = get_klines(symbol, TF_ENTRY, LIMIT_30M)
 
     if df_4h is None or df_1h is None or df_30m is None:
-        return None, None, "DATA_FAIL"
+        result["info"] = "DATA_FAIL"
+        return result
 
     ind_4h = compute_ind(df_4h)
     ind_1h = compute_ind(df_1h)
     ind_30m = compute_ind(df_30m)
 
     if not ind_4h or not ind_1h or not ind_30m:
-        return None, None, "IND_FAIL"
+        result["info"] = "IND_FAIL"
+        return result
 
     current_price = ind_30m.close
+    result["current_price"] = current_price
+
     btc_bias, btc_reason = get_btc_filter_bias()
 
     trigger_breakout_long = breakout_long(df_30m, BREAKOUT_LOOKBACK)
@@ -776,11 +793,7 @@ def evaluate_symbol(symbol: str):
     breakout_short_ok, breakout_short_reason = breakout_quality_short(df_30m, ind_30m.atr)
 
     last_range_atr = last_candle_range_atr(df_30m, ind_30m.atr)
-    if last_range_atr is not None and last_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
-        return None, current_price, "LAST_BAR_TOO_WIDE"
-
-    if distance_from_ema20_atr(ind_30m) > MAX_DISTANCE_FROM_EMA20_ATR:
-        return None, current_price, "TOO_FAR_FROM_EMA20"
+    dist_ema20_atr = distance_from_ema20_atr(ind_30m)
 
     long_score = 0.0
     short_score = 0.0
@@ -789,7 +802,6 @@ def evaluate_symbol(symbol: str):
     long_tags = []
     short_tags = []
 
-    # 4H TREND
     trend_4h_long_ok = (
         trend_up(ind_4h)
         and ind_4h.adx >= MIN_4H_ADX
@@ -816,7 +828,6 @@ def evaluate_symbol(symbol: str):
             short_score += 1.0
             short_reasons.append("4h adx strong")
 
-    # 1H SETUP
     setup_1h_long_ok = (
         ind_1h.close > ind_1h.ema50
         and ind_1h.ema20 > ind_1h.ema50 > ind_1h.ema200
@@ -844,7 +855,6 @@ def evaluate_symbol(symbol: str):
         short_score += 1.0
         short_reasons.append("1h close below ema20")
 
-    # BTC FILTER
     if btc_bias == "LONG":
         long_score += 1.0
         short_score -= 0.75
@@ -857,7 +867,6 @@ def evaluate_symbol(symbol: str):
         long_score -= 0.20
         short_score -= 0.20
 
-    # 30M ENTRY ALIGNMENT
     entry_30m_long_ok = (
         ind_30m.close > ind_30m.ema20 > ind_30m.ema50 > ind_30m.ema200
         and MIN_30M_RSI_LONG <= ind_30m.rsi <= MAX_30M_RSI_LONG
@@ -874,7 +883,6 @@ def evaluate_symbol(symbol: str):
         short_score += 2.0
         short_reasons.append("30m entry aligned")
 
-    # PATTERN CONFIRMATION
     if engulf_long:
         long_score += 2.0
         long_reasons.append("bullish engulf")
@@ -893,7 +901,6 @@ def evaluate_symbol(symbol: str):
         short_reasons.append("bearish pinbar")
         short_tags.append("Pinbar")
 
-    # BREAKOUT / BREAKDOWN
     if trigger_breakout_long and breakout_long_ok:
         long_score += 2.0
         long_reasons.append("30m breakout valid")
@@ -912,7 +919,6 @@ def evaluate_symbol(symbol: str):
         short_reasons.append(f"fake short risk:{breakout_short_reason}")
         short_tags.append("FakeRisk")
 
-    # VOLUME + SQUEEZE
     if trigger_volume:
         if entry_30m_long_ok:
             long_score += 1.0
@@ -933,13 +939,59 @@ def evaluate_symbol(symbol: str):
             short_reasons.append("30m squeeze release")
             short_tags.append("Sıkışma")
 
+    result["long_score"] = round(long_score, 2)
+    result["short_score"] = round(short_score, 2)
+
+    result["debug"] = {
+        "btc_bias": btc_bias,
+        "btc_reason": btc_reason,
+        "trend_4h_long_ok": trend_4h_long_ok,
+        "trend_4h_short_ok": trend_4h_short_ok,
+        "setup_1h_long_ok": setup_1h_long_ok,
+        "setup_1h_short_ok": setup_1h_short_ok,
+        "entry_30m_long_ok": entry_30m_long_ok,
+        "entry_30m_short_ok": entry_30m_short_ok,
+        "engulf_long": engulf_long,
+        "engulf_short": engulf_short,
+        "pinbar_long": pinbar_long,
+        "pinbar_short": pinbar_short,
+        "breakout_long": trigger_breakout_long,
+        "breakout_short": trigger_breakout_short,
+        "breakout_long_ok": breakout_long_ok,
+        "breakout_short_ok": breakout_short_ok,
+        "breakout_long_reason": breakout_long_reason,
+        "breakout_short_reason": breakout_short_reason,
+        "trigger_volume": trigger_volume,
+        "trigger_squeeze": trigger_squeeze,
+        "last_range_atr": round(last_range_atr, 3) if last_range_atr is not None else None,
+        "dist_ema20_atr": round(dist_ema20_atr, 3) if dist_ema20_atr is not None else None,
+        "rsi_4h": round(ind_4h.rsi, 2),
+        "rsi_1h": round(ind_1h.rsi, 2),
+        "rsi_30m": round(ind_30m.rsi, 2),
+        "adx_4h": round(ind_4h.adx, 2),
+        "adx_1h": round(ind_1h.adx, 2),
+        "price": round(current_price, 6),
+    }
+
+    if last_range_atr is not None and last_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
+        result["info"] = f"LAST_BAR_TOO_WIDE atr={round(last_range_atr, 2)}"
+        return result
+
+    if dist_ema20_atr > MAX_DISTANCE_FROM_EMA20_ATR:
+        result["info"] = f"TOO_FAR_FROM_EMA20 atr={round(dist_ema20_atr, 2)}"
+        return result
+
     candidates = []
 
-    # LONG CANDIDATE
     long_trigger_ok = (
         (trigger_breakout_long and breakout_long_ok)
         or engulf_long
         or (trigger_volume and trigger_squeeze and entry_30m_long_ok)
+    )
+    short_trigger_ok = (
+        (trigger_breakout_short and breakout_short_ok)
+        or engulf_short
+        or (trigger_volume and trigger_squeeze and entry_30m_short_ok)
     )
 
     if trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
@@ -957,19 +1009,13 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=long_score,
-                strategy_tag="FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V2",
+                strategy_tag="FUTURES_DEBUG_4H_1H_30M_ENGULF_FAKEFILTER_V3",
                 reason=" | ".join(long_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
                 tags=list(dict.fromkeys(long_tags))
             ))
-
-    # SHORT CANDIDATE
-    short_trigger_ok = (
-        (trigger_breakout_short and breakout_short_ok)
-        or engulf_short
-        or (trigger_volume and trigger_squeeze and entry_30m_short_ok)
-    )
-
-    if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
+        else:
+            result["info"] = f"LONG_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(long_score,2)}"
+    elif trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
         rr2 = rr("SHORT", entry, sl, tp2)
@@ -984,16 +1030,35 @@ def evaluate_symbol(symbol: str):
                 tp2=tp2,
                 tp3=tp3,
                 score=short_score,
-                strategy_tag="FUTURES_4H_1H_30M_ENGULF_FAKEFILTER_V2",
+                strategy_tag="FUTURES_DEBUG_4H_1H_30M_ENGULF_FAKEFILTER_V3",
                 reason=" | ".join(short_reasons[:12]) + f" | {btc_reason} | RR2:{round(rr2, 2)}",
                 tags=list(dict.fromkeys(short_tags))
             ))
+        else:
+            result["info"] = f"SHORT_BLOCKED rr2={round(rr2, 2) if rr2 is not None else 'NA'} score={round(short_score,2)}"
+    else:
+        blockers = []
+        if not trend_4h_long_ok and not trend_4h_short_ok:
+            blockers.append("4H_TREND_FAIL")
+        if not setup_1h_long_ok and not setup_1h_short_ok:
+            blockers.append("1H_SETUP_FAIL")
+        if not entry_30m_long_ok and not entry_30m_short_ok:
+            blockers.append("30M_ENTRY_FAIL")
+        if not long_trigger_ok and not short_trigger_ok:
+            blockers.append("TRIGGER_FAIL")
+
+        if not blockers:
+            blockers.append("NO_CANDIDATE")
+        result["info"] = " | ".join(blockers)
 
     if not candidates:
-        return None, current_price, f"NO_VALID_SIGNAL | long={round(long_score, 2)} short={round(short_score, 2)}"
+        return result
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates[0], current_price, f"SIGNAL_READY | long={round(long_score, 2)} short={round(short_score, 2)}"
+    result["ok"] = True
+    result["signal"] = candidates[0]
+    result["info"] = "SIGNAL_READY"
+    return result
 
 # =========================================================
 # MESSAGE FORMAT
@@ -1045,31 +1110,38 @@ def format_close_message(sig, close_reason, close_price=None):
     body += f"İlk score: {sig.get('score')}\nZaman: {now_str()}"
     return body
 
-def format_top_summary(sent_signals):
+def format_status_summary(scan_results):
     ts = now_dt().strftime("%Y-%m-%d %H:%M")
     lines = [
-        f"🚀 CRYPTO PRO FUTURES TOP SİNYALLER — {ts} TR",
-        f"🧠 Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake setup filter",
-        f"📊 Market: {MARKET_TYPE.upper()}",
+        f"📊 CRYPTO PRO FUTURES DURUM ÖZETİ — {ts} TR",
+        f"Market: {MARKET_TYPE}",
+        f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter",
         ""
     ]
 
-    for i, sig in enumerate(sent_signals, start=1):
-        tags = ", ".join(sig.get("tags", [])) if sig.get("tags") else "Normal"
+    for r in scan_results:
+        dbg = r.get("debug", {})
         lines.append(
-            f"{i}) {sig['symbol']} {sig['direction']}\n"
-            f"   Score: {sig['score']}\n"
-            f"   Entry: {fmt_price(sig['entry'])}\n"
-            f"   SL: {fmt_price(sig['sl'])}\n"
-            f"   TP1: {fmt_price(sig['tp1'])}\n"
-            f"   TP2: {fmt_price(sig['tp2'])}\n"
-            f"   TP3: {fmt_price(sig['tp3'])}\n"
-            f"   Etiket: {tags}"
+            f"{r['symbol']}\n"
+            f"  Fiyat: {fmt_price(r.get('current_price'))}\n"
+            f"  Long skor: {r.get('long_score')} | Short skor: {r.get('short_score')}\n"
+            f"  Durum: {r.get('info')}\n"
+            f"  BTC: {dbg.get('btc_bias', '-')}\n"
+            f"  4H L/S: {dbg.get('trend_4h_long_ok', False)}/{dbg.get('trend_4h_short_ok', False)}\n"
+            f"  1H L/S: {dbg.get('setup_1h_long_ok', False)}/{dbg.get('setup_1h_short_ok', False)}\n"
+            f"  30M L/S: {dbg.get('entry_30m_long_ok', False)}/{dbg.get('entry_30m_short_ok', False)}\n"
+            f"  Engulf L/S: {dbg.get('engulf_long', False)}/{dbg.get('engulf_short', False)}\n"
+            f"  Breakout L/S: {dbg.get('breakout_long', False)}/{dbg.get('breakout_short', False)}\n"
+            f"  Volume: {dbg.get('trigger_volume', False)} | Squeeze: {dbg.get('trigger_squeeze', False)}"
         )
         lines.append("")
 
-    lines.append("⚠️ Teknik taramadır, yatırım tavsiyesi değildir.")
+    lines.append("⚠️ Bu bir durum raporudur.")
     return "\n".join(lines)
+
+def should_send_summary(state):
+    last_summary_ts = state.get("last_summary_ts", 0)
+    return minutes_since(last_summary_ts) >= SUMMARY_EVERY_MINUTES
 
 # =========================================================
 # RUN
@@ -1077,14 +1149,19 @@ def format_top_summary(sent_signals):
 def run_once():
     state = load_state()
     raw_candidates = []
+    scan_results = []
 
     for symbol in SYMBOLS:
         try:
-            sig, current_price, info = evaluate_symbol(symbol)
+            r = evaluate_symbol(symbol)
+            scan_results.append(r)
+
+            current_price = r.get("current_price")
             if current_price is not None:
                 refresh_active_signal_if_needed(state, symbol, current_price)
 
-            if sig:
+            if r.get("ok") and r.get("signal"):
+                sig = r["signal"]
                 can_send, reason_code = should_send_signal(state, symbol, sig, current_price)
                 if can_send:
                     raw_candidates.append((sig, current_price, reason_code))
@@ -1093,49 +1170,55 @@ def run_once():
                         "Sinyal var ama gönderilmedi | %s | %s | score=%s | %s",
                         symbol, sig["direction"], sig["score"], reason_code
                     )
+                    r["info"] = f"SIGNAL_BLOCKED:{reason_code}"
             else:
-                logger.info("%s valid sinyal yok. %s", symbol, info)
+                logger.info("%s valid sinyal yok. %s", symbol, r.get("info"))
 
         except Exception as e:
             logger.exception("Sembol analiz exception %s: %s", symbol, e)
+            scan_results.append({
+                "symbol": symbol,
+                "ok": False,
+                "current_price": None,
+                "info": f"EXCEPTION:{e}",
+                "long_score": 0.0,
+                "short_score": 0.0,
+                "signal": None,
+                "debug": {},
+            })
 
         time.sleep(0.30)
 
-    if not raw_candidates:
-        save_state(state)
-        return
+    if raw_candidates:
+        raw_candidates.sort(key=lambda x: x[0]["score"], reverse=True)
+        selected = raw_candidates[:TOP_N_SIGNALS]
+        sent_list = []
 
-    raw_candidates.sort(key=lambda x: x[0]["score"], reverse=True)
-    selected = raw_candidates[:TOP_N_SIGNALS]
+        for sig, current_price, reason_code in selected:
+            message = format_signal_message(sig, current_price)
+            sent = tg_send(message)
 
-    sent_list = []
+            if sent:
+                register_sent_signal(state, sig["symbol"], sig)
+                sent_list.append(sig)
+                logger.info(
+                    "YENİ SİNYAL GÖNDERİLDİ | %s | %s | entry=%s sl=%s tp1=%s tp2=%s tp3=%s score=%s | %s",
+                    sig["symbol"], sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"], sig["score"], reason_code
+                )
 
-    for sig, current_price, reason_code in selected:
-        message = format_signal_message(sig, current_price)
-        sent = tg_send(message)
-
-        if sent:
-            register_sent_signal(state, sig["symbol"], sig)
-            sent_list.append(sig)
-            logger.info(
-                "YENİ SİNYAL GÖNDERİLDİ | %s | %s | entry=%s sl=%s tp1=%s tp2=%s tp3=%s score=%s | %s",
-                sig["symbol"], sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"], sig["score"], reason_code
-            )
-        else:
-            logger.warning("Telegram gönderimi başarısız: %s", sig["symbol"])
-
-    if sent_list:
-        tg_send(format_top_summary(sent_list))
+    if SEND_EMPTY_STATUS and should_send_summary(state):
+        tg_send(format_status_summary(scan_results))
+        state["last_summary_ts"] = now_ts()
 
     save_state(state)
 
 def send_startup_message():
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            f"🤖 CRYPTO PRO FUTURES BOT başladı.\n"
+            f"🤖 CRYPTO PRO FUTURES DEBUG BOT başladı.\n"
             f"Zaman: {now_str()}\n"
             f"Pariteler: {', '.join(SYMBOLS)}\n"
-            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter\n"
+            f"Kurgu: 4H trend + 1H setup + 30M entry + engulf + fake filter + durum özeti\n"
             f"Market: {MARKET_TYPE}"
         )
         logger.info("Başlangıç mesajı gönderildi.")
