@@ -106,6 +106,7 @@ EXCLUDED_BASES = (
 MAX_SYMBOLS_TO_SCAN = 120
 TOP_N_SIGNALS = 3
 TOP_N_SIGNALS_BTC_BEAR = 1
+SPECIAL_SYMBOLS = ["BTC_USDT", "ETH_USDT", "PAXG_USDT", "XRP_USDT"]
 
 MIN_SYMBOL_SCORE_24H_VOLUME = 5_000_000
 MIN_SYMBOL_SCORE_TURNOVER_24H = 5_000_000
@@ -168,7 +169,7 @@ BLOCK_COUNTERTREND_SIGNALS = True
 
 FULL_MIN_SCORE = 11.5
 EARLY_MIN_SCORE = 7.5
-WATCHLIST_MIN_SCORE = 6.0
+WATCHLIST_MIN_SCORE = 999.0
 BEAR_BTC_SCORE_PENALTY = 1.0
 BEAR_BTC_RR_BONUS = 0.10
 
@@ -181,7 +182,7 @@ SAME_DIRECTION_SCORE_BONUS = 2.50
 WATCHLIST_COOLDOWN_MINUTES = 180
 
 SEND_SUMMARY_TO_TELEGRAM = False
-SEND_NO_SIGNAL_MESSAGE = True
+SEND_NO_SIGNAL_MESSAGE = False
 
 # =========================================================
 # LOGGING
@@ -1359,31 +1360,19 @@ def evaluate_symbol(symbol: str, btc_bias: str, btc_reason: str):
 # MESSAGE FORMAT
 # =========================================================
 
-def format_signal_message(sig, current_price):
-    emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-    signal_type = sig.get("signal_type", "FULL")
-    prefix = "✅ FULL" if signal_type == "FULL" else "⚡ EARLY"
+def format_signal_message(sig, current_price=None):
     return (
-        f"{emoji} {prefix} {sig['symbol']} {sig['direction']}\n"
-        f"Fiyat: {fmt_price(current_price)}\n"
+        f"{sig['direction']} {sig['symbol']}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}  -> TP1 gelince SL BE\n"
-        f"TP2: {fmt_price(sig['tp2'])}  -> TP2 gelince trail aktif\n"
-        f"TP3: {fmt_price(sig['tp3'])}  -> final close\n"
-        f"Score: {sig['score']}\n"
-        f"Neden: {sig['reason']}\n"
-        f"Zaman: {now_str()}"
+        f"TP1: {fmt_price(sig['tp1'])}\n"
+        f"TP2: {fmt_price(sig['tp2'])}\n"
+        f"TP3: {fmt_price(sig['tp3'])}"
     )
 
 
 def format_watchlist_message(w):
-    return (
-        f"👀 WATCHLIST {w['symbol']} {w['direction']}\n"
-        f"Score: {w['score']}\n"
-        f"Neden: {w['reason']}\n"
-        f"Zaman: {now_str()}"
-    )
+    return ''
 
 
 def format_close_message(sig, close_reason, close_price=None):
@@ -1463,6 +1452,28 @@ def pick_top_diverse_signals(raw_candidates, limit: int):
 # RUN
 # =========================================================
 
+def collect_special_symbol_signals(state, btc_bias: str, btc_reason: str):
+    special_candidates = []
+
+    for symbol in SPECIAL_SYMBOLS:
+        try:
+            r = evaluate_symbol(symbol, btc_bias, btc_reason)
+            current_price = r.get("current_price")
+
+            if current_price is not None:
+                refresh_active_signal_if_needed(state, symbol, current_price)
+
+            if r.get("ok") and r.get("signal"):
+                sig = r["signal"]
+                can_send, reason_code = should_send_signal(state, symbol, sig, current_price)
+                if can_send:
+                    special_candidates.append((sig, current_price, reason_code))
+        except Exception as e:
+            logger.exception("Ozel sembol analiz exception %s: %s", symbol, e)
+
+    return special_candidates
+
+
 def run_once():
     state = load_state()
     active_symbols = get_active_symbols()
@@ -1472,7 +1483,14 @@ def run_once():
     btc_bias, btc_reason = get_btc_filter_bias()
     logger.info("BTC FILTER | %s | %s", btc_bias, btc_reason)
 
+    special_candidates = collect_special_symbol_signals(state, btc_bias, btc_reason)
+
     if not active_symbols:
+        selected_special = pick_top_diverse_signals(special_candidates, len(SPECIAL_SYMBOLS))
+        for sig, current_price, reason_code in selected_special:
+            if tg_send(format_signal_message(sig, current_price)):
+                register_sent_signal(state, sig["symbol"], sig)
+                logger.info("Ozel sinyal gonderildi %s %s %s", sig["symbol"], sig["direction"], reason_code)
         save_state(state)
         return
 
@@ -1483,10 +1501,6 @@ def run_once():
 
             if current_price is not None:
                 refresh_active_signal_if_needed(state, symbol, current_price)
-
-            if r.get("watchlist") and should_send_watchlist(state, symbol):
-                tg_send(format_watchlist_message(r["watchlist"]))
-                mark_watchlist_sent(state, symbol)
 
             if r.get("ok") and r.get("signal"):
                 sig = r["signal"]
@@ -1501,6 +1515,12 @@ def run_once():
 
     dynamic_top_n = TOP_N_SIGNALS_BTC_BEAR if btc_bias == "SHORT" else TOP_N_SIGNALS
 
+    selected_special = pick_top_diverse_signals(special_candidates, len(SPECIAL_SYMBOLS))
+    for sig, current_price, reason_code in selected_special:
+        if tg_send(format_signal_message(sig, current_price)):
+            register_sent_signal(state, sig["symbol"], sig)
+            logger.info("Ozel sinyal gonderildi %s %s %s", sig["symbol"], sig["direction"], reason_code)
+
     if raw_candidates:
         selected = pick_top_diverse_signals(raw_candidates, dynamic_top_n)
 
@@ -1508,10 +1528,6 @@ def run_once():
             if tg_send(format_signal_message(sig, current_price)):
                 register_sent_signal(state, sig["symbol"], sig)
                 logger.info("Sinyal gönderildi %s %s %s", sig["symbol"], sig["direction"], reason_code)
-    else:
-        if SEND_NO_SIGNAL_MESSAGE and minutes_since(state.get("last_no_signal_ts", 0)) >= 180:
-            tg_send(f"⛔ Uygun trade yok. BTC={btc_bias} | {btc_reason} | Zaman: {now_str()}")
-            state["last_no_signal_ts"] = now_ts()
 
     save_state(state)
 
