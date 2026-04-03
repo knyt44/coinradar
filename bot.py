@@ -19,14 +19,18 @@ from urllib3.util.retry import Retry
 # =========================================================
 TZ = ZoneInfo("Europe/Istanbul")
 
+
 def now_dt():
     return datetime.now(TZ)
+
 
 def now_ts() -> int:
     return int(now_dt().timestamp())
 
+
 def now_str() -> str:
     return now_dt().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def safe_float(v, default=0.0):
     try:
@@ -34,15 +38,18 @@ def safe_float(v, default=0.0):
     except Exception:
         return default
 
+
 def pct_change(a: float, b: float) -> float:
     if a in (None, 0) or b is None:
         return 0.0
     return ((b / a) - 1.0) * 100.0
 
+
 def pct_diff(a, b):
     if a in (None, 0) or b is None:
         return 999.0
     return abs(a - b) / a * 100.0
+
 
 # =========================================================
 # ENV
@@ -54,7 +61,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "mexc-clean-signal-bot/1.0"})
+HTTP.headers.update({"User-Agent": "mexc-super-signal-bot-pro/2.0"})
 
 retry = Retry(
     total=3,
@@ -71,18 +78,36 @@ HTTP.mount("http://", adapter)
 # =========================================================
 # CONFIG
 # =========================================================
-LOG_FILE = "mexc_clean_signal_bot.log"
-STATE_FILE = "mexc_clean_signal_bot_state.json"
+LOG_FILE = "mexc_super_signal_bot_pro.log"
+STATE_FILE = "mexc_super_signal_bot_pro_state.json"
 MEXC_BASE_URL = "https://api.mexc.com"
 
-REQUESTED_SYMBOLS = [
+BTC_SYMBOL = "BTC_USDT"
+CHECK_EVERY_SECONDS = 60
+
+# Tüm aktif USDT kontratlarını tara, bazılarını hariç tut
+QUOTE_FILTER = "USDT"
+EXCLUDED_SYMBOLS = {
     "BTC_USDT",
     "ETH_USDT",
     "PAXG_USDT",
-]
-BTC_SYMBOL = "BTC_USDT"
+    "XRP_USDT",
+}
+EXCLUDED_KEYWORDS = (
+    "_USDC",
+    "_FDUSD",
+    "_TUSD",
+)
+MAX_SYMBOLS_TO_SCAN = 120
+TOP_N_SIGNALS = 3
+TOP_N_SIGNALS_BTC_BEAR = 1
 
-CHECK_EVERY_SECONDS = 60
+MIN_SYMBOL_SCORE_24H_VOLUME = 5_000_000
+MIN_SYMBOL_SCORE_TURNOVER_24H = 5_000_000
+MIN_ATR_PCT_30M = 0.0035
+MAX_ATR_PCT_30M = 0.03
+USE_THEME_DIVERSITY_FILTER = True
+
 
 TF_TREND = "Hour4"
 TF_SETUP = "Min60"
@@ -95,65 +120,68 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-MIN_4H_ADX = 16
-MIN_1H_ADX = 14
+MIN_4H_ADX = 18
+MIN_1H_ADX = 16
 
 MIN_4H_RSI_LONG = 50
-MAX_4H_RSI_LONG = 76
-MIN_4H_RSI_SHORT = 24
+MAX_4H_RSI_LONG = 74
+MIN_4H_RSI_SHORT = 26
 MAX_4H_RSI_SHORT = 50
 
-MIN_1H_RSI_LONG = 45
-MAX_1H_RSI_LONG = 69
-MIN_1H_RSI_SHORT = 31
-MAX_1H_RSI_SHORT = 55
+MIN_1H_RSI_LONG = 47
+MAX_1H_RSI_LONG = 68
+MIN_1H_RSI_SHORT = 32
+MAX_1H_RSI_SHORT = 54
 
-MIN_30M_RSI_LONG = 42
-MAX_30M_RSI_LONG = 67
-MIN_30M_RSI_SHORT = 33
-MAX_30M_RSI_SHORT = 58
+MIN_30M_RSI_LONG = 44
+MAX_30M_RSI_LONG = 66
+MIN_30M_RSI_SHORT = 34
+MAX_30M_RSI_SHORT = 57
 
-VOLUME_SURGE_MULT = 1.06
-BOLL_SQUEEZE_Q = 0.32
+# Senin notuna göre 1.15 - 1.25 bandı
+VOLUME_SURGE_MULT = 1.18
+BOLL_SQUEEZE_Q = 0.28
 BREAKOUT_LOOKBACK = 20
 
-ATR_SL_MULTIPLIER = 1.25
-ATR_TP1_MULTIPLIER = 1.50
-ATR_TP2_MULTIPLIER = 2.40
-ATR_TP3_MULTIPLIER = 3.40
+ATR_SL_MULTIPLIER = 1.20
+ATR_TP1_MULTIPLIER = 1.45
+ATR_TP2_MULTIPLIER = 2.35
+ATR_TP3_MULTIPLIER = 3.30
+TP2_TRAIL_ATR_MULTIPLIER = 0.90
 
-FULL_MIN_RR_TO_TP2 = 1.10
-EARLY_MIN_RR_TO_TP2 = 1.00
+FULL_MIN_RR_TO_TP2 = 1.20
+EARLY_MIN_RR_TO_TP2 = 1.05
 
-MAX_LAST_CANDLE_RANGE_ATR = 2.60
-MAX_DISTANCE_FROM_EMA20_ATR = 2.30
-MAX_BREAKOUT_WICK_BODY_RATIO = 2.60
-MIN_BREAKOUT_BODY_ATR = 0.15
+MAX_LAST_CANDLE_RANGE_ATR = 2.40
+MAX_DISTANCE_FROM_EMA20_ATR = 2.10
+MAX_BREAKOUT_WICK_BODY_RATIO = 2.20
+MIN_BREAKOUT_BODY_ATR = 0.18
 
 USE_BTC_FILTER = True
 BTC_30M_TREND_THRESHOLD = 0.08
+BLOCK_COUNTERTREND_SIGNALS = True
 
-FULL_MIN_SCORE = 9.0
-EARLY_MIN_SCORE = 6.0
-WATCHLIST_MIN_SCORE = 5.0
+FULL_MIN_SCORE = 11.5
+EARLY_MIN_SCORE = 7.5
+WATCHLIST_MIN_SCORE = 6.0
+BEAR_BTC_SCORE_PENALTY = 1.0
+BEAR_BTC_RR_BONUS = 0.10
 
 MIN_SIGNAL_GAP_MINUTES = 35
-MAX_ACTIVE_SIGNAL_AGE_MINUTES = 240
-SIGNAL_TIMEOUT_MINUTES = 240
+MAX_ACTIVE_SIGNAL_AGE_MINUTES = 360
+SIGNAL_TIMEOUT_MINUTES = 360
 MIN_PRICE_DISTANCE_PCT = 0.55
 REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
 SAME_DIRECTION_SCORE_BONUS = 2.50
-
-TOP_N_SIGNALS = 3
 WATCHLIST_COOLDOWN_MINUTES = 180
 
-# Telegram'a debug özeti kapalı
 SEND_SUMMARY_TO_TELEGRAM = False
+SEND_NO_SIGNAL_MESSAGE = True
 
 # =========================================================
 # LOGGING
 # =========================================================
-logger = logging.getLogger("mexc_clean_signal_bot")
+logger = logging.getLogger("mexc_super_signal_bot_pro")
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
@@ -169,6 +197,7 @@ if not logger.handlers:
 # =========================================================
 # TELEGRAM
 # =========================================================
+
 def tg_send(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID eksik")
@@ -195,9 +224,11 @@ def tg_send(text: str):
             ok = False
     return ok
 
+
 # =========================================================
 # STATE
 # =========================================================
+
 def default_state():
     return {
         "last_signal": {},
@@ -205,7 +236,9 @@ def default_state():
         "signal_history": [],
         "last_watchlist_sent": {},
         "active_symbols": [],
+        "last_no_signal_ts": 0,
     }
+
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -221,10 +254,12 @@ def load_state():
             data.setdefault("signal_history", [])
             data.setdefault("last_watchlist_sent", {})
             data.setdefault("active_symbols", [])
+            data.setdefault("last_no_signal_ts", 0)
             return data
     except Exception as e:
         logger.exception("State load exception: %s", e)
         return default_state()
+
 
 def save_state(state):
     tmp_file = STATE_FILE + ".tmp"
@@ -232,14 +267,17 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp_file, STATE_FILE)
 
+
 def minutes_since(ts):
     if not ts:
         return 999999
     return (now_ts() - int(ts)) / 60.0
 
+
 # =========================================================
 # MEXC API
 # =========================================================
+
 def mexc_get(path: str, params=None):
     url = f"{MEXC_BASE_URL}{path}"
     try:
@@ -252,6 +290,7 @@ def mexc_get(path: str, params=None):
         logger.exception("MEXC GET exception | %s", e)
         return None
 
+
 def get_contract_detail():
     data = mexc_get("/api/v1/contract/detail")
     if not data or not isinstance(data, dict):
@@ -261,26 +300,87 @@ def get_contract_detail():
     result = data.get("data", [])
     return result if isinstance(result, list) else []
 
-def get_active_symbols(requested_symbols):
+
+def symbol_allowed(symbol: str) -> bool:
+    symbol = str(symbol).upper()
+    if not symbol.endswith(f"_{QUOTE_FILTER}"):
+        return False
+    if symbol in EXCLUDED_SYMBOLS:
+        return False
+    if any(k in symbol for k in EXCLUDED_KEYWORDS):
+        return False
+    if any(x in symbol for x in ("_BULL", "_BEAR", "_UP", "_DOWN")):
+        return False
+    return True
+
+
+def symbol_liquidity_score(item: dict) -> float:
+    volume_candidates = [
+        item.get("volume24"),
+        item.get("vol24"),
+        item.get("volume"),
+        item.get("dealVolume"),
+    ]
+    turnover_candidates = [
+        item.get("turnover24"),
+        item.get("amount24"),
+        item.get("turnover"),
+        item.get("quoteAmount"),
+    ]
+    trades_candidates = [
+        item.get("tradeCount"),
+        item.get("tradeCount24"),
+        item.get("dealCount"),
+    ]
+
+    volume_24h = max(safe_float(v, 0.0) for v in volume_candidates)
+    turnover_24h = max(safe_float(v, 0.0) for v in turnover_candidates)
+    trades_24h = max(safe_float(v, 0.0) for v in trades_candidates)
+
+    score = turnover_24h + (volume_24h * 0.35) + (trades_24h * 25.0)
+    return score
+
+
+def get_active_symbols():
     details = get_contract_detail()
     if not details:
         return []
 
-    active = []
-    available = set()
-
+    ranked = []
     for item in details:
         symbol = str(item.get("symbol", "")).upper()
-        available.add(symbol)
         api_allowed = item.get("apiAllowed", True)
-        if symbol in requested_symbols and api_allowed:
-            active.append(symbol)
+        if not (api_allowed and symbol_allowed(symbol)):
+            continue
 
-    for s in requested_symbols:
-        if s not in available:
-            logger.warning("İstenen symbol bulunamadı: %s", s)
+        liquidity_score = symbol_liquidity_score(item)
+        if liquidity_score <= 0:
+            continue
 
-    return sorted(list(set(active)))
+        volume_candidates = [item.get("volume24"), item.get("vol24"), item.get("volume"), item.get("dealVolume")]
+        turnover_candidates = [item.get("turnover24"), item.get("amount24"), item.get("turnover"), item.get("quoteAmount")]
+        volume_24h = max(safe_float(v, 0.0) for v in volume_candidates)
+        turnover_24h = max(safe_float(v, 0.0) for v in turnover_candidates)
+
+        if volume_24h < MIN_SYMBOL_SCORE_24H_VOLUME and turnover_24h < MIN_SYMBOL_SCORE_TURNOVER_24H:
+            continue
+
+        ranked.append((symbol, liquidity_score))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+
+    selected = []
+    seen = set()
+    for symbol, _score in ranked:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        selected.append(symbol)
+        if len(selected) >= MAX_SYMBOLS_TO_SCAN:
+            break
+
+    return selected
+
 
 def get_klines(symbol: str, interval: str, bars: int = 320):
     interval_sec_map = {
@@ -334,6 +434,7 @@ def get_klines(symbol: str, interval: str, bars: int = 320):
     df.set_index("open_time", inplace=True)
     return df.sort_index()
 
+
 # =========================================================
 # INDICATORS
 # =========================================================
@@ -346,6 +447,7 @@ class Ind:
         self.ema200 = float(ema200)
         self.atr = float(atr)
         self.adx = float(adx)
+
 
 def compute_ind(df: pd.DataFrame):
     if df is None or df.empty:
@@ -373,15 +475,19 @@ def compute_ind(df: pd.DataFrame):
     last = df.iloc[-1]
     return Ind(last["close"], rsi.iloc[-1], ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1], atr.iloc[-1], adx.iloc[-1])
 
+
 def trend_up(ind: Ind) -> bool:
     return ind.ema20 > ind.ema50 > ind.ema200 and ind.close > ind.ema20
+
 
 def trend_down(ind: Ind) -> bool:
     return ind.ema20 < ind.ema50 < ind.ema200 and ind.close < ind.ema20
 
+
 # =========================================================
 # CANDLE HELPERS
 # =========================================================
+
 def candle_parts(row):
     o = float(row["open"])
     h = float(row["high"])
@@ -392,6 +498,7 @@ def candle_parts(row):
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
     return o, h, l, c, body, rng, upper_wick, lower_wick
+
 
 def bullish_engulf(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 3:
@@ -404,6 +511,7 @@ def bullish_engulf(df: pd.DataFrame) -> bool:
         return False
     return min(bo, bc) <= min(ao, ac) and max(bo, bc) >= max(ao, ac)
 
+
 def bearish_engulf(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 3:
         return False
@@ -415,12 +523,14 @@ def bearish_engulf(df: pd.DataFrame) -> bool:
         return False
     return min(bo, bc) <= min(ao, ac) and max(bo, bc) >= max(ao, ac)
 
+
 def bullish_pinbar(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 1:
         return False
     row = df.iloc[-1]
     o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(row)
     return rng > 0 and lower_wick >= body * 2.0 and upper_wick <= body * 1.2 and c > o
+
 
 def bearish_pinbar(df: pd.DataFrame) -> bool:
     if df is None or len(df) < 1:
@@ -429,9 +539,11 @@ def bearish_pinbar(df: pd.DataFrame) -> bool:
     o, h, l, c, body, rng, upper_wick, lower_wick = candle_parts(row)
     return rng > 0 and upper_wick >= body * 2.0 and lower_wick <= body * 1.2 and c < o
 
+
 # =========================================================
 # FILTER HELPERS
 # =========================================================
+
 def bollinger_squeeze(df: pd.DataFrame):
     if df is None or len(df) < 40:
         return False
@@ -445,11 +557,13 @@ def bollinger_squeeze(df: pd.DataFrame):
     tail = width.iloc[-20:]
     return float(tail.iloc[-1]) <= float(tail.quantile(BOLL_SQUEEZE_Q))
 
+
 def breakout_long(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     if df is None or len(df) < lookback + 2:
         return False
     prev_high = float(df["high"].iloc[-(lookback + 1):-1].max())
     return float(df["close"].iloc[-1]) > prev_high
+
 
 def breakout_short(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     if df is None or len(df) < lookback + 2:
@@ -457,11 +571,13 @@ def breakout_short(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     prev_low = float(df["low"].iloc[-(lookback + 1):-1].min())
     return float(df["close"].iloc[-1]) < prev_low
 
+
 def volume_surge(df: pd.DataFrame, mult: float = VOLUME_SURGE_MULT):
     if df is None or len(df) < 25:
         return False
     vma = float(df["volume"].rolling(20).mean().iloc[-1])
     return vma > 0 and float(df["volume"].iloc[-1]) > vma * mult
+
 
 def last_candle_range_atr(df: pd.DataFrame, atr: float):
     if df is None or len(df) < 1 or atr <= 0:
@@ -469,10 +585,12 @@ def last_candle_range_atr(df: pd.DataFrame, atr: float):
     last = df.iloc[-1]
     return float(last["high"] - last["low"]) / atr
 
+
 def distance_from_ema20_atr(ind: Ind):
     if ind.atr <= 0:
         return 999.0
     return abs(ind.close - ind.ema20) / ind.atr
+
 
 def breakout_quality_long(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
@@ -484,6 +602,7 @@ def breakout_quality_long(df: pd.DataFrame, atr: float):
     prev_high = float(df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
     return c > prev_high and wick_body_ratio <= MAX_BREAKOUT_WICK_BODY_RATIO and body_atr >= MIN_BREAKOUT_BODY_ATR
 
+
 def breakout_quality_short(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
         return False
@@ -494,9 +613,11 @@ def breakout_quality_short(df: pd.DataFrame, atr: float):
     prev_low = float(df["low"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].min())
     return c < prev_low and wick_body_ratio <= MAX_BREAKOUT_WICK_BODY_RATIO and body_atr >= MIN_BREAKOUT_BODY_ATR
 
+
 # =========================================================
 # BTC FILTER
 # =========================================================
+
 def get_btc_filter_bias():
     if not USE_BTC_FILTER:
         return "NEUTRAL", "BTC_FILTER_DISABLED"
@@ -512,15 +633,17 @@ def get_btc_filter_bias():
     if ind is None:
         return "NEUTRAL", f"BTC_FLAT:{round(move, 3)}%"
 
-    if move >= BTC_30M_TREND_THRESHOLD and ind.close > ind.ema20:
+    if move >= BTC_30M_TREND_THRESHOLD and ind.close > ind.ema20 and ind.rsi >= 51:
         return "LONG", f"BTC_BULL:{round(move, 3)}%"
-    if move <= -BTC_30M_TREND_THRESHOLD and ind.close < ind.ema20:
+    if move <= -BTC_30M_TREND_THRESHOLD and ind.close < ind.ema20 and ind.rsi <= 49:
         return "SHORT", f"BTC_BEAR:{round(move, 3)}%"
     return "NEUTRAL", f"BTC_FLAT:{round(move, 3)}%"
+
 
 # =========================================================
 # RISK
 # =========================================================
+
 def calc_levels(direction: str, entry: float, atr: float):
     if direction == "LONG":
         sl = entry - (ATR_SL_MULTIPLIER * atr)
@@ -534,6 +657,7 @@ def calc_levels(direction: str, entry: float, atr: float):
         tp3 = entry - (ATR_TP3_MULTIPLIER * atr)
     return sl, tp1, tp2, tp3
 
+
 def rr(direction: str, entry: float, sl: float, target: float):
     if direction == "LONG":
         risk = entry - sl
@@ -544,6 +668,7 @@ def rr(direction: str, entry: float, sl: float, target: float):
     if risk <= 0:
         return None
     return reward / risk
+
 
 def fmt_price(v):
     try:
@@ -560,15 +685,18 @@ def fmt_price(v):
     except Exception:
         return str(v)
 
+
 # =========================================================
 # SIGNAL / WATCHLIST
 # =========================================================
-def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, signal_type):
+
+def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, signal_type, atr):
     return {
         "symbol": symbol,
         "direction": direction.upper(),
         "entry": round(float(entry), 8),
         "sl": round(float(sl), 8),
+        "initial_sl": round(float(sl), 8),
         "tp1": round(float(tp1), 8),
         "tp2": round(float(tp2), 8),
         "tp3": round(float(tp3), 8),
@@ -576,28 +704,41 @@ def build_signal_payload(symbol, direction, entry, sl, tp1, tp2, tp3, score, str
         "strategy_tag": strategy_tag,
         "reason": reason,
         "signal_type": signal_type,
+        "atr": round(float(atr), 8),
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "be_moved": False,
+        "trail_active": False,
+        "highest_price": round(float(entry), 8),
+        "lowest_price": round(float(entry), 8),
         "created_ts": now_ts(),
         "updated_ts": now_ts(),
         "status": "OPEN"
     }
 
+
 def signal_key(symbol):
     return symbol.upper()
+
 
 def is_same_direction(a, b):
     return bool(a and b and a.get("direction") == b.get("direction"))
 
+
 def is_opposite_direction(a, b):
     return bool(a and b and a.get("direction") != b.get("direction"))
+
 
 def entry_distance_pct(sig_a, sig_b):
     if not sig_a or not sig_b:
         return 999.0
     return pct_diff(safe_float(sig_a.get("entry")), safe_float(sig_b.get("entry")))
 
+
 # =========================================================
 # ACTIVE SIGNAL MGMT
 # =========================================================
+
 def close_active_signal(state, symbol, close_reason, current_price=None, notify_telegram=True):
     key = signal_key(symbol)
     active = state.get("active_signal", {}).get(key)
@@ -617,15 +758,55 @@ def close_active_signal(state, symbol, close_reason, current_price=None, notify_
     state["signal_history"].append(active)
     state["active_signal"].pop(key, None)
 
+
+def update_signal_stop(state, symbol, new_sl, reason, current_price=None, notify_telegram=True):
+    key = signal_key(symbol)
+    active = state.get("active_signal", {}).get(key)
+    if not active:
+        return False
+
+    old_sl = safe_float(active.get("sl"))
+    new_sl = safe_float(new_sl)
+    direction = active.get("direction")
+
+    better = new_sl > old_sl if direction == "LONG" else new_sl < old_sl
+    if not better:
+        return False
+
+    active["sl"] = round(float(new_sl), 8)
+    active["updated_ts"] = now_ts()
+
+    if notify_telegram:
+        tg_send(format_manager_message(active, reason, old_sl, new_sl, current_price))
+    return True
+
+
 def is_tp1_hit(signal, current_price):
     if not signal:
         return False
     direction = signal["direction"]
     tp1 = safe_float(signal.get("tp1"))
     cp = safe_float(current_price)
-    if tp1 is None or cp is None:
-        return False
     return cp >= tp1 if direction == "LONG" else cp <= tp1
+
+
+def is_tp2_hit(signal, current_price):
+    if not signal:
+        return False
+    direction = signal["direction"]
+    tp2 = safe_float(signal.get("tp2"))
+    cp = safe_float(current_price)
+    return cp >= tp2 if direction == "LONG" else cp <= tp2
+
+
+def is_tp3_hit(signal, current_price):
+    if not signal:
+        return False
+    direction = signal["direction"]
+    tp3 = safe_float(signal.get("tp3"))
+    cp = safe_float(current_price)
+    return cp >= tp3 if direction == "LONG" else cp <= tp3
+
 
 def is_sl_hit(signal, current_price):
     if not signal:
@@ -633,28 +814,62 @@ def is_sl_hit(signal, current_price):
     direction = signal["direction"]
     sl = safe_float(signal.get("sl"))
     cp = safe_float(current_price)
-    if sl is None or cp is None:
-        return False
     return cp <= sl if direction == "LONG" else cp >= sl
+
 
 def is_expired(signal):
     if not signal:
         return True
     return minutes_since(signal.get("created_ts")) >= SIGNAL_TIMEOUT_MINUTES
 
+
 def refresh_active_signal_if_needed(state, symbol, current_price):
     key = signal_key(symbol)
     active = state.get("active_signal", {}).get(key)
     if not active:
         return
-    if is_sl_hit(active, current_price):
-        close_active_signal(state, symbol, "SL_HIT", current_price, True)
+
+    cp = safe_float(current_price)
+    direction = active["direction"]
+    atr = max(safe_float(active.get("atr"), 0.0), 1e-12)
+
+    if direction == "LONG":
+        active["highest_price"] = max(safe_float(active.get("highest_price"), cp), cp)
+    else:
+        active["lowest_price"] = min(safe_float(active.get("lowest_price"), cp), cp)
+
+    if not active.get("tp1_hit") and is_tp1_hit(active, cp):
+        active["tp1_hit"] = True
+        active["be_moved"] = True
+        update_signal_stop(state, symbol, safe_float(active.get("entry")), "TP1_HIT -> SL BE", cp, True)
+
+    if not active.get("tp2_hit") and is_tp2_hit(active, cp):
+        active["tp2_hit"] = True
+        active["trail_active"] = True
+        tp1_level = safe_float(active.get("tp1"))
+        update_signal_stop(state, symbol, tp1_level, "TP2_HIT -> SL TP1", cp, True)
+
+    if active.get("trail_active"):
+        base_trail_mult = TP2_TRAIL_ATR_MULTIPLIER
+        if direction == "LONG":
+            open_profit = cp - safe_float(active.get("entry"))
+            trail_mult = 0.70 if open_profit >= (2.0 * atr) else base_trail_mult
+            trail_sl = safe_float(active.get("highest_price")) - (trail_mult * atr)
+        else:
+            open_profit = safe_float(active.get("entry")) - cp
+            trail_mult = 0.70 if open_profit >= (2.0 * atr) else base_trail_mult
+            trail_sl = safe_float(active.get("lowest_price")) + (trail_mult * atr)
+        update_signal_stop(state, symbol, trail_sl, "TP2_TRAIL_UPDATE", cp, False)
+
+    if is_tp3_hit(active, cp):
+        close_active_signal(state, symbol, "TP3_HIT", cp, True)
         return
-    if is_tp1_hit(active, current_price):
-        close_active_signal(state, symbol, "TP1_HIT", current_price, True)
+    if is_sl_hit(active, cp):
+        close_active_signal(state, symbol, "SL_HIT", cp, True)
         return
     if is_expired(active):
-        close_active_signal(state, symbol, "TIMEOUT", current_price, True)
+        close_active_signal(state, symbol, "TIMEOUT", cp, True)
+
 
 def recent_gap_blocked(state, symbol, new_signal):
     key = signal_key(symbol)
@@ -669,6 +884,7 @@ def recent_gap_blocked(state, symbol, new_signal):
         if dist < MIN_PRICE_DISTANCE_PCT:
             return True
     return False
+
 
 def should_send_signal(state, symbol, new_signal, current_price):
     key = signal_key(symbol)
@@ -706,6 +922,7 @@ def should_send_signal(state, symbol, new_signal, current_price):
 
     return False, "SIMILAR_ACTIVE_SIGNAL_STILL_OPEN"
 
+
 def register_sent_signal(state, symbol, sent_signal):
     key = signal_key(symbol)
     sent_signal["created_ts"] = now_ts()
@@ -714,20 +931,25 @@ def register_sent_signal(state, symbol, sent_signal):
     state["active_signal"][key] = sent_signal
     state["last_signal"][key] = sent_signal
 
+
 # =========================================================
 # WATCHLIST CONTROL
 # =========================================================
+
 def should_send_watchlist(state, symbol):
     ts = state.get("last_watchlist_sent", {}).get(symbol, 0)
     return minutes_since(ts) >= WATCHLIST_COOLDOWN_MINUTES
 
+
 def mark_watchlist_sent(state, symbol):
     state["last_watchlist_sent"][symbol] = now_ts()
+
 
 # =========================================================
 # STRATEGY
 # =========================================================
-def evaluate_symbol(symbol: str):
+
+def evaluate_symbol(symbol: str, btc_bias: str, btc_reason: str):
     result = {
         "symbol": symbol,
         "ok": False,
@@ -755,7 +977,10 @@ def evaluate_symbol(symbol: str):
     current_price = ind_30m.close
     result["current_price"] = current_price
 
-    btc_bias, btc_reason = get_btc_filter_bias()
+    atr_pct_30m = (ind_30m.atr / current_price) if current_price > 0 else 999.0
+    if atr_pct_30m < MIN_ATR_PCT_30M or atr_pct_30m > MAX_ATR_PCT_30M:
+        logger.info("%s ATR_PCT_FILTER %.5f", symbol, atr_pct_30m)
+        return result
 
     trigger_breakout_long = breakout_long(df_30m, BREAKOUT_LOOKBACK)
     trigger_breakout_short = breakout_short(df_30m, BREAKOUT_LOOKBACK)
@@ -789,8 +1014,8 @@ def evaluate_symbol(symbol: str):
     trend_4h_long_ok = trend_up(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_LONG <= ind_4h.rsi <= MAX_4H_RSI_LONG
     trend_4h_short_ok = trend_down(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_SHORT <= ind_4h.rsi <= MAX_4H_RSI_SHORT
 
-    trend_4h_long_partial = ind_4h.close > ind_4h.ema20 and ind_4h.rsi >= 47
-    trend_4h_short_partial = ind_4h.close < ind_4h.ema20 and ind_4h.rsi <= 53
+    trend_4h_long_partial = ind_4h.close > ind_4h.ema20 and ind_4h.rsi >= 48
+    trend_4h_short_partial = ind_4h.close < ind_4h.ema20 and ind_4h.rsi <= 52
 
     if trend_4h_long_ok:
         long_score += 3.0
@@ -865,10 +1090,10 @@ def evaluate_symbol(symbol: str):
 
     if trigger_volume:
         if entry_30m_long_ok:
-            long_score += 1.0
+            long_score += 1.25
             long_reasons.append("30M volume confirm")
         if entry_30m_short_ok:
-            short_score += 1.0
+            short_score += 1.25
             short_reasons.append("30M volume confirm")
 
     if trigger_squeeze:
@@ -881,15 +1106,28 @@ def evaluate_symbol(symbol: str):
 
     if btc_bias == "LONG":
         long_score += 1.0
-        short_score -= 0.75
+        short_score -= 1.0
         long_reasons.append("BTC supports long")
     elif btc_bias == "SHORT":
         short_score += 1.0
-        long_score -= 0.75
+        long_score -= 1.0
         short_reasons.append("BTC supports short")
     else:
-        long_score -= 0.20
-        short_score -= 0.20
+        long_score -= 0.25
+        short_score -= 0.25
+
+    volume_strength = min(max((float(df_30m["volume"].iloc[-1]) / max(float(df_30m["volume"].rolling(20).mean().iloc[-1]), 1e-12)) - 1.0, 0.0), 1.0)
+    adx_strength = min(max((ind_30m.adx - 18.0) / 20.0, 0.0), 1.0)
+    quality_boost = volume_strength + adx_strength
+
+    if entry_30m_long_ok:
+        long_score += quality_boost
+        if quality_boost > 0:
+            long_reasons.append(f"quality+{quality_boost:.2f}")
+    if entry_30m_short_ok:
+        short_score += quality_boost
+        if quality_boost > 0:
+            short_reasons.append(f"quality+{quality_boost:.2f}")
 
     long_trigger_ok = (
         (trigger_breakout_long and breakout_long_ok) or
@@ -906,34 +1144,44 @@ def evaluate_symbol(symbol: str):
 
     candidates = []
 
+    long_rr_min = FULL_MIN_RR_TO_TP2 + (BEAR_BTC_RR_BONUS if btc_bias == "SHORT" else 0.0)
+    short_rr_min = FULL_MIN_RR_TO_TP2 + (BEAR_BTC_RR_BONUS if btc_bias == "LONG" else 0.0)
+    long_min_score = FULL_MIN_SCORE + (BEAR_BTC_SCORE_PENALTY if btc_bias == "SHORT" else 0.0)
+    short_min_score = FULL_MIN_SCORE + (BEAR_BTC_SCORE_PENALTY if btc_bias == "LONG" else 0.0)
+
+    allow_long = not (BLOCK_COUNTERTREND_SIGNALS and btc_bias == "SHORT")
+    allow_short = not (BLOCK_COUNTERTREND_SIGNALS and btc_bias == "LONG")
+
     # FULL LONG
-    if trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
+    if allow_long and trend_4h_long_ok and setup_1h_long_ok and entry_30m_long_ok and long_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
         rr2 = rr("LONG", entry, sl, tp2)
-        if rr2 is not None and rr2 >= FULL_MIN_RR_TO_TP2 and long_score >= FULL_MIN_SCORE:
+        if rr2 is not None and rr2 >= long_rr_min and long_score >= long_min_score:
             candidates.append(build_signal_payload(
                 symbol, "LONG", entry, sl, tp1, tp2, tp3, long_score,
-                "MEXC_CLEAN_FULL",
+                "MEXC_SUPER_FULL",
                 " | ".join(long_reasons[:8]) + f" | {btc_reason}",
-                "FULL"
+                "FULL",
+                ind_30m.atr,
             ))
 
     # FULL SHORT
-    if trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
+    if allow_short and trend_4h_short_ok and setup_1h_short_ok and entry_30m_short_ok and short_trigger_ok:
         entry = current_price
         sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
         rr2 = rr("SHORT", entry, sl, tp2)
-        if rr2 is not None and rr2 >= FULL_MIN_RR_TO_TP2 and short_score >= FULL_MIN_SCORE:
+        if rr2 is not None and rr2 >= short_rr_min and short_score >= short_min_score:
             candidates.append(build_signal_payload(
                 symbol, "SHORT", entry, sl, tp1, tp2, tp3, short_score,
-                "MEXC_CLEAN_FULL",
+                "MEXC_SUPER_FULL",
                 " | ".join(short_reasons[:8]) + f" | {btc_reason}",
-                "FULL"
+                "FULL",
+                ind_30m.atr,
             ))
 
     # EARLY LONG
-    early_long_allowed = entry_30m_long_ok and long_trigger_ok and (setup_1h_long_ok or trend_4h_long_partial or engulf_long)
+    early_long_allowed = allow_long and entry_30m_long_ok and long_trigger_ok and (setup_1h_long_ok or trend_4h_long_partial or engulf_long)
     early_long_blocked = ind_30m.rsi > 67 or dist_ema20_atr > 2.0
 
     if not candidates and early_long_allowed and not early_long_blocked:
@@ -941,16 +1189,19 @@ def evaluate_symbol(symbol: str):
         sl, tp1, tp2, tp3 = calc_levels("LONG", entry, ind_30m.atr)
         rr2 = rr("LONG", entry, sl, tp2)
         early_score = long_score + (1.0 if trend_4h_long_partial else 0.0) + (0.5 if engulf_long else 0.0)
-        if rr2 is not None and rr2 >= EARLY_MIN_RR_TO_TP2 and early_score >= EARLY_MIN_SCORE:
+        early_min_score = EARLY_MIN_SCORE + (BEAR_BTC_SCORE_PENALTY if btc_bias == "SHORT" else 0.0)
+        early_rr_min = EARLY_MIN_RR_TO_TP2 + (BEAR_BTC_RR_BONUS if btc_bias == "SHORT" else 0.0)
+        if rr2 is not None and rr2 >= early_rr_min and early_score >= early_min_score:
             candidates.append(build_signal_payload(
                 symbol, "LONG", entry, sl, tp1, tp2, tp3, early_score,
-                "MEXC_CLEAN_EARLY",
+                "MEXC_SUPER_EARLY",
                 "EARLY | " + " | ".join(long_reasons[:8]) + f" | {btc_reason}",
-                "EARLY"
+                "EARLY",
+                ind_30m.atr,
             ))
 
     # EARLY SHORT
-    early_short_allowed = entry_30m_short_ok and short_trigger_ok and (setup_1h_short_ok or trend_4h_short_partial or engulf_short)
+    early_short_allowed = allow_short and entry_30m_short_ok and short_trigger_ok and (setup_1h_short_ok or trend_4h_short_partial or engulf_short)
     early_short_blocked = ind_30m.rsi < 33 or dist_ema20_atr > 2.0
 
     if not candidates and early_short_allowed and not early_short_blocked:
@@ -958,16 +1209,19 @@ def evaluate_symbol(symbol: str):
         sl, tp1, tp2, tp3 = calc_levels("SHORT", entry, ind_30m.atr)
         rr2 = rr("SHORT", entry, sl, tp2)
         early_score = short_score + (1.0 if trend_4h_short_partial else 0.0) + (0.5 if engulf_short else 0.0)
-        if rr2 is not None and rr2 >= EARLY_MIN_RR_TO_TP2 and early_score >= EARLY_MIN_SCORE:
+        early_min_score = EARLY_MIN_SCORE + (BEAR_BTC_SCORE_PENALTY if btc_bias == "LONG" else 0.0)
+        early_rr_min = EARLY_MIN_RR_TO_TP2 + (BEAR_BTC_RR_BONUS if btc_bias == "LONG" else 0.0)
+        if rr2 is not None and rr2 >= early_rr_min and early_score >= early_min_score:
             candidates.append(build_signal_payload(
                 symbol, "SHORT", entry, sl, tp1, tp2, tp3, early_score,
-                "MEXC_CLEAN_EARLY",
+                "MEXC_SUPER_EARLY",
                 "EARLY | " + " | ".join(short_reasons[:8]) + f" | {btc_reason}",
-                "EARLY"
+                "EARLY",
+                ind_30m.atr,
             ))
 
     # WATCHLIST
-    if setup_1h_long_ok or entry_30m_long_ok or engulf_long or trend_4h_long_partial:
+    if allow_long and (setup_1h_long_ok or entry_30m_long_ok or engulf_long or trend_4h_long_partial):
         if long_score >= WATCHLIST_MIN_SCORE:
             result["watchlist"] = {
                 "symbol": symbol,
@@ -976,7 +1230,7 @@ def evaluate_symbol(symbol: str):
                 "reason": " | ".join(long_reasons[:6]) + f" | {btc_reason}"
             }
 
-    if result["watchlist"] is None and (setup_1h_short_ok or entry_30m_short_ok or engulf_short or trend_4h_short_partial):
+    if result["watchlist"] is None and allow_short and (setup_1h_short_ok or entry_30m_short_ok or engulf_short or trend_4h_short_partial):
         if short_score >= WATCHLIST_MIN_SCORE:
             result["watchlist"] = {
                 "symbol": symbol,
@@ -987,10 +1241,11 @@ def evaluate_symbol(symbol: str):
 
     if not candidates:
         logger.info(
-            "%s | no signal | long=%.2f short=%.2f | 4H=%s/%s 1H=%s/%s 30M=%s/%s",
+            "%s | no signal | long=%.2f short=%.2f | btc=%s | 4H=%s/%s 1H=%s/%s 30M=%s/%s",
             symbol,
             long_score,
             short_score,
+            btc_bias,
             trend_4h_long_ok,
             trend_4h_short_ok,
             setup_1h_long_ok,
@@ -1005,9 +1260,11 @@ def evaluate_symbol(symbol: str):
     result["signal"] = candidates[0]
     return result
 
+
 # =========================================================
 # MESSAGE FORMAT
 # =========================================================
+
 def format_signal_message(sig, current_price):
     emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
     signal_type = sig.get("signal_type", "FULL")
@@ -1017,13 +1274,14 @@ def format_signal_message(sig, current_price):
         f"Fiyat: {fmt_price(current_price)}\n"
         f"Entry: {fmt_price(sig['entry'])}\n"
         f"SL: {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}\n"
-        f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}  -> TP1 gelince SL BE\n"
+        f"TP2: {fmt_price(sig['tp2'])}  -> TP2 gelince trail aktif\n"
+        f"TP3: {fmt_price(sig['tp3'])}  -> final close\n"
         f"Score: {sig['score']}\n"
         f"Neden: {sig['reason']}\n"
         f"Zaman: {now_str()}"
     )
+
 
 def format_watchlist_message(w):
     return (
@@ -1033,6 +1291,7 @@ def format_watchlist_message(w):
         f"Zaman: {now_str()}"
     )
 
+
 def format_close_message(sig, close_reason, close_price=None):
     direction_emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
     body = (
@@ -1040,7 +1299,8 @@ def format_close_message(sig, close_reason, close_price=None):
         f"Yön: {direction_emoji} {sig['direction']}\n"
         f"Tip: {sig.get('signal_type', 'FULL')}\n"
         f"Entry: {fmt_price(sig.get('entry'))}\n"
-        f"SL: {fmt_price(sig.get('sl'))}\n"
+        f"İlk SL: {fmt_price(sig.get('initial_sl'))}\n"
+        f"Son SL: {fmt_price(sig.get('sl'))}\n"
         f"TP1: {fmt_price(sig.get('tp1'))}\n"
         f"TP2: {fmt_price(sig.get('tp2'))}\n"
         f"TP3: {fmt_price(sig.get('tp3'))}\n"
@@ -1051,15 +1311,72 @@ def format_close_message(sig, close_reason, close_price=None):
     body += f"İlk score: {sig.get('score')}\nZaman: {now_str()}"
     return body
 
+
+def format_manager_message(sig, reason, old_sl, new_sl, current_price=None):
+    body = (
+        f"🛠 {sig['symbol']} TRADE MANAGER\n"
+        f"Yön: {sig['direction']}\n"
+        f"Sebep: {reason}\n"
+        f"Eski SL: {fmt_price(old_sl)}\n"
+        f"Yeni SL: {fmt_price(new_sl)}\n"
+    )
+    if current_price is not None:
+        body += f"Anlık fiyat: {fmt_price(current_price)}\n"
+    body += f"Zaman: {now_str()}"
+    return body
+
+
+
+
+def symbol_theme_key(symbol: str) -> str:
+    base = symbol.split("_")[0].upper()
+    if len(base) <= 4:
+        return base
+    return base[:4]
+
+
+def pick_top_diverse_signals(raw_candidates, limit: int):
+    if not raw_candidates:
+        return []
+
+    ranked = sorted(raw_candidates, key=lambda x: (x[0]["signal_type"] == "FULL", x[0]["score"]), reverse=True)
+    if not USE_THEME_DIVERSITY_FILTER:
+        return ranked[:limit]
+
+    selected = []
+    used_themes = set()
+
+    for item in ranked:
+        sig = item[0]
+        theme = symbol_theme_key(sig["symbol"])
+        if theme in used_themes:
+            continue
+        selected.append(item)
+        used_themes.add(theme)
+        if len(selected) >= limit:
+            return selected
+
+    for item in ranked:
+        if item in selected:
+            continue
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+
+    return selected
+
 # =========================================================
 # RUN
 # =========================================================
+
 def run_once():
     state = load_state()
-    active_symbols = get_active_symbols(REQUESTED_SYMBOLS)
+    active_symbols = get_active_symbols()
     state["active_symbols"] = active_symbols
 
     raw_candidates = []
+    btc_bias, btc_reason = get_btc_filter_bias()
+    logger.info("BTC FILTER | %s | %s", btc_bias, btc_reason)
 
     if not active_symbols:
         save_state(state)
@@ -1067,7 +1384,7 @@ def run_once():
 
     for symbol in active_symbols:
         try:
-            r = evaluate_symbol(symbol)
+            r = evaluate_symbol(symbol, btc_bias, btc_reason)
             current_price = r.get("current_price")
 
             if current_price is not None:
@@ -1086,32 +1403,41 @@ def run_once():
         except Exception as e:
             logger.exception("Sembol analiz exception %s: %s", symbol, e)
 
-        time.sleep(0.30)
+        time.sleep(0.15)
+
+    dynamic_top_n = TOP_N_SIGNALS_BTC_BEAR if btc_bias == "SHORT" else TOP_N_SIGNALS
 
     if raw_candidates:
-        raw_candidates.sort(key=lambda x: (x[0]["signal_type"] == "FULL", x[0]["score"]), reverse=True)
-        selected = raw_candidates[:TOP_N_SIGNALS]
+        selected = pick_top_diverse_signals(raw_candidates, dynamic_top_n)
 
         for sig, current_price, reason_code in selected:
             if tg_send(format_signal_message(sig, current_price)):
                 register_sent_signal(state, sig["symbol"], sig)
                 logger.info("Sinyal gönderildi %s %s %s", sig["symbol"], sig["direction"], reason_code)
+    else:
+        if SEND_NO_SIGNAL_MESSAGE and minutes_since(state.get("last_no_signal_ts", 0)) >= 180:
+            tg_send(f"⛔ Uygun trade yok. BTC={btc_bias} | {btc_reason} | Zaman: {now_str()}")
+            state["last_no_signal_ts"] = now_ts()
 
     save_state(state)
 
+
 def send_startup_message(state):
-    active_symbols = get_active_symbols(REQUESTED_SYMBOLS)
+    active_symbols = get_active_symbols()
     state["active_symbols"] = active_symbols
     save_state(state)
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            f"🤖 MEXC SADE SİNYAL BOT başladı.\n"
+            f"🤖 MEXC SUPER SIGNAL BOT PRO başladı.\n"
             f"Zaman: {now_str()}\n"
-            f"İstenen: {', '.join(REQUESTED_SYMBOLS)}\n"
-            f"Aktif: {', '.join(active_symbols) if active_symbols else 'YOK'}\n"
-            f"Mesajlar: WATCHLIST / EARLY / FULL"
+            f"Tarama: aktif USDT kontratları\n"
+            f"Hariç: {', '.join(sorted(EXCLUDED_SYMBOLS))}\n"
+            f"Aktif sembol sayısı: {len(active_symbols)}\n"
+            f"Top sinyal: {TOP_N_SIGNALS}\n"
+            f"Trade manager: TP1->BE / TP2->Trail / TP3->Close"
         )
+
 
 def main():
     logger.info("Bot başlıyor...")
@@ -1128,6 +1454,7 @@ def main():
             tg_send(f"❌ Bot ana döngü hatası: {e}")
 
         time.sleep(CHECK_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
