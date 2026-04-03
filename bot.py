@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-COINRADAR PRO++ - MEXC FUTURES SIGNAL BOT
-Tek dosya / tek parça / Telegram profesyonel formatlı sinyal botu
+COINRADAR ELIT++ - MEXC FUTURES SIGNAL BOT
+Tek dosya / tek parça / profesyonel Telegram formatlı
+Amaç:
+- 200-250 coin taramak
+- çöp coinleri mümkün olduğunca elemek
+- kaliteli 3 sinyal seçmek
+- LONG / SHORT sinyal üretmek
+- mevcut yapıdaki iyi parçaları koruyup geliştirmek
 
 Kurulum:
     pip install requests pandas
 
 Çalıştırma:
-    python coinradar_propp.py
+    python coinradar_elitpp.py
 """
 
 import os
 import time
 import html
 import json
+import math
 import traceback
 from typing import List, Optional, Tuple
 
@@ -34,43 +41,48 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID").strip()
 # GENEL AYARLAR
 # =========================================================
 MEXC_BASE = "https://contract.mexc.com"
-CHECK_EVERY_SECONDS = 60
 HTTP_TIMEOUT = 15
+CHECK_EVERY_SECONDS = 60
 
-MAX_SYMBOLS_TO_SCAN = 120
-TOP_N_SIGNALS = 2
-SIGNAL_COOLDOWN_MINUTES = 45
-
+STATE_FILE = "coinradar_elitpp_state.json"
 SEND_STARTUP_MESSAGE = True
 SEND_HEARTBEAT_IF_NO_SIGNAL = True
 HEARTBEAT_EVERY_MINUTES = 30
 
-STATE_FILE = "coinradar_propp_state.json"
+# Daha geniş ama kontrollü tarama
+MAX_SYMBOLS_TO_SCAN = 250
+TOP_N_SIGNALS = 3
+SIGNAL_COOLDOWN_MINUTES = 30
+
+# Kline
+TF_ENTRY = "Min5"
+TF_CONFIRM = "Min15"
+TF_REGIME = "Min60"
+KLINE_LIMIT = 260
 
 # =========================================================
-# MARKET / FİLTRE
+# MARKET / EVREN FİLTRESİ
 # =========================================================
-MIN_AMOUNT24_USDT = 8_000_000
-MIN_HOLDVOL = 100_000
-MAX_SPREAD_PCT = 0.20
-MAX_ABS_FUNDING = 0.0012
-MAX_24H_PUMP_PCT = 10.0
+REQUIRE_USDT_PERP = True
+
+# 200-250 coin tarayabilsin diye gevşetildi ama yine kaliteli kalsın
+MIN_AMOUNT24_USDT = 2_500_000
+MIN_HOLDVOL = 40_000
+MAX_SPREAD_PCT = 0.35
+MAX_ABS_FUNDING = 0.0020
+MAX_24H_PUMP_PCT = 18.0
 MIN_PRICE = 0.00001
 
+# Çok riskli / anlamsız / aşırı spekülatif sözleşmeleri ele
 BLACKLIST_KEYWORDS = {
-    "1000", "10000", "100000", "MOG", "PEPE", "FLOKI",
-    "LUNA", "USTC", "BULL", "BEAR"
+    "1000", "10000", "100000",
+    "BULL", "BEAR",
+    "USTC"
 }
-
-REQUIRE_USDT_PERP = True
 
 # =========================================================
 # İNDİKATÖRLER
 # =========================================================
-TF_SIGNAL = "Min5"
-TF_TREND = "Min15"
-KLINE_LIMIT = 220
-
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
@@ -79,29 +91,35 @@ ATR_PERIOD = 14
 ADX_PERIOD = 14
 VOL_MA_PERIOD = 20
 
-MIN_RSI_LONG = 53
-MAX_RSI_SHORT = 47
-MIN_ADX = 18
-MIN_RR_TO_TP2 = 1.60
+# Sinyal eşikleri
+MIN_RSI_LONG = 51
+MAX_RSI_SHORT = 49
+MIN_ADX = 15
+MIN_RR_TO_TP2 = 1.25
 
+MAX_DISTANCE_FROM_EMA20_ATR = 2.4
+MAX_LAST_CANDLE_RANGE_ATR = 2.8
+MIN_BREAKOUT_BODY_ATR = 0.12
+
+SL_ATR_MULT = 1.10
+TP1_ATR_MULT = 1.10
+TP2_ATR_MULT = 1.90
+TP3_ATR_MULT = 2.90
+
+# Volume & yapı
+VOLUME_SURGE_MIN = 1.15
+BREAKOUT_LOOKBACK = 20
+
+# BTC bias
 USE_BTC_REGIME_FILTER = True
 BTC_SYMBOL = "BTC_USDT"
-
-MAX_DISTANCE_FROM_EMA20_ATR = 1.8
-MAX_LAST_CANDLE_RANGE_ATR = 2.2
-MIN_BREAKOUT_BODY_ATR = 0.15
-
-SL_ATR_MULT = 1.15
-TP1_ATR_MULT = 1.20
-TP2_ATR_MULT = 2.00
-TP3_ATR_MULT = 3.00
 
 # =========================================================
 # REQUEST SESSION
 # =========================================================
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "CoinRadar-ProPP/1.1"
+    "User-Agent": "CoinRadar-ElitPP/2.0"
 })
 
 
@@ -141,17 +159,12 @@ def validate_telegram_config():
         or TELEGRAM_BOT_TOKEN == "BURAYA_TOKEN"
         or ":" not in TELEGRAM_BOT_TOKEN
     ):
-        raise ValueError(
-            "TELEGRAM_BOT_TOKEN geçersiz. GitHub/Railway env veya kod içindeki token yanlış."
-        )
-
+        raise ValueError("TELEGRAM_BOT_TOKEN geçersiz.")
     if (
         not TELEGRAM_CHAT_ID
         or TELEGRAM_CHAT_ID == "BURAYA_CHAT_ID"
     ):
-        raise ValueError(
-            "TELEGRAM_CHAT_ID geçersiz. GitHub/Railway env veya kod içindeki chat id yanlış."
-        )
+        raise ValueError("TELEGRAM_CHAT_ID geçersiz.")
 
 
 def load_state() -> dict:
@@ -174,34 +187,27 @@ def save_state(state: dict):
 # TELEGRAM
 # =========================================================
 def telegram_send_html(message: str) -> bool:
-    token = str(TELEGRAM_BOT_TOKEN).strip()
-    chat_id = str(TELEGRAM_CHAT_ID).strip()
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-
     try:
         r = requests.post(url, data=payload, timeout=HTTP_TIMEOUT)
-
         if r.ok:
             return True
-
         print("Telegram status:", r.status_code)
         print("Telegram response:", r.text[:500])
         return False
-
     except Exception as e:
         print("Telegram exception:", e)
         return False
 
 
 def telegram_test() -> bool:
-    return telegram_send_html("✅ <b>COINRADAR TEST</b>\n\nTelegram bağlantısı başarılı.")
+    return telegram_send_html("✅ <b>COINRADAR ELIT++ TEST</b>\n\nTelegram bağlantısı başarılı.")
 
 
 # =========================================================
@@ -238,7 +244,7 @@ def get_funding_rate(symbol: str) -> Optional[float]:
         return None
 
 
-def get_kline(symbol: str, interval: str, limit: int = 220) -> pd.DataFrame:
+def get_kline(symbol: str, interval: str, limit: int = 260) -> pd.DataFrame:
     end_ = now_ts()
     seconds_per_bar = {
         "Min1": 60,
@@ -249,7 +255,7 @@ def get_kline(symbol: str, interval: str, limit: int = 220) -> pd.DataFrame:
         "Hour4": 14400,
         "Day1": 86400,
     }.get(interval, 300)
-    start_ = end_ - (limit + 20) * seconds_per_bar
+    start_ = end_ - (limit + 30) * seconds_per_bar
 
     data = mexc_get(
         f"/api/v1/contract/kline/{symbol}",
@@ -352,7 +358,7 @@ def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# MARKET FİLTRE
+# MARKET FİLTRESİ
 # =========================================================
 def is_blacklisted(symbol: str) -> bool:
     s = symbol.upper()
@@ -396,7 +402,7 @@ def build_market_universe() -> List[dict]:
         if abs(rise_fall_rate) > MAX_24H_PUMP_PCT:
             continue
 
-        spread_pct = 0.0
+        spread_pct = 999.0
         if bid1 > 0 and ask1 > 0:
             mid = (bid1 + ask1) / 2.0
             if mid > 0:
@@ -405,6 +411,11 @@ def build_market_universe() -> List[dict]:
         if spread_pct > MAX_SPREAD_PCT:
             continue
 
+        liquidity_score = (
+            math.log10(max(amount24, 1.0)) * 0.70 +
+            math.log10(max(hold_vol, 1.0)) * 0.30
+        )
+
         rows.append({
             "symbol": symbol,
             "last_price": last_price,
@@ -412,18 +423,22 @@ def build_market_universe() -> List[dict]:
             "hold_vol": hold_vol,
             "spread_pct": spread_pct,
             "rise_fall_pct": rise_fall_rate,
+            "liquidity_score": liquidity_score
         })
 
-    rows.sort(key=lambda x: (x["amount24"], x["hold_vol"]), reverse=True)
+    rows.sort(
+        key=lambda x: (x["liquidity_score"], x["amount24"], x["hold_vol"]),
+        reverse=True
+    )
     return rows[:MAX_SYMBOLS_TO_SCAN]
 
 
 # =========================================================
-# BTC REJİM
+# BTC REGIME
 # =========================================================
 def get_btc_regime() -> str:
     try:
-        df = get_kline(BTC_SYMBOL, TF_TREND, 220)
+        df = get_kline(BTC_SYMBOL, TF_CONFIRM, 240)
         if len(df) < 210:
             return "NEUTRAL"
 
@@ -433,12 +448,12 @@ def get_btc_regime() -> str:
         bullish = (
             last["close"] > last["ema20"] > last["ema50"] > last["ema200"]
             and last["rsi"] >= 52
-            and last["adx"] >= 18
+            and last["adx"] >= 16
         )
         bearish = (
             last["close"] < last["ema20"] < last["ema50"] < last["ema200"]
             and last["rsi"] <= 48
-            and last["adx"] >= 18
+            and last["adx"] >= 16
         )
 
         if bullish:
@@ -453,19 +468,6 @@ def get_btc_regime() -> str:
 # =========================================================
 # SİNYAL MOTORU
 # =========================================================
-def breakdown_or_breakout(df: pd.DataFrame) -> Tuple[bool, bool]:
-    if len(df) < 25:
-        return False, False
-
-    prev20_high = df["high"].iloc[-21:-1].max()
-    prev20_low = df["low"].iloc[-21:-1].min()
-    last = df.iloc[-1]
-
-    breakout_long = last["close"] > prev20_high and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
-    breakdown_short = last["close"] < prev20_low and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
-    return breakout_long, breakdown_short
-
-
 def compute_rr(side: str, entry: float, sl: float, tp2: float) -> float:
     if side == "LONG":
         risk = entry - sl
@@ -479,16 +481,83 @@ def compute_rr(side: str, entry: float, sl: float, tp2: float) -> float:
     return reward / risk
 
 
+def breakout_flags(df: pd.DataFrame) -> Tuple[bool, bool]:
+    if len(df) < BREAKOUT_LOOKBACK + 2:
+        return False, False
+
+    prev_high = df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max()
+    prev_low = df["low"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].min()
+    last = df.iloc[-1]
+
+    breakout_long = (
+        last["close"] > prev_high
+        and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
+    )
+    breakdown_short = (
+        last["close"] < prev_low
+        and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
+    )
+    return breakout_long, breakdown_short
+
+
+def ema_reclaim_long(last5, prev5) -> bool:
+    return (
+        last5["close"] > last5["ema20"]
+        and prev5["close"] <= prev5["ema20"]
+        and last5["close"] > last5["open"]
+    )
+
+
+def ema_reject_short(last5, prev5) -> bool:
+    return (
+        last5["close"] < last5["ema20"]
+        and prev5["close"] >= prev5["ema20"]
+        and last5["close"] < last5["open"]
+    )
+
+
+def wick_ok_for_long(last5) -> bool:
+    body = max(last5["body"], 1e-12)
+    return (last5["upper_wick"] / body) <= 3.5
+
+
+def wick_ok_for_short(last5) -> bool:
+    body = max(last5["body"], 1e-12)
+    return (last5["lower_wick"] / body) <= 3.5
+
+
+def trend_score_long(last15) -> float:
+    score = 0.0
+    if last15["close"] > last15["ema20"]:
+        score += 1.0
+    if last15["ema20"] > last15["ema50"]:
+        score += 1.0
+    if last15["ema50"] > last15["ema200"]:
+        score += 1.0
+    return score
+
+
+def trend_score_short(last15) -> float:
+    score = 0.0
+    if last15["close"] < last15["ema20"]:
+        score += 1.0
+    if last15["ema20"] < last15["ema50"]:
+        score += 1.0
+    if last15["ema50"] < last15["ema200"]:
+        score += 1.0
+    return score
+
+
 def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[dict]:
     try:
         funding = get_funding_rate(symbol)
         if funding is not None and abs(funding) > MAX_ABS_FUNDING:
             return None
 
-        df5 = get_kline(symbol, TF_SIGNAL, KLINE_LIMIT)
-        df15 = get_kline(symbol, TF_TREND, KLINE_LIMIT)
+        df5 = get_kline(symbol, TF_ENTRY, KLINE_LIMIT)
+        df15 = get_kline(symbol, TF_CONFIRM, KLINE_LIMIT)
 
-        if len(df5) < 210 or len(df15) < 210:
+        if len(df5) < 230 or len(df15) < 230:
             return None
 
         df5 = enrich_indicators(df5)
@@ -498,56 +567,71 @@ def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[di
         prev5 = df5.iloc[-2]
         last15 = df15.iloc[-1]
 
-        breakout_long, breakdown_short = breakdown_or_breakout(df5)
+        if last5["atr"] <= 0:
+            return None
 
-        trend_long = last15["close"] > last15["ema20"] > last15["ema50"] > last15["ema200"]
-        trend_short = last15["close"] < last15["ema20"] < last15["ema50"] < last15["ema200"]
+        breakout_long, breakdown_short = breakout_flags(df5)
 
-        vol_ok = last5["vol"] > (last5["vol_ma"] * 1.20 if pd.notna(last5["vol_ma"]) else 0)
+        trend_long_score = trend_score_long(last15)
+        trend_short_score = trend_score_short(last15)
+
+        trend_long = trend_long_score >= 2.5
+        trend_short = trend_short_score >= 2.5
+
+        vol_ratio = 0.0
+        if pd.notna(last5["vol_ma"]) and last5["vol_ma"] > 0:
+            vol_ratio = float(last5["vol"] / last5["vol_ma"])
+
+        vol_ok = vol_ratio >= VOLUME_SURGE_MIN
         adx_ok = last5["adx"] >= MIN_ADX
 
         candle_range_atr = (last5["range"] / last5["atr"]) if last5["atr"] > 0 else 999
         if candle_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
             return None
 
-        distance_from_ema20_atr = abs(last5["close"] - last5["ema20"]) / last5["atr"] if last5["atr"] > 0 else 999
+        distance_from_ema20_atr = abs(last5["close"] - last5["ema20"]) / last5["atr"]
         if distance_from_ema20_atr > MAX_DISTANCE_FROM_EMA20_ATR:
             return None
 
+        long_trigger = breakout_long or ema_reclaim_long(last5, prev5)
+        short_trigger = breakdown_short or ema_reject_short(last5, prev5)
+
         long_ok = all([
             trend_long,
-            breakout_long or (last5["close"] > last5["ema20"] and prev5["close"] <= prev5["ema20"]),
+            long_trigger,
             last5["rsi"] >= MIN_RSI_LONG,
             adx_ok,
-            vol_ok,
+            wick_ok_for_long(last5),
         ])
 
         short_ok = all([
             trend_short,
-            breakdown_short or (last5["close"] < last5["ema20"] and prev5["close"] >= prev5["ema20"]),
+            short_trigger,
             last5["rsi"] <= MAX_RSI_SHORT,
             adx_ok,
-            vol_ok,
+            wick_ok_for_short(last5),
         ])
 
+        # Volume yoksa tamamen öldürme, ama puanda ceza ver
         if USE_BTC_REGIME_FILTER:
             if btc_regime == "LONG_ONLY":
                 short_ok = False
             elif btc_regime == "SHORT_ONLY":
                 long_ok = False
-            elif btc_regime == "NEUTRAL":
-                if not breakout_long:
+            else:
+                # BTC nötrse daha seçici ol
+                if long_ok and not breakout_long and vol_ratio < 1.05:
                     long_ok = False
-                if not breakdown_short:
+                if short_ok and not breakdown_short and vol_ratio < 1.05:
                     short_ok = False
 
         if not long_ok and not short_ok:
             return None
 
         if long_ok and short_ok:
-            long_score_seed = (last5["rsi"] - 50) + (last5["adx"] - 15)
-            short_score_seed = (50 - last5["rsi"]) + (last5["adx"] - 15)
-            if long_score_seed >= short_score_seed:
+            long_seed = trend_long_score + max(0.0, last5["rsi"] - 50) + last5["adx"] * 0.15
+            short_seed = trend_short_score + max(0.0, 50 - last5["rsi"]) + last5["adx"] * 0.15
+            if long_seed >= short_seed:
                 short_ok = False
             else:
                 long_ok = False
@@ -562,6 +646,8 @@ def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[di
             tp2 = entry + atrv * TP2_ATR_MULT
             tp3 = entry + atrv * TP3_ATR_MULT
             setup = "Breakout" if breakout_long else "EMA Reclaim"
+            setup_bonus = 0.9 if breakout_long else 0.5
+            trend_bonus = trend_long_score
         else:
             side = "SHORT"
             sl = entry + atrv * SL_ATR_MULT
@@ -569,28 +655,48 @@ def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[di
             tp2 = entry - atrv * TP2_ATR_MULT
             tp3 = entry - atrv * TP3_ATR_MULT
             setup = "Breakdown" if breakdown_short else "EMA Reject"
+            setup_bonus = 0.9 if breakdown_short else 0.5
+            trend_bonus = trend_short_score
 
         rr = compute_rr(side, entry, sl, tp2)
         if rr < MIN_RR_TO_TP2:
             return None
 
-        strength = 0.0
-        strength += clamp(abs(last5["rsi"] - 50) * 0.20, 0, 3.0)
-        strength += clamp((last5["adx"] - 15) * 0.15, 0, 2.5)
-        strength += clamp(rr * 1.4, 0, 3.0)
-        strength += 0.8 if vol_ok else 0.0
-        strength += 0.8 if ((side == "LONG" and breakout_long) or (side == "SHORT" and breakdown_short)) else 0.0
+        # Kalite puanı
+        score = 0.0
 
+        score += clamp(trend_bonus * 0.90, 0.0, 3.0)
+        score += clamp(abs(float(last5["rsi"]) - 50) * 0.08, 0.0, 1.8)
+        score += clamp((float(last5["adx"]) - 14) * 0.12, 0.0, 2.0)
+        score += clamp((vol_ratio - 1.0) * 1.4, 0.0, 1.6)
+        score += clamp(rr * 1.25, 0.0, 2.6)
+        score += setup_bonus
+
+        # Likidite bonusu
+        if market_info["amount24"] >= 10_000_000:
+            score += 0.7
+        elif market_info["amount24"] >= 5_000_000:
+            score += 0.4
+
+        # Spread cezası
+        score -= clamp(market_info["spread_pct"] * 2.8, 0.0, 1.1)
+
+        # Funding cezası
         if funding is not None:
             if side == "LONG" and funding > 0:
-                strength -= clamp(funding * 1000, 0, 0.7)
+                score -= clamp(funding * 800, 0.0, 0.8)
             elif side == "SHORT" and funding < 0:
-                strength -= clamp(abs(funding) * 1000, 0, 0.7)
+                score -= clamp(abs(funding) * 800, 0.0, 0.8)
 
-        spread_penalty = clamp(market_info["spread_pct"] * 3.0, 0, 1.0)
-        strength -= spread_penalty
+        # Volume zayıfsa hafif ceza
+        if not vol_ok:
+            score -= 0.35
 
-        score = round(clamp(strength, 1.0, 10.0), 1)
+        score = round(clamp(score, 1.0, 10.0), 1)
+
+        # Düşük kaliteli sinyalleri ele
+        if score < 6.2:
+            return None
 
         return {
             "symbol": symbol,
@@ -610,6 +716,7 @@ def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[di
             "funding": None if funding is None else round(funding * 100, 4),
             "rsi": round(float(last5["rsi"]), 1),
             "adx": round(float(last5["adx"]), 1),
+            "vol_ratio": round(vol_ratio, 2),
             "btc_regime": btc_regime
         }
 
@@ -630,7 +737,7 @@ def format_signal_message(sig: dict) -> str:
     emoji = "🟢" if sig["side"] == "LONG" else "🔴"
 
     return (
-        f"🚨 <b>COINRADAR SIGNAL</b>\n\n"
+        f"🚨 <b>COINRADAR ELIT++ SIGNAL</b>\n\n"
         f"{emoji} <b>{side} | {symbol}</b>\n"
         f"<b>Entry:</b> {fmt_price(sig['entry'])}\n"
         f"<b>Stop:</b> {fmt_price(sig['sl'])}\n\n"
@@ -642,6 +749,7 @@ def format_signal_message(sig: dict) -> str:
         f"<b>Setup:</b> {setup}\n"
         f"<b>TF:</b> {tf}\n"
         f"<b>RSI:</b> {sig['rsi']} | <b>ADX:</b> {sig['adx']}\n"
+        f"<b>Vol x:</b> {sig['vol_ratio']}\n"
         f"<b>Spread:</b> {sig['spread_pct']}%\n"
         f"<b>Funding:</b> {funding_text}\n"
         f"<b>BTC Bias:</b> {html.escape(sig['btc_regime'])}"
@@ -650,25 +758,26 @@ def format_signal_message(sig: dict) -> str:
 
 def format_startup_message() -> str:
     return (
-        "✅ <b>COINRADAR PRO++ başladı</b>\n\n"
-        "Tarama aktif.\n"
+        "✅ <b>COINRADAR ELIT++ başladı</b>\n\n"
+        f"Taranan maksimum sözleşme: <b>{MAX_SYMBOLS_TO_SCAN}</b>\n"
+        f"Seçilen sinyal sayısı: <b>{TOP_N_SIGNALS}</b>\n"
         "MEXC futures market izleniyor.\n"
-        "Profesyonel format sinyal sistemi hazır."
+        "Kaliteli 3 sinyal modu aktif."
     )
 
 
 def format_heartbeat_message(symbol_count: int, btc_regime: str) -> str:
     return (
-        "ℹ️ <b>COINRADAR PRO++ aktif</b>\n\n"
+        "ℹ️ <b>COINRADAR ELIT++ aktif</b>\n\n"
         f"Taranan sözleşme: <b>{symbol_count}</b>\n"
         f"BTC Bias: <b>{html.escape(btc_regime)}</b>\n"
-        "Şu turda uygun sinyal bulunmadı."
+        "Bu turda filtreleri geçen sinyal bulunmadı."
     )
 
 
 def format_error_message(err: str) -> str:
-    txt = html.escape(err[:700])
-    return f"⚠️ <b>COINRADAR HATA</b>\n\n<code>{txt}</code>"
+    txt = html.escape(err[:800])
+    return f"⚠️ <b>COINRADAR ELIT++ HATA</b>\n\n<code>{txt}</code>"
 
 
 # =========================================================
@@ -685,7 +794,21 @@ def mark_sent(state: dict, symbol: str, side: str):
     state.setdefault("last_sent", {})[key] = now_ts()
 
 
+def dedupe_signals(signals: List[dict]) -> List[dict]:
+    seen = set()
+    out = []
+    for sig in signals:
+        key = sig["symbol"]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(sig)
+    return out
+
+
 def pick_top_signals(signals: List[dict], n: int) -> List[dict]:
+    # Önce en yüksek skor, sonra RR, sonra likidite
+    signals = dedupe_signals(signals)
     signals = sorted(
         signals,
         key=lambda x: (x["score"], x["rr"], x["amount24"]),
