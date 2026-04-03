@@ -294,15 +294,37 @@ def mexc_get(path: str, params=None):
 def get_contract_detail():
     data = mexc_get("/api/v1/contract/detail")
     if not data or not isinstance(data, dict):
+        logger.info("CONTRACT DETAIL FAIL | invalid response")
         return []
     if not data.get("success", False):
+        logger.info("CONTRACT DETAIL FAIL | success=false | data=%s", str(data)[:500])
         return []
     result = data.get("data", [])
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        logger.info("CONTRACT DETAIL FAIL | data not list")
+        return []
+    logger.info("CONTRACT DETAIL OK | total=%s", len(result))
+    return result
+
+
+def normalize_symbol(symbol: str) -> str:
+    s = str(symbol).upper().strip()
+    s = s.replace("-", "_").replace("/", "_").replace(" ", "")
+
+    if s.endswith("USDT") and not s.endswith("_USDT"):
+        s = s[:-4] + "_USDT"
+
+    while "__" in s:
+        s = s.replace("__", "_")
+
+    return s
 
 
 def symbol_allowed(symbol: str) -> bool:
-    symbol = str(symbol).upper()
+    symbol = normalize_symbol(symbol)
+
+    if not symbol:
+        return False
     if not symbol.endswith(f"_{QUOTE_FILTER}"):
         return False
     if symbol in EXCLUDED_SYMBOLS:
@@ -344,40 +366,71 @@ def symbol_liquidity_score(item: dict) -> float:
 def get_active_symbols():
     details = get_contract_detail()
     if not details:
+        logger.info("AKTIF SEMBOL BULUNAMADI | details bos")
         return []
 
     ranked = []
+    raw_seen = []
+
     for item in details:
-        symbol = str(item.get("symbol", "")).upper()
+        if not isinstance(item, dict):
+            continue
+
+        raw_symbol = (
+            item.get("symbol")
+            or item.get("displayName")
+            or item.get("contractCode")
+            or item.get("contract_code")
+            or ""
+        )
+        symbol = normalize_symbol(raw_symbol)
+
+        if raw_symbol and len(raw_seen) < 20:
+            raw_seen.append(f"{raw_symbol} -> {symbol}")
+
         api_allowed = item.get("apiAllowed", True)
-        if not (api_allowed and symbol_allowed(symbol)):
+        if str(api_allowed).lower() in ("false", "0", "none", "null"):
+            continue
+        if not symbol_allowed(symbol):
             continue
 
         liquidity_score = symbol_liquidity_score(item)
-        if liquidity_score <= 0:
-            continue
 
-        volume_candidates = [item.get("volume24"), item.get("vol24"), item.get("volume"), item.get("dealVolume")]
-        turnover_candidates = [item.get("turnover24"), item.get("amount24"), item.get("turnover"), item.get("quoteAmount")]
+        volume_candidates = [
+            item.get("volume24"), item.get("vol24"), item.get("volume"),
+            item.get("dealVolume"), item.get("bizVolume"), item.get("holdVol")
+        ]
+        turnover_candidates = [
+            item.get("turnover24"), item.get("amount24"), item.get("turnover"),
+            item.get("quoteAmount"), item.get("fairPrice"), item.get("indexPrice")
+        ]
         volume_24h = max(safe_float(v, 0.0) for v in volume_candidates)
         turnover_24h = max(safe_float(v, 0.0) for v in turnover_candidates)
 
+        if liquidity_score <= 0 and volume_24h <= 0 and turnover_24h <= 0:
+            liquidity_score = 1.0
+
         if volume_24h < MIN_SYMBOL_SCORE_24H_VOLUME and turnover_24h < MIN_SYMBOL_SCORE_TURNOVER_24H:
-            continue
+            if liquidity_score <= 1.0:
+                continue
 
-        ranked.append((symbol, liquidity_score))
+        ranked.append((symbol, liquidity_score, volume_24h, turnover_24h))
 
-    ranked.sort(key=lambda x: x[1], reverse=True)
+    ranked.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
 
     selected = []
     seen = set()
-    for symbol, _score in ranked:
+    for symbol, _score, _vol, _turnover in ranked:
         if symbol in seen:
             continue
         seen.add(symbol)
         selected.append(symbol)
         if len(selected) >= MAX_SYMBOLS_TO_SCAN:
             break
+
+    logger.info("RAW SYMBOL SAMPLE = %s", raw_seen)
+    logger.info("FILTER SONRASI AKTIF SEMBOL SAYISI = %s", len(selected))
+    logger.info("ILK 20 SEMBOL = %s", selected[:20])
 
     return selected
 
