@@ -98,6 +98,11 @@ EXCLUDED_KEYWORDS = (
     "_FDUSD",
     "_TUSD",
 )
+EXCLUDED_BASES = (
+    "XAU", "XAUT", "GOLD", "SILVER", "XAG",
+    "OIL", "UKOIL", "USOIL", "BRENT", "WTI",
+    "GAS", "NATGAS", "POWER", "COPPER", "PLATINUM", "PALLADIUM",
+)
 MAX_SYMBOLS_TO_SCAN = 120
 TOP_N_SIGNALS = 3
 TOP_N_SIGNALS_BTC_BEAR = 1
@@ -333,6 +338,23 @@ def symbol_allowed(symbol: str) -> bool:
         return False
     if any(x in symbol for x in ("_BULL", "_BEAR", "_UP", "_DOWN")):
         return False
+
+    base = symbol.split("_")[0].strip()
+    if not base:
+        return False
+
+    if any(base == bad or bad in base for bad in EXCLUDED_BASES):
+        return False
+
+    if len(base) > 15:
+        return False
+
+    cleaned = base
+    for junk in ("1000", "10000", "2", "3", "5"):
+        cleaned = cleaned.replace(junk, "")
+    if cleaned and not cleaned.isalnum():
+        return False
+
     return True
 
 
@@ -370,6 +392,7 @@ def get_active_symbols():
         return []
 
     ranked = []
+    fallback_allowed = []
     raw_seen = []
 
     for item in details:
@@ -379,54 +402,72 @@ def get_active_symbols():
         raw_symbol = (
             item.get("symbol")
             or item.get("displayName")
+            or item.get("display_name")
             or item.get("contractCode")
             or item.get("contract_code")
             or ""
         )
         symbol = normalize_symbol(raw_symbol)
 
-        if raw_symbol and len(raw_seen) < 20:
+        if raw_symbol and len(raw_seen) < 30:
             raw_seen.append(f"{raw_symbol} -> {symbol}")
+
+        if not symbol_allowed(symbol):
+            continue
+
+        fallback_allowed.append(symbol)
 
         api_allowed = item.get("apiAllowed", True)
         if str(api_allowed).lower() in ("false", "0", "none", "null"):
-            continue
-        if not symbol_allowed(symbol):
             continue
 
         liquidity_score = symbol_liquidity_score(item)
 
         volume_candidates = [
             item.get("volume24"), item.get("vol24"), item.get("volume"),
-            item.get("dealVolume"), item.get("bizVolume"), item.get("holdVol")
+            item.get("dealVolume"), item.get("bizVolume"), item.get("holdVol"), item.get("amount24")
         ]
         turnover_candidates = [
             item.get("turnover24"), item.get("amount24"), item.get("turnover"),
-            item.get("quoteAmount"), item.get("fairPrice"), item.get("indexPrice")
+            item.get("quoteAmount"), item.get("fairPrice"), item.get("indexPrice"), item.get("quoteVolume")
         ]
+        trades_candidates = [
+            item.get("tradeCount"), item.get("tradeCount24"), item.get("dealCount"), item.get("deals")
+        ]
+
         volume_24h = max(safe_float(v, 0.0) for v in volume_candidates)
         turnover_24h = max(safe_float(v, 0.0) for v in turnover_candidates)
+        trades_24h = max(safe_float(v, 0.0) for v in trades_candidates)
 
-        if liquidity_score <= 0 and volume_24h <= 0 and turnover_24h <= 0:
-            liquidity_score = 1.0
+        if liquidity_score <= 0 and volume_24h <= 0 and turnover_24h <= 0 and trades_24h <= 0:
+            continue
 
-        if volume_24h < MIN_SYMBOL_SCORE_24H_VOLUME and turnover_24h < MIN_SYMBOL_SCORE_TURNOVER_24H:
-            if liquidity_score <= 1.0:
-                continue
+        if (
+            volume_24h < MIN_SYMBOL_SCORE_24H_VOLUME
+            and turnover_24h < MIN_SYMBOL_SCORE_TURNOVER_24H
+            and trades_24h <= 0
+            and liquidity_score < 1000
+        ):
+            continue
 
-        ranked.append((symbol, liquidity_score, volume_24h, turnover_24h))
+        ranked.append((symbol, liquidity_score, volume_24h, turnover_24h, trades_24h))
 
-    ranked.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    ranked.sort(key=lambda x: (x[1], x[2], x[3], x[4]), reverse=True)
 
     selected = []
     seen = set()
-    for symbol, _score, _vol, _turnover in ranked:
+    for symbol, _score, _vol, _turnover, _trades in ranked:
         if symbol in seen:
             continue
         seen.add(symbol)
         selected.append(symbol)
         if len(selected) >= MAX_SYMBOLS_TO_SCAN:
             break
+
+    if not selected:
+        fallback_selected = sorted(set(fallback_allowed))[:MAX_SYMBOLS_TO_SCAN]
+        logger.info("LIKIDITE FILTER COK SERT | FALLBACK DEVREDE | count=%s", len(fallback_selected))
+        selected = fallback_selected
 
     logger.info("RAW SYMBOL SAMPLE = %s", raw_seen)
     logger.info("FILTER SONRASI AKTIF SEMBOL SAYISI = %s", len(selected))
