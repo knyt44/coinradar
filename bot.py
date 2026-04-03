@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import math
 import hashlib
 import logging
 from datetime import datetime
@@ -21,11 +20,14 @@ from urllib3.util.retry import Retry
 # =========================================================
 TZ = ZoneInfo("Europe/Istanbul")
 
+
 def now_dt():
     return datetime.now(TZ)
 
+
 def now_ts() -> int:
     return int(now_dt().timestamp())
+
 
 def safe_float(v, default=0.0):
     try:
@@ -33,10 +35,12 @@ def safe_float(v, default=0.0):
     except Exception:
         return default
 
+
 def pct_change(a: float, b: float) -> float:
     if a in (None, 0) or b is None:
         return 0.0
     return ((b / a) - 1.0) * 100.0
+
 
 def fmt_price(v: float) -> str:
     v = float(v)
@@ -50,6 +54,7 @@ def fmt_price(v: float) -> str:
         return f"{v:,.4f}"
     return f"{v:,.6f}"
 
+
 # =========================================================
 # ENV
 # =========================================================
@@ -60,7 +65,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # HTTP
 # =========================================================
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "mexc-pro-signal-bot/3.0"})
+HTTP.headers.update({"User-Agent": "mexc-pro-signal-bot/4.0"})
 
 retry = Retry(
     total=3,
@@ -81,16 +86,14 @@ LOG_FILE = "mexc_pro_signal_bot.log"
 STATE_FILE = "mexc_pro_signal_bot_state.json"
 MEXC_BASE_URL = "https://api.mexc.com"
 
-CHECK_EVERY_SECONDS = 300          # 5 dk
-TOP_N_SIGNALS = 3                  # sadece en iyi 3
-MAX_SYMBOLS_TO_SCAN = 120          # aktif sembollerden en fazla bu kadar
-NO_SIGNAL_MESSAGE = False          # spam istemiyorsan False kalsın
+CHECK_EVERY_SECONDS = 300
+TOP_N_SIGNALS = 3
+MAX_SYMBOLS_TO_SCAN = 90
+NO_SIGNAL_MESSAGE = False
 
-# BTC/ETH/PAXG/XRP ana taramadan hariç, ama yön analizi ayrı gönderilecek
 SPECIAL_SYMBOLS = ["BTC_USDT", "ETH_USDT", "PAXG_USDT", "XRP_USDT"]
 EXCLUDED_SYMBOLS = set(SPECIAL_SYMBOLS)
 
-# Kripto dışı / istenmeyenler
 EXCLUDED_KEYWORDS = (
     "_USDC", "_FDUSD", "_TUSD",
     "_BULL", "_BEAR", "_UP", "_DOWN",
@@ -101,12 +104,10 @@ EXCLUDED_BASES = (
     "GAS", "NATGAS", "POWER", "COPPER",
 )
 
-# Zaman dilimleri
-TF_TREND = "Hour4"   # 4H trend
-TF_SETUP = "Min60"   # 1H setup
-TF_ENTRY = "Min15"   # 15M entry
+TF_TREND = "Hour4"
+TF_SETUP = "Min60"
+TF_ENTRY = "Min15"
 
-# İndikatörler
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
@@ -114,53 +115,48 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-# Filtreler - sert ama aşırı boğmayacak şekilde
-MIN_4H_ADX = 18
-MIN_1H_ADX = 16
+MIN_4H_ADX = 16
+MIN_1H_ADX = 14
 
-MIN_4H_RSI_LONG = 50
-MAX_4H_RSI_LONG = 74
-MIN_4H_RSI_SHORT = 26
-MAX_4H_RSI_SHORT = 50
+MIN_4H_RSI_LONG = 48
+MAX_4H_RSI_LONG = 76
+MIN_4H_RSI_SHORT = 24
+MAX_4H_RSI_SHORT = 52
 
-MIN_1H_RSI_LONG = 47
-MAX_1H_RSI_LONG = 68
-MIN_1H_RSI_SHORT = 32
-MAX_1H_RSI_SHORT = 54
+MIN_1H_RSI_LONG = 42
+MAX_1H_RSI_LONG = 72
+MIN_1H_RSI_SHORT = 28
+MAX_1H_RSI_SHORT = 58
 
-MIN_15M_RSI_LONG = 45
-MAX_15M_RSI_LONG = 66
-MIN_15M_RSI_SHORT = 34
-MAX_15M_RSI_SHORT = 57
+MIN_15M_RSI_LONG = 43
+MAX_15M_RSI_LONG = 68
+MIN_15M_RSI_SHORT = 32
+MAX_15M_RSI_SHORT = 59
 
-VOLUME_SURGE_MULT = 1.20
+VOLUME_SURGE_MULT = 1.12
 BREAKOUT_LOOKBACK = 20
 
-MAX_LAST_CANDLE_RANGE_ATR = 2.40
-MAX_DISTANCE_FROM_EMA20_ATR = 2.20
-MAX_BREAKOUT_WICK_BODY_RATIO = 2.20
-MIN_BREAKOUT_BODY_ATR = 0.18
+MAX_LAST_CANDLE_RANGE_ATR = 2.70
+MAX_DISTANCE_FROM_EMA20_ATR = 2.60
+MAX_BREAKOUT_WICK_BODY_RATIO = 2.80
+MIN_BREAKOUT_BODY_ATR = 0.12
 
-MIN_ATR_PCT = 0.0030
-MAX_ATR_PCT = 0.0300
+MIN_ATR_PCT = 0.0020
+MAX_ATR_PCT = 0.0450
 
-# Risk
 ATR_SL_MULTIPLIER = 1.20
 ATR_TP1_MULTIPLIER = 1.40
-ATR_TP2_MULTIPLIER = 2.25
-ATR_TP3_MULTIPLIER = 3.10
-MIN_RR_TO_TP2 = 1.60
+ATR_TP2_MULTIPLIER = 2.20
+ATR_TP3_MULTIPLIER = 3.00
+MIN_RR_TO_TP2 = 1.45
 
-# Skor
-FULL_MIN_SCORE = 10.0
-EARLY_MIN_SCORE = 8.0
+FULL_MIN_SCORE = 7.5
+EARLY_MIN_SCORE = 6.5
 
-# BTC rejim filtresi
 USE_BTC_FILTER = True
 BTC_15M_TREND_THRESHOLD = 0.10
-BLOCK_COUNTERTREND_SIGNALS = True
+BLOCK_COUNTERTREND_SIGNALS = False
 
-# Piyasayı zorlamama
 MAX_NEW_SIGNALS_PER_RUN_IF_BTC_BAD = 1
 COOLDOWN_MINUTES_SAME_SYMBOL = 180
 
@@ -189,6 +185,7 @@ def default_state():
         "last_sent_by_symbol": {},
     }
 
+
 def load_state():
     if not os.path.exists(STATE_FILE):
         return default_state()
@@ -204,11 +201,13 @@ def load_state():
         logger.exception("State load error: %s", e)
         return default_state()
 
+
 def save_state(state):
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_FILE)
+
 
 def minutes_since(ts):
     if not ts:
@@ -251,6 +250,7 @@ def normalize_symbol(symbol: str) -> str:
         s = s.replace("__", "_")
     return s
 
+
 def symbol_allowed(symbol: str) -> bool:
     symbol = normalize_symbol(symbol)
     if not symbol or not symbol.endswith("_USDT"):
@@ -289,12 +289,14 @@ def mexc_get(path: str, params=None):
         logger.exception("MEXC GET exception: %s", e)
         return None
 
+
 def get_contract_detail():
     data = mexc_get("/api/v1/contract/detail")
     if not data or not isinstance(data, dict) or not data.get("success", False):
         return []
     result = data.get("data", [])
     return result if isinstance(result, list) else []
+
 
 def get_active_symbols():
     details = get_contract_detail()
@@ -324,8 +326,10 @@ def get_active_symbols():
             symbols.append(symbol)
 
     symbols = sorted(list(set(symbols)))
-    logger.info("Aktif sembol sayisi: %s", len(symbols))
-    return symbols[:MAX_SYMBOLS_TO_SCAN]
+    symbols = symbols[:MAX_SYMBOLS_TO_SCAN]
+    logger.info("Aktif sembol sayisi (filtreli): %s", len(symbols))
+    return symbols
+
 
 def get_klines(symbol: str, interval: str, bars: int = 320):
     interval_sec_map = {
@@ -392,6 +396,7 @@ class Ind:
         self.atr = float(atr)
         self.adx = float(adx)
 
+
 def compute_ind(df: pd.DataFrame):
     if df is None or df.empty:
         return None
@@ -418,14 +423,16 @@ def compute_ind(df: pd.DataFrame):
     last = df.iloc[-1]
     return Ind(last["close"], rsi.iloc[-1], ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1], atr.iloc[-1], adx.iloc[-1])
 
+
 def trend_up(ind: Ind) -> bool:
     return ind.ema20 > ind.ema50 > ind.ema200 and ind.close > ind.ema20
+
 
 def trend_down(ind: Ind) -> bool:
     return ind.ema20 < ind.ema50 < ind.ema200 and ind.close < ind.ema20
 
 # =========================================================
-# CANDLE / FILTER HELPERS
+# FILTER HELPERS
 # =========================================================
 def candle_parts(row):
     o = float(row["open"])
@@ -438,11 +445,13 @@ def candle_parts(row):
     lower_wick = min(o, c) - l
     return o, h, l, c, body, rng, upper_wick, lower_wick
 
+
 def breakout_long(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     if df is None or len(df) < lookback + 2:
         return False
     prev_high = float(df["high"].iloc[-(lookback + 1):-1].max())
     return float(df["close"].iloc[-1]) > prev_high
+
 
 def breakout_short(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     if df is None or len(df) < lookback + 2:
@@ -450,11 +459,13 @@ def breakout_short(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
     prev_low = float(df["low"].iloc[-(lookback + 1):-1].min())
     return float(df["close"].iloc[-1]) < prev_low
 
+
 def volume_surge(df: pd.DataFrame, mult: float = VOLUME_SURGE_MULT):
     if df is None or len(df) < 25:
         return False
     vma = float(df["volume"].rolling(20).mean().iloc[-1])
     return vma > 0 and float(df["volume"].iloc[-1]) > vma * mult
+
 
 def last_candle_range_atr(df: pd.DataFrame, atr: float):
     if df is None or len(df) < 1 or atr <= 0:
@@ -462,10 +473,12 @@ def last_candle_range_atr(df: pd.DataFrame, atr: float):
     last = df.iloc[-1]
     return float(last["high"] - last["low"]) / atr
 
+
 def distance_from_ema20_atr(ind: Ind):
     if ind.atr <= 0:
         return 999.0
     return abs(ind.close - ind.ema20) / ind.atr
+
 
 def breakout_quality_long(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
@@ -476,6 +489,7 @@ def breakout_quality_long(df: pd.DataFrame, atr: float):
     body_atr = body / atr
     prev_high = float(df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
     return c > prev_high and wick_body_ratio <= MAX_BREAKOUT_WICK_BODY_RATIO and body_atr >= MIN_BREAKOUT_BODY_ATR
+
 
 def breakout_quality_short(df: pd.DataFrame, atr: float):
     if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
@@ -528,6 +542,7 @@ def calc_levels(direction: str, entry: float, atr: float):
         tp3 = entry - (ATR_TP3_MULTIPLIER * atr)
     return sl, tp1, tp2, tp3
 
+
 def rr(direction: str, entry: float, sl: float, target: float):
     if direction == "LONG":
         risk = entry - sl
@@ -552,16 +567,15 @@ def format_single_signal(sig: dict) -> str:
         f"TP3: {fmt_price(sig['tp3'])}"
     )
 
+
 def format_batch_message(special_signals, main_signals) -> str:
     parts = []
-
     for sig in special_signals:
         parts.append(format_single_signal(sig))
-
     for sig in main_signals:
         parts.append(format_single_signal(sig))
-
     return "\n\n".join(parts).strip()
+
 
 def batch_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -569,7 +583,7 @@ def batch_hash(text: str) -> str:
 # =========================================================
 # STRATEGY
 # =========================================================
-def evaluate_symbol(symbol: str, btc_bias: str):
+def evaluate_symbol(symbol: str, btc_bias: str, relaxed: bool = False):
     df_4h = get_klines(symbol, TF_TREND, 320)
     df_1h = get_klines(symbol, TF_SETUP, 420)
     df_15m = get_klines(symbol, TF_ENTRY, 520)
@@ -605,18 +619,16 @@ def evaluate_symbol(symbol: str, btc_bias: str):
     long_score = 0.0
     short_score = 0.0
 
-    # 4H trend
     if trend_up(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_LONG <= ind_4h.rsi <= MAX_4H_RSI_LONG:
         long_score += 4.0
-    elif ind_4h.close > ind_4h.ema20 and ind_4h.rsi >= 48:
+    elif ind_4h.close > ind_4h.ema20 and ind_4h.rsi >= 46:
         long_score += 1.5
 
     if trend_down(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_SHORT <= ind_4h.rsi <= MAX_4H_RSI_SHORT:
         short_score += 4.0
-    elif ind_4h.close < ind_4h.ema20 and ind_4h.rsi <= 52:
+    elif ind_4h.close < ind_4h.ema20 and ind_4h.rsi <= 54:
         short_score += 1.5
 
-    # 1H setup
     if (
         ind_1h.close > ind_1h.ema50 and
         ind_1h.ema20 > ind_1h.ema50 > ind_1h.ema200 and
@@ -633,7 +645,6 @@ def evaluate_symbol(symbol: str, btc_bias: str):
     ):
         short_score += 3.0
 
-    # 15M entry
     entry_15m_long_ok = (
         ind_15m.close > ind_15m.ema20 > ind_15m.ema50 > ind_15m.ema200 and
         MIN_15M_RSI_LONG <= ind_15m.rsi <= MAX_15M_RSI_LONG
@@ -648,26 +659,23 @@ def evaluate_symbol(symbol: str, btc_bias: str):
     if entry_15m_short_ok:
         short_score += 2.0
 
-    # breakout + volume
     if trigger_breakout_long and breakout_long_ok:
-        long_score += 2.0
+        long_score += 1.5
     if trigger_breakout_short and breakout_short_ok:
-        short_score += 2.0
+        short_score += 1.5
 
     if trigger_volume and entry_15m_long_ok:
-        long_score += 1.0
+        long_score += 0.75
     if trigger_volume and entry_15m_short_ok:
-        short_score += 1.0
+        short_score += 0.75
 
-    # BTC bias
     if btc_bias == "LONG":
-        long_score += 1.0
-        short_score -= 1.0
+        long_score += 0.75
+        short_score -= 0.50
     elif btc_bias == "SHORT":
-        short_score += 1.0
-        long_score -= 1.0
+        short_score += 0.75
+        long_score -= 0.50
 
-    # direction choose
     direction = None
     score = 0.0
 
@@ -680,22 +688,22 @@ def evaluate_symbol(symbol: str, btc_bias: str):
     else:
         return None
 
-    # Countertrend engelle
     if BLOCK_COUNTERTREND_SIGNALS:
         if btc_bias == "SHORT" and direction == "LONG":
             return None
         if btc_bias == "LONG" and direction == "SHORT":
             return None
 
-    # Full setup zorunluluğu
-    if score < FULL_MIN_SCORE:
+    min_score_to_use = FULL_MIN_SCORE if not relaxed else (FULL_MIN_SCORE - 1.0)
+    if score < min_score_to_use:
         return None
 
     entry = ind_15m.close
     sl, tp1, tp2, tp3 = calc_levels(direction, entry, ind_15m.atr)
     rr_tp2 = rr(direction, entry, sl, tp2)
 
-    if rr_tp2 is None or rr_tp2 < MIN_RR_TO_TP2:
+    min_rr = MIN_RR_TO_TP2 if not relaxed else 1.30
+    if rr_tp2 is None or rr_tp2 < min_rr:
         return None
 
     return {
@@ -709,13 +717,38 @@ def evaluate_symbol(symbol: str, btc_bias: str):
         "score": round(score, 2),
     }
 
-# =========================================================
-# SPECIAL COINS
-# =========================================================
+
 def evaluate_special_symbol(symbol: str, btc_bias: str):
-    # aynı mantık ama tarama hariç coinler için ayrı mesaj üret
-    sig = evaluate_symbol(symbol, btc_bias)
-    return sig
+    sig = evaluate_symbol(symbol, btc_bias, relaxed=True)
+    if sig:
+        return sig
+
+    df_15m = get_klines(symbol, TF_ENTRY, 220)
+    if df_15m is None:
+        return None
+
+    ind = compute_ind(df_15m)
+    if not ind:
+        return None
+
+    if ind.close >= ind.ema20:
+        direction = "LONG"
+    else:
+        direction = "SHORT"
+
+    entry = ind.close
+    sl, tp1, tp2, tp3 = calc_levels(direction, entry, ind.atr)
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "score": 6.0,
+    }
 
 # =========================================================
 # MAIN
@@ -725,7 +758,6 @@ def run_once(state):
     btc_bias = get_btc_filter_bias()
     logger.info("BTC bias: %s", btc_bias)
 
-    # 1) Özel coinler
     special_signals = []
     for sp in SPECIAL_SYMBOLS:
         try:
@@ -735,18 +767,16 @@ def run_once(state):
         except Exception as e:
             logger.exception("Special symbol error %s: %s", sp, e)
 
-    # 2) Ana tarama
     symbols = get_active_symbols()
     candidates = []
 
     for symbol in symbols:
         try:
-            # cooldown
             last_sent_ts = state["last_sent_by_symbol"].get(symbol, 0)
             if minutes_since(last_sent_ts) < COOLDOWN_MINUTES_SAME_SYMBOL:
                 continue
 
-            sig = evaluate_symbol(symbol, btc_bias)
+            sig = evaluate_symbol(symbol, btc_bias, relaxed=False)
             if sig:
                 candidates.append(sig)
 
@@ -782,6 +812,7 @@ def run_once(state):
         save_state(state)
         logger.info("Sinyal batch gonderildi | special=%s | main=%s", len(special_signals), len(main_signals))
 
+
 def main():
     logger.info("Bot basladi")
     state = load_state()
@@ -792,6 +823,7 @@ def main():
         except Exception as e:
             logger.exception("Main loop error: %s", e)
         time.sleep(CHECK_EVERY_SECONDS)
+
 
 if __name__ == "__main__":
     main()
