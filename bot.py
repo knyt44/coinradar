@@ -1534,20 +1534,9 @@ def run_once():
 
 def send_startup_message(state):
     active_symbols = get_active_symbols()
-    state["active_symbols"] = active_symbols
+    state['active_symbols'] = active_symbols
     save_state(state)
-
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        tg_send(
-            f"🤖 MEXC SUPER SIGNAL BOT PRO başladı.\n"
-            f"Zaman: {now_str()}\n"
-            f"Tarama: aktif USDT kontratları\n"
-            f"Hariç: {', '.join(sorted(EXCLUDED_SYMBOLS))}\n"
-            f"Aktif sembol sayısı: {len(active_symbols)}\n"
-            f"Top sinyal: {TOP_N_SIGNALS}\n"
-            f"Trade manager: TP1->BE / TP2->Trail / TP3->Close"
-        )
-
+    logger.info('Startup | aktif sembol sayisi=%s | top sinyal=%s', len(active_symbols), TOP_N_SIGNALS)
 
 def main():
     logger.info("Bot başlıyor...")
@@ -1561,7 +1550,7 @@ def main():
             break
         except Exception as e:
             logger.exception("Ana döngü hatası: %s", e)
-            tg_send(f"❌ Bot ana döngü hatası: {e}")
+            logger.error('Telegram hata bildirimi kapali | %s', e)
 
         time.sleep(CHECK_EVERY_SECONDS)
 
