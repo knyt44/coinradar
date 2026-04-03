@@ -1,112 +1,89 @@
-import os
+# -*- coding: utf-8 -*-
+"""
+COINRADAR PRO++ - MEXC FUTURES SIGNAL BOT
+Tek dosya / tek parça / Telegram profesyonel formatlı sinyal botu
+
+Kurulum:
+    pip install requests pandas
+
+Çalıştırma:
+    python coinradar_propp.py
+
+Not:
+- Bu bot sinyal üretir, otomatik emir açmaz.
+- MEXC futures market verisini tarar.
+- Telegram'a profesyonel formatta mesaj gönderir.
+"""
+
 import time
+import math
+import html
 import json
-import hashlib
-import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import traceback
+from typing import Dict, List, Optional, Tuple, Set
 
 import requests
 import pandas as pd
 
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import AverageTrueRange
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # =========================================================
-# GLOBAL
+# TELEGRAM
 # =========================================================
-TZ = ZoneInfo("Europe/Istanbul")
-
-
-def now_dt():
-    return datetime.now(TZ)
-
-
-def now_ts() -> int:
-    return int(now_dt().timestamp())
-
-
-def safe_float(v, default=0.0):
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def pct_change(a: float, b: float) -> float:
-    if a in (None, 0) or b is None:
-        return 0.0
-    return ((b / a) - 1.0) * 100.0
-
-
-def fmt_price(v: float) -> str:
-    v = float(v)
-    if v >= 10000:
-        return f"{v:,.2f}"
-    if v >= 1000:
-        return f"{v:,.2f}"
-    if v >= 100:
-        return f"{v:,.3f}"
-    if v >= 1:
-        return f"{v:,.4f}"
-    return f"{v:,.6f}"
-
+TELEGRAM_BOT_TOKEN = "BURAYA_TOKEN"
+TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID"
 
 # =========================================================
-# ENV
+# GENEL AYARLAR
 # =========================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+MEXC_BASE = "https://contract.mexc.com"
+CHECK_EVERY_SECONDS = 60
+HTTP_TIMEOUT = 15
+
+# Kaç coin taransın
+MAX_SYMBOLS_TO_SCAN = 120
+
+# Sadece en iyi kaç sinyal gönderilsin
+TOP_N_SIGNALS = 2
+
+# Aynı coin için tekrar sinyal cooldown
+SIGNAL_COOLDOWN_MINUTES = 45
+
+# Durum mesajı
+SEND_STARTUP_MESSAGE = True
+SEND_HEARTBEAT_IF_NO_SIGNAL = True
+HEARTBEAT_EVERY_MINUTES = 30
+
+# State
+STATE_FILE = "coinradar_propp_state.json"
 
 # =========================================================
-# HTTP
+# MARKET / FİLTRE
 # =========================================================
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "mexc-pro-signal-bot/4.0"})
+QUOTE_CURRENCY = "USDT"
 
-retry = Retry(
-    total=3,
-    connect=3,
-    read=3,
-    backoff_factor=1.0,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["GET", "POST"],
-)
-adapter = HTTPAdapter(max_retries=retry)
-HTTP.mount("https://", adapter)
-HTTP.mount("http://", adapter)
+# Çöp coin / likidite / spread / funding filtreleri
+MIN_AMOUNT24_USDT = 8_000_000       # 24h turnover
+MIN_HOLDVOL = 100_000               # open interest contracts
+MAX_SPREAD_PCT = 0.20               # yüzde
+MAX_ABS_FUNDING = 0.0012            # 0.12%
+MAX_24H_PUMP_PCT = 10.0             # aşırı pump kovalanmasın
+MIN_PRICE = 0.00001
+
+# Kara liste
+BLACKLIST_KEYWORDS = {
+    "1000", "10000", "100000", "MOG", "PEPE", "FLOKI",
+    "LUNA", "USTC", "BULL", "BEAR"
+}
+
+# Sadece perpetual ve USDT
+REQUIRE_USDT_PERP = True
 
 # =========================================================
-# CONFIG
+# İNDİKATÖRLER
 # =========================================================
-LOG_FILE = "mexc_pro_signal_bot.log"
-STATE_FILE = "mexc_pro_signal_bot_state.json"
-MEXC_BASE_URL = "https://api.mexc.com"
-
-CHECK_EVERY_SECONDS = 300
-TOP_N_SIGNALS = 3
-MAX_SYMBOLS_TO_SCAN = 90
-NO_SIGNAL_MESSAGE = False
-
-SPECIAL_SYMBOLS = ["BTC_USDT", "ETH_USDT", "PAXG_USDT", "XRP_USDT"]
-EXCLUDED_SYMBOLS = set(SPECIAL_SYMBOLS)
-
-EXCLUDED_KEYWORDS = (
-    "_USDC", "_FDUSD", "_TUSD",
-    "_BULL", "_BEAR", "_UP", "_DOWN",
-)
-EXCLUDED_BASES = (
-    "XAU", "XAUT", "GOLD", "SILVER", "XAG",
-    "OIL", "UKOIL", "USOIL", "BRENT", "WTI",
-    "GAS", "NATGAS", "POWER", "COPPER",
-)
-
-TF_TREND = "Hour4"
-TF_SETUP = "Min60"
-TF_ENTRY = "Min15"
+TF_SIGNAL = "Min5"
+TF_TREND = "Min15"
+KLINE_LIMIT = 220
 
 EMA_FAST = 20
 EMA_MID = 50
@@ -114,716 +91,662 @@ EMA_SLOW = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 ADX_PERIOD = 14
+VOL_MA_PERIOD = 20
 
-MIN_4H_ADX = 16
-MIN_1H_ADX = 14
+MIN_RSI_LONG = 53
+MAX_RSI_SHORT = 47
+MIN_ADX = 18
+MIN_RR_TO_TP2 = 1.60
 
-MIN_4H_RSI_LONG = 48
-MAX_4H_RSI_LONG = 76
-MIN_4H_RSI_SHORT = 24
-MAX_4H_RSI_SHORT = 52
+# BTC rejim filtresi
+USE_BTC_REGIME_FILTER = True
+BTC_SYMBOL = "BTC_USDT"
 
-MIN_1H_RSI_LONG = 42
-MAX_1H_RSI_LONG = 72
-MIN_1H_RSI_SHORT = 28
-MAX_1H_RSI_SHORT = 58
+# Mesafe / kalite filtreleri
+MAX_DISTANCE_FROM_EMA20_ATR = 1.8
+MAX_LAST_CANDLE_RANGE_ATR = 2.2
+MIN_BREAKOUT_BODY_ATR = 0.15
 
-MIN_15M_RSI_LONG = 43
-MAX_15M_RSI_LONG = 68
-MIN_15M_RSI_SHORT = 32
-MAX_15M_RSI_SHORT = 59
-
-VOLUME_SURGE_MULT = 1.12
-BREAKOUT_LOOKBACK = 20
-
-MAX_LAST_CANDLE_RANGE_ATR = 2.70
-MAX_DISTANCE_FROM_EMA20_ATR = 2.60
-MAX_BREAKOUT_WICK_BODY_RATIO = 2.80
-MIN_BREAKOUT_BODY_ATR = 0.12
-
-MIN_ATR_PCT = 0.0020
-MAX_ATR_PCT = 0.0450
-
-ATR_SL_MULTIPLIER = 1.20
-ATR_TP1_MULTIPLIER = 1.40
-ATR_TP2_MULTIPLIER = 2.20
-ATR_TP3_MULTIPLIER = 3.00
-MIN_RR_TO_TP2 = 1.45
-
-FULL_MIN_SCORE = 7.5
-EARLY_MIN_SCORE = 6.5
-
-USE_BTC_FILTER = True
-BTC_15M_TREND_THRESHOLD = 0.10
-BLOCK_COUNTERTREND_SIGNALS = False
-
-MAX_NEW_SIGNALS_PER_RUN_IF_BTC_BAD = 1
-COOLDOWN_MINUTES_SAME_SYMBOL = 180
+# SL / TP ATR katları
+SL_ATR_MULT = 1.15
+TP1_ATR_MULT = 1.20
+TP2_ATR_MULT = 2.00
+TP3_ATR_MULT = 3.00
 
 # =========================================================
-# LOGGING
+# REQUEST SESSION
 # =========================================================
-logger = logging.getLogger("mexc_pro_signal_bot")
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "CoinRadar-ProPP/1.0"
+})
 
-if not logger.handlers:
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    logger.addHandler(sh)
 
 # =========================================================
-# STATE
+# YARDIMCI
 # =========================================================
-def default_state():
-    return {
-        "last_batch_hash": "",
-        "last_sent_by_symbol": {},
-    }
+def now_ts() -> int:
+    return int(time.time())
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return default_state()
+def safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def pct(a: float, b: float) -> float:
+    if b == 0:
+        return 0.0
+    return ((a - b) / b) * 100.0
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def fmt_price(x: float) -> str:
+    if x >= 1000:
+        return f"{x:.2f}"
+    if x >= 100:
+        return f"{x:.3f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    if x >= 0.01:
+        return f"{x:.5f}"
+    return f"{x:.8f}".rstrip("0").rstrip(".")
+
+
+def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return default_state()
-            data.setdefault("last_batch_hash", "")
-            data.setdefault("last_sent_by_symbol", {})
-            return data
-    except Exception as e:
-        logger.exception("State load error: %s", e)
-        return default_state()
+            return json.load(f)
+    except Exception:
+        return {
+            "last_sent": {},      # symbol_side -> ts
+            "last_heartbeat": 0
+        }
 
 
-def save_state(state):
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, STATE_FILE)
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
-
-def minutes_since(ts):
-    if not ts:
-        return 999999
-    return (now_ts() - int(ts)) / 60.0
 
 # =========================================================
 # TELEGRAM
 # =========================================================
-def tg_send(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram env eksik")
-        return False
-
+def telegram_send_html(message: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
     try:
-        r = HTTP.post(url, json=payload, timeout=20)
-        if r.status_code != 200:
-            logger.error("Telegram error: %s", r.text[:500])
-            return False
-        return True
+        r = session.post(url, data=payload, timeout=HTTP_TIMEOUT)
+        if r.ok:
+            return True
+        print("Telegram hata:", r.status_code, r.text[:300])
+        return False
     except Exception as e:
-        logger.exception("Telegram exception: %s", e)
+        print("Telegram exception:", e)
         return False
 
-# =========================================================
-# SYMBOL HELPERS
-# =========================================================
-def normalize_symbol(symbol: str) -> str:
-    s = str(symbol).upper().strip()
-    s = s.replace("-", "_").replace("/", "_").replace(" ", "")
-    if s.endswith("USDT") and not s.endswith("_USDT"):
-        s = s[:-4] + "_USDT"
-    while "__" in s:
-        s = s.replace("__", "_")
-    return s
-
-
-def symbol_allowed(symbol: str) -> bool:
-    symbol = normalize_symbol(symbol)
-    if not symbol or not symbol.endswith("_USDT"):
-        return False
-
-    if symbol in EXCLUDED_SYMBOLS:
-        return False
-
-    if any(k in symbol for k in EXCLUDED_KEYWORDS):
-        return False
-
-    base = symbol.split("_")[0].strip()
-    if not base:
-        return False
-
-    if any(base == bad or bad in base for bad in EXCLUDED_BASES):
-        return False
-
-    if len(base) > 15:
-        return False
-
-    return True
 
 # =========================================================
 # MEXC API
 # =========================================================
-def mexc_get(path: str, params=None):
-    url = f"{MEXC_BASE_URL}{path}"
+def mexc_get(path: str, params: Optional[dict] = None) -> dict:
+    url = f"{MEXC_BASE}{path}"
+    r = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise ValueError("Beklenmeyen API cevabı")
+    if data.get("success") is False:
+        raise ValueError(f"MEXC API error: {data}")
+    return data
+
+
+def get_contract_detail() -> List[dict]:
+    data = mexc_get("/api/v1/contract/detail")
+    return data.get("data", []) or []
+
+
+def get_tickers() -> List[dict]:
+    data = mexc_get("/api/v1/contract/ticker")
+    return data.get("data", []) or []
+
+
+def get_funding_rate(symbol: str) -> Optional[float]:
     try:
-        r = HTTP.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            logger.error("MEXC HTTP ERROR | %s | %s | %s", path, r.status_code, r.text[:300])
-            return None
-        return r.json()
-    except Exception as e:
-        logger.exception("MEXC GET exception: %s", e)
+        data = mexc_get(f"/api/v1/contract/funding_rate/{symbol}")
+        item = data.get("data", {}) or {}
+        return safe_float(item.get("fundingRate"), None)
+    except Exception:
         return None
 
 
-def get_contract_detail():
-    data = mexc_get("/api/v1/contract/detail")
-    if not data or not isinstance(data, dict) or not data.get("success", False):
-        return []
-    result = data.get("data", [])
-    return result if isinstance(result, list) else []
-
-
-def get_active_symbols():
-    details = get_contract_detail()
-    if not details:
-        return []
-
-    symbols = []
-    for item in details:
-        if not isinstance(item, dict):
-            continue
-
-        raw_symbol = (
-            item.get("symbol")
-            or item.get("displayName")
-            or item.get("display_name")
-            or item.get("contractCode")
-            or item.get("contract_code")
-            or ""
-        )
-
-        symbol = normalize_symbol(raw_symbol)
-        api_allowed = item.get("apiAllowed", True)
-        if str(api_allowed).lower() in ("false", "0", "none", "null"):
-            continue
-
-        if symbol_allowed(symbol):
-            symbols.append(symbol)
-
-    symbols = sorted(list(set(symbols)))
-    symbols = symbols[:MAX_SYMBOLS_TO_SCAN]
-    logger.info("Aktif sembol sayisi (filtreli): %s", len(symbols))
-    return symbols
-
-
-def get_klines(symbol: str, interval: str, bars: int = 320):
-    interval_sec_map = {
-        "Min1": 60,
-        "Min5": 300,
-        "Min15": 900,
-        "Min30": 1800,
-        "Min60": 3600,
-        "Hour4": 14400,
-        "Hour8": 28800,
-        "Day1": 86400,
-    }
-    sec = interval_sec_map.get(interval, 60)
-    end_ts = int(time.time())
-    start_ts = end_ts - (bars * sec)
+def get_kline(symbol: str, interval: str, limit: int = 220) -> pd.DataFrame:
+    end_ = now_ts()
+    # limit kadar mum için kaba start
+    seconds_per_bar = {
+        "Min1": 60, "Min5": 300, "Min15": 900, "Min30": 1800,
+        "Min60": 3600, "Hour4": 14400, "Day1": 86400
+    }.get(interval, 300)
+    start_ = end_ - (limit + 20) * seconds_per_bar
 
     data = mexc_get(
         f"/api/v1/contract/kline/{symbol}",
-        params={"interval": interval, "start": start_ts, "end": end_ts}
+        params={"interval": interval, "start": start_, "end": end_}
+    ).get("data", {}) or {}
+
+    df = pd.DataFrame({
+        "time": data.get("time", []),
+        "open": data.get("open", []),
+        "high": data.get("high", []),
+        "low": data.get("low", []),
+        "close": data.get("close", []),
+        "vol": data.get("vol", []),
+        "amount": data.get("amount", []),
+    })
+
+    if df.empty:
+        return df
+
+    for col in ["open", "high", "low", "close", "vol", "amount"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna().reset_index(drop=True)
+    if len(df) > limit:
+        df = df.iloc[-limit:].reset_index(drop=True)
+    return df
+
+
+# =========================================================
+# İNDİKATÖRLER
+# =========================================================
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0.0)
+    down = -delta.clip(upper=0.0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / ma_down.replace(0, pd.NA)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50.0)
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - prev_close).abs(),
+        (df["low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+
+    plus_dm = pd.Series(
+        [u if (u > d and u > 0) else 0 for u, d in zip(up_move.fillna(0), down_move.fillna(0))],
+        index=df.index
     )
-    if not data or not isinstance(data, dict) or not data.get("success", False):
-        return None
+    minus_dm = pd.Series(
+        [d if (d > u and d > 0) else 0 for u, d in zip(up_move.fillna(0), down_move.fillna(0))],
+        index=df.index
+    )
 
-    k = data.get("data", {})
-    if not isinstance(k, dict):
-        return None
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - df["close"].shift(1)).abs(),
+        (df["low"] - df["close"].shift(1)).abs()
+    ], axis=1).max(axis=1)
 
-    times = k.get("time", [])
-    opens = k.get("open", [])
-    highs = k.get("high", [])
-    lows = k.get("low", [])
-    closes = k.get("close", [])
-    vols = k.get("vol", k.get("volume", []))
+    atr_ = tr.ewm(alpha=1/period, adjust=False).mean().replace(0, pd.NA)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr_)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)) * 100
+    adx_ = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx_.fillna(0.0)
 
-    lens = [len(times), len(opens), len(highs), len(lows), len(closes), len(vols)]
-    if min(lens) == 0 or len(set(lens)) != 1:
-        return None
+
+def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["ema20"] = ema(out["close"], EMA_FAST)
+    out["ema50"] = ema(out["close"], EMA_MID)
+    out["ema200"] = ema(out["close"], EMA_SLOW)
+    out["rsi"] = rsi(out["close"], RSI_PERIOD)
+    out["atr"] = atr(out, ATR_PERIOD)
+    out["adx"] = adx(out, ADX_PERIOD)
+    out["vol_ma"] = out["vol"].rolling(VOL_MA_PERIOD).mean()
+    out["body"] = (out["close"] - out["open"]).abs()
+    out["range"] = (out["high"] - out["low"]).abs()
+    out["upper_wick"] = out["high"] - out[["open", "close"]].max(axis=1)
+    out["lower_wick"] = out[["open", "close"]].min(axis=1) - out["low"]
+    return out
+
+
+# =========================================================
+# MARKET FİLTRE
+# =========================================================
+def is_blacklisted(symbol: str) -> bool:
+    s = symbol.upper()
+    for k in BLACKLIST_KEYWORDS:
+        if k in s:
+            return True
+    return False
+
+
+def build_market_universe() -> List[dict]:
+    details = get_contract_detail()
+    tickers = get_tickers()
+    ticker_map = {x.get("symbol"): x for x in tickers if x.get("symbol")}
 
     rows = []
-    for i in range(len(times)):
-        rows.append({
-            "open_time": pd.to_datetime(int(times[i]), unit="s", utc=True).tz_convert(TZ).tz_localize(None),
-            "open": float(opens[i]),
-            "high": float(highs[i]),
-            "low": float(lows[i]),
-            "close": float(closes[i]),
-            "volume": float(vols[i]),
-        })
-
-    df = pd.DataFrame(rows)
-    df.set_index("open_time", inplace=True)
-    return df.sort_index()
-
-# =========================================================
-# INDICATORS
-# =========================================================
-class Ind:
-    def __init__(self, close, rsi, ema20, ema50, ema200, atr, adx):
-        self.close = float(close)
-        self.rsi = float(rsi)
-        self.ema20 = float(ema20)
-        self.ema50 = float(ema50)
-        self.ema200 = float(ema200)
-        self.atr = float(atr)
-        self.adx = float(adx)
-
-
-def compute_ind(df: pd.DataFrame):
-    if df is None or df.empty:
-        return None
-
-    need = max(EMA_SLOW, RSI_PERIOD, ATR_PERIOD, ADX_PERIOD) + 20
-    if len(df) < need:
-        return None
-
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-
-    rsi = RSIIndicator(close=close, window=RSI_PERIOD).rsi()
-    ema20 = EMAIndicator(close=close, window=EMA_FAST).ema_indicator()
-    ema50 = EMAIndicator(close=close, window=EMA_MID).ema_indicator()
-    ema200 = EMAIndicator(close=close, window=EMA_SLOW).ema_indicator()
-    atr = AverageTrueRange(high=high, low=low, close=close, window=ATR_PERIOD).average_true_range()
-    adx = ADXIndicator(high=high, low=low, close=close, window=ADX_PERIOD).adx()
-
-    vals = [rsi.iloc[-1], ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1], atr.iloc[-1], adx.iloc[-1]]
-    if any(pd.isna(v) for v in vals):
-        return None
-
-    last = df.iloc[-1]
-    return Ind(last["close"], rsi.iloc[-1], ema20.iloc[-1], ema50.iloc[-1], ema200.iloc[-1], atr.iloc[-1], adx.iloc[-1])
-
-
-def trend_up(ind: Ind) -> bool:
-    return ind.ema20 > ind.ema50 > ind.ema200 and ind.close > ind.ema20
-
-
-def trend_down(ind: Ind) -> bool:
-    return ind.ema20 < ind.ema50 < ind.ema200 and ind.close < ind.ema20
-
-# =========================================================
-# FILTER HELPERS
-# =========================================================
-def candle_parts(row):
-    o = float(row["open"])
-    h = float(row["high"])
-    l = float(row["low"])
-    c = float(row["close"])
-    body = abs(c - o)
-    rng = max(h - l, 1e-12)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-    return o, h, l, c, body, rng, upper_wick, lower_wick
-
-
-def breakout_long(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
-    if df is None or len(df) < lookback + 2:
-        return False
-    prev_high = float(df["high"].iloc[-(lookback + 1):-1].max())
-    return float(df["close"].iloc[-1]) > prev_high
-
-
-def breakout_short(df: pd.DataFrame, lookback: int = BREAKOUT_LOOKBACK):
-    if df is None or len(df) < lookback + 2:
-        return False
-    prev_low = float(df["low"].iloc[-(lookback + 1):-1].min())
-    return float(df["close"].iloc[-1]) < prev_low
-
-
-def volume_surge(df: pd.DataFrame, mult: float = VOLUME_SURGE_MULT):
-    if df is None or len(df) < 25:
-        return False
-    vma = float(df["volume"].rolling(20).mean().iloc[-1])
-    return vma > 0 and float(df["volume"].iloc[-1]) > vma * mult
-
-
-def last_candle_range_atr(df: pd.DataFrame, atr: float):
-    if df is None or len(df) < 1 or atr <= 0:
-        return None
-    last = df.iloc[-1]
-    return float(last["high"] - last["low"]) / atr
-
-
-def distance_from_ema20_atr(ind: Ind):
-    if ind.atr <= 0:
-        return 999.0
-    return abs(ind.close - ind.ema20) / ind.atr
-
-
-def breakout_quality_long(df: pd.DataFrame, atr: float):
-    if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
-        return False
-    last = df.iloc[-1]
-    _, _, _, c, body, _, upper_wick, _ = candle_parts(last)
-    wick_body_ratio = upper_wick / max(body, 1e-12)
-    body_atr = body / atr
-    prev_high = float(df["high"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].max())
-    return c > prev_high and wick_body_ratio <= MAX_BREAKOUT_WICK_BODY_RATIO and body_atr >= MIN_BREAKOUT_BODY_ATR
-
-
-def breakout_quality_short(df: pd.DataFrame, atr: float):
-    if df is None or len(df) < BREAKOUT_LOOKBACK + 2 or atr <= 0:
-        return False
-    last = df.iloc[-1]
-    _, _, _, c, body, _, _, lower_wick = candle_parts(last)
-    wick_body_ratio = lower_wick / max(body, 1e-12)
-    body_atr = body / atr
-    prev_low = float(df["low"].iloc[-(BREAKOUT_LOOKBACK + 1):-1].min())
-    return c < prev_low and wick_body_ratio <= MAX_BREAKOUT_WICK_BODY_RATIO and body_atr >= MIN_BREAKOUT_BODY_ATR
-
-# =========================================================
-# BTC FILTER
-# =========================================================
-def get_btc_filter_bias():
-    if not USE_BTC_FILTER:
-        return "NEUTRAL"
-
-    df = get_klines("BTC_USDT", "Min15", 120)
-    if df is None or len(df) < 20:
-        return "NEUTRAL"
-
-    prev_close = float(df["close"].iloc[-4])
-    last_close = float(df["close"].iloc[-1])
-    move = pct_change(prev_close, last_close)
-
-    ind = compute_ind(df)
-    if ind is None:
-        return "NEUTRAL"
-
-    if move >= BTC_15M_TREND_THRESHOLD and ind.close > ind.ema20 and ind.rsi >= 51:
-        return "LONG"
-    if move <= -BTC_15M_TREND_THRESHOLD and ind.close < ind.ema20 and ind.rsi <= 49:
-        return "SHORT"
-    return "NEUTRAL"
-
-# =========================================================
-# RISK
-# =========================================================
-def calc_levels(direction: str, entry: float, atr: float):
-    if direction == "LONG":
-        sl = entry - (ATR_SL_MULTIPLIER * atr)
-        tp1 = entry + (ATR_TP1_MULTIPLIER * atr)
-        tp2 = entry + (ATR_TP2_MULTIPLIER * atr)
-        tp3 = entry + (ATR_TP3_MULTIPLIER * atr)
-    else:
-        sl = entry + (ATR_SL_MULTIPLIER * atr)
-        tp1 = entry - (ATR_TP1_MULTIPLIER * atr)
-        tp2 = entry - (ATR_TP2_MULTIPLIER * atr)
-        tp3 = entry - (ATR_TP3_MULTIPLIER * atr)
-    return sl, tp1, tp2, tp3
-
-
-def rr(direction: str, entry: float, sl: float, target: float):
-    if direction == "LONG":
-        risk = entry - sl
-        reward = target - entry
-    else:
-        risk = sl - entry
-        reward = entry - target
-    if risk <= 0:
-        return None
-    return reward / risk
-
-# =========================================================
-# MESSAGE FORMAT
-# =========================================================
-def format_single_signal(sig: dict) -> str:
-    return (
-        f"{sig['direction']} {sig['symbol']}\n"
-        f"Entry: {fmt_price(sig['entry'])}\n"
-        f"SL: {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}\n"
-        f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}"
-    )
-
-
-def format_batch_message(special_signals, main_signals) -> str:
-    parts = []
-    for sig in special_signals:
-        parts.append(format_single_signal(sig))
-    for sig in main_signals:
-        parts.append(format_single_signal(sig))
-    return "\n\n".join(parts).strip()
-
-
-def batch_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-# =========================================================
-# STRATEGY
-# =========================================================
-def evaluate_symbol(symbol: str, btc_bias: str, relaxed: bool = False):
-    df_4h = get_klines(symbol, TF_TREND, 320)
-    df_1h = get_klines(symbol, TF_SETUP, 420)
-    df_15m = get_klines(symbol, TF_ENTRY, 520)
-
-    if df_4h is None or df_1h is None or df_15m is None:
-        return None
-
-    ind_4h = compute_ind(df_4h)
-    ind_1h = compute_ind(df_1h)
-    ind_15m = compute_ind(df_15m)
-
-    if not ind_4h or not ind_1h or not ind_15m:
-        return None
-
-    atr_pct = ind_15m.atr / max(ind_15m.close, 1e-12)
-    if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
-        return None
-
-    last_range_atr = last_candle_range_atr(df_15m, ind_15m.atr)
-    if last_range_atr is not None and last_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
-        return None
-
-    dist_ema20_atr = distance_from_ema20_atr(ind_15m)
-    if dist_ema20_atr > MAX_DISTANCE_FROM_EMA20_ATR:
-        return None
-
-    trigger_breakout_long = breakout_long(df_15m, BREAKOUT_LOOKBACK)
-    trigger_breakout_short = breakout_short(df_15m, BREAKOUT_LOOKBACK)
-    trigger_volume = volume_surge(df_15m, VOLUME_SURGE_MULT)
-    breakout_long_ok = breakout_quality_long(df_15m, ind_15m.atr)
-    breakout_short_ok = breakout_quality_short(df_15m, ind_15m.atr)
-
-    long_score = 0.0
-    short_score = 0.0
-
-    if trend_up(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_LONG <= ind_4h.rsi <= MAX_4H_RSI_LONG:
-        long_score += 4.0
-    elif ind_4h.close > ind_4h.ema20 and ind_4h.rsi >= 46:
-        long_score += 1.5
-
-    if trend_down(ind_4h) and ind_4h.adx >= MIN_4H_ADX and MIN_4H_RSI_SHORT <= ind_4h.rsi <= MAX_4H_RSI_SHORT:
-        short_score += 4.0
-    elif ind_4h.close < ind_4h.ema20 and ind_4h.rsi <= 54:
-        short_score += 1.5
-
-    if (
-        ind_1h.close > ind_1h.ema50 and
-        ind_1h.ema20 > ind_1h.ema50 > ind_1h.ema200 and
-        ind_1h.adx >= MIN_1H_ADX and
-        MIN_1H_RSI_LONG <= ind_1h.rsi <= MAX_1H_RSI_LONG
-    ):
-        long_score += 3.0
-
-    if (
-        ind_1h.close < ind_1h.ema50 and
-        ind_1h.ema20 < ind_1h.ema50 < ind_1h.ema200 and
-        ind_1h.adx >= MIN_1H_ADX and
-        MIN_1H_RSI_SHORT <= ind_1h.rsi <= MAX_1H_RSI_SHORT
-    ):
-        short_score += 3.0
-
-    entry_15m_long_ok = (
-        ind_15m.close > ind_15m.ema20 > ind_15m.ema50 > ind_15m.ema200 and
-        MIN_15M_RSI_LONG <= ind_15m.rsi <= MAX_15M_RSI_LONG
-    )
-    entry_15m_short_ok = (
-        ind_15m.close < ind_15m.ema20 < ind_15m.ema50 < ind_15m.ema200 and
-        MIN_15M_RSI_SHORT <= ind_15m.rsi <= MAX_15M_RSI_SHORT
-    )
-
-    if entry_15m_long_ok:
-        long_score += 2.0
-    if entry_15m_short_ok:
-        short_score += 2.0
-
-    if trigger_breakout_long and breakout_long_ok:
-        long_score += 1.5
-    if trigger_breakout_short and breakout_short_ok:
-        short_score += 1.5
-
-    if trigger_volume and entry_15m_long_ok:
-        long_score += 0.75
-    if trigger_volume and entry_15m_short_ok:
-        short_score += 0.75
-
-    if btc_bias == "LONG":
-        long_score += 0.75
-        short_score -= 0.50
-    elif btc_bias == "SHORT":
-        short_score += 0.75
-        long_score -= 0.50
-
-    direction = None
-    score = 0.0
-
-    if long_score >= short_score and long_score >= EARLY_MIN_SCORE:
-        direction = "LONG"
-        score = long_score
-    elif short_score > long_score and short_score >= EARLY_MIN_SCORE:
-        direction = "SHORT"
-        score = short_score
-    else:
-        return None
-
-    if BLOCK_COUNTERTREND_SIGNALS:
-        if btc_bias == "SHORT" and direction == "LONG":
-            return None
-        if btc_bias == "LONG" and direction == "SHORT":
-            return None
-
-    min_score_to_use = FULL_MIN_SCORE if not relaxed else (FULL_MIN_SCORE - 1.0)
-    if score < min_score_to_use:
-        return None
-
-    entry = ind_15m.close
-    sl, tp1, tp2, tp3 = calc_levels(direction, entry, ind_15m.atr)
-    rr_tp2 = rr(direction, entry, sl, tp2)
-
-    min_rr = MIN_RR_TO_TP2 if not relaxed else 1.30
-    if rr_tp2 is None or rr_tp2 < min_rr:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "score": round(score, 2),
-    }
-
-
-def evaluate_special_symbol(symbol: str, btc_bias: str):
-    sig = evaluate_symbol(symbol, btc_bias, relaxed=True)
-    if sig:
-        return sig
-
-    df_15m = get_klines(symbol, TF_ENTRY, 220)
-    if df_15m is None:
-        return None
-
-    ind = compute_ind(df_15m)
-    if not ind:
-        return None
-
-    if ind.close >= ind.ema20:
-        direction = "LONG"
-    else:
-        direction = "SHORT"
-
-    entry = ind.close
-    sl, tp1, tp2, tp3 = calc_levels(direction, entry, ind.atr)
-
-    return {
-        "symbol": symbol,
-        "direction": direction,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "score": 6.0,
-    }
-
-# =========================================================
-# MAIN
-# =========================================================
-def run_once(state):
-    logger.info("Tarama basladi")
-    btc_bias = get_btc_filter_bias()
-    logger.info("BTC bias: %s", btc_bias)
-
-    special_signals = []
-    for sp in SPECIAL_SYMBOLS:
-        try:
-            sig = evaluate_special_symbol(sp, btc_bias)
-            if sig:
-                special_signals.append(sig)
-        except Exception as e:
-            logger.exception("Special symbol error %s: %s", sp, e)
-
-    symbols = get_active_symbols()
-    candidates = []
-
-    for symbol in symbols:
-        try:
-            last_sent_ts = state["last_sent_by_symbol"].get(symbol, 0)
-            if minutes_since(last_sent_ts) < COOLDOWN_MINUTES_SAME_SYMBOL:
+    for d in details:
+        symbol = d.get("symbol")
+        if not symbol or symbol not in ticker_map:
+            continue
+
+        if REQUIRE_USDT_PERP:
+            if not symbol.endswith("_USDT"):
                 continue
 
-            sig = evaluate_symbol(symbol, btc_bias, relaxed=False)
-            if sig:
-                candidates.append(sig)
+        if is_blacklisted(symbol):
+            continue
 
-        except Exception as e:
-            logger.exception("Evaluate error %s: %s", symbol, e)
+        t = ticker_map[symbol]
+        last_price = safe_float(t.get("lastPrice"))
+        amount24 = safe_float(t.get("amount24"))
+        hold_vol = safe_float(t.get("holdVol"))
+        bid1 = safe_float(t.get("bid1"))
+        ask1 = safe_float(t.get("ask1"))
+        rise_fall_rate = safe_float(t.get("riseFallRate")) * 100.0
 
-    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+        if last_price < MIN_PRICE:
+            continue
+        if amount24 < MIN_AMOUNT24_USDT:
+            continue
+        if hold_vol < MIN_HOLDVOL:
+            continue
+        if abs(rise_fall_rate) > MAX_24H_PUMP_PCT:
+            continue
 
-    top_n = TOP_N_SIGNALS
-    if btc_bias == "SHORT":
-        top_n = min(top_n, MAX_NEW_SIGNALS_PER_RUN_IF_BTC_BAD)
+        spread_pct = 0.0
+        if bid1 > 0 and ask1 > 0:
+            mid = (bid1 + ask1) / 2.0
+            if mid > 0:
+                spread_pct = ((ask1 - bid1) / mid) * 100.0
 
-    main_signals = candidates[:top_n]
+        if spread_pct > MAX_SPREAD_PCT:
+            continue
 
-    if not special_signals and not main_signals:
-        logger.info("Uygun sinyal yok")
-        if NO_SIGNAL_MESSAGE:
-            tg_send("Uygun sinyal yok")
-        return
+        rows.append({
+            "symbol": symbol,
+            "last_price": last_price,
+            "amount24": amount24,
+            "hold_vol": hold_vol,
+            "spread_pct": spread_pct,
+            "rise_fall_pct": rise_fall_rate,
+        })
 
-    text = format_batch_message(special_signals, main_signals)
-    current_hash = batch_hash(text)
-
-    if current_hash == state.get("last_batch_hash", ""):
-        logger.info("Ayni batch, tekrar gonderilmedi")
-        return
-
-    ok = tg_send(text)
-    if ok:
-        state["last_batch_hash"] = current_hash
-        for sig in special_signals + main_signals:
-            state["last_sent_by_symbol"][sig["symbol"]] = now_ts()
-        save_state(state)
-        logger.info("Sinyal batch gonderildi | special=%s | main=%s", len(special_signals), len(main_signals))
+    rows.sort(key=lambda x: (x["amount24"], x["hold_vol"]), reverse=True)
+    return rows[:MAX_SYMBOLS_TO_SCAN]
 
 
-def main():
-    logger.info("Bot basladi")
+# =========================================================
+# BTC REJİM
+# =========================================================
+def get_btc_regime() -> str:
+    try:
+        df = get_kline(BTC_SYMBOL, TF_TREND, 220)
+        if len(df) < 210:
+            return "NEUTRAL"
+        df = enrich_indicators(df)
+        last = df.iloc[-1]
+
+        bullish = (
+            last["close"] > last["ema20"] > last["ema50"] > last["ema200"]
+            and last["rsi"] >= 52
+            and last["adx"] >= 18
+        )
+        bearish = (
+            last["close"] < last["ema20"] < last["ema50"] < last["ema200"]
+            and last["rsi"] <= 48
+            and last["adx"] >= 18
+        )
+
+        if bullish:
+            return "LONG_ONLY"
+        if bearish:
+            return "SHORT_ONLY"
+        return "NEUTRAL"
+    except Exception:
+        return "NEUTRAL"
+
+
+# =========================================================
+# SİNYAL MOTORU
+# =========================================================
+def breakdown_or_breakout(df: pd.DataFrame) -> Tuple[bool, bool]:
+    """
+    breakout_long, breakdown_short
+    """
+    if len(df) < 25:
+        return False, False
+
+    prev20_high = df["high"].iloc[-21:-1].max()
+    prev20_low = df["low"].iloc[-21:-1].min()
+    last = df.iloc[-1]
+
+    breakout_long = last["close"] > prev20_high and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
+    breakdown_short = last["close"] < prev20_low and last["body"] >= last["atr"] * MIN_BREAKOUT_BODY_ATR
+    return breakout_long, breakdown_short
+
+
+def compute_rr(side: str, entry: float, sl: float, tp2: float) -> float:
+    if side == "LONG":
+        risk = entry - sl
+        reward = tp2 - entry
+    else:
+        risk = sl - entry
+        reward = entry - tp2
+
+    if risk <= 0:
+        return 0.0
+    return reward / risk
+
+
+def build_signal(symbol: str, market_info: dict, btc_regime: str) -> Optional[dict]:
+    try:
+        funding = get_funding_rate(symbol)
+        if funding is not None and abs(funding) > MAX_ABS_FUNDING:
+            return None
+
+        df5 = get_kline(symbol, TF_SIGNAL, KLINE_LIMIT)
+        df15 = get_kline(symbol, TF_TREND, KLINE_LIMIT)
+
+        if len(df5) < 210 or len(df15) < 210:
+            return None
+
+        df5 = enrich_indicators(df5)
+        df15 = enrich_indicators(df15)
+
+        last5 = df5.iloc[-1]
+        prev5 = df5.iloc[-2]
+        last15 = df15.iloc[-1]
+
+        breakout_long, breakdown_short = breakdown_or_breakout(df5)
+
+        trend_long = last15["close"] > last15["ema20"] > last15["ema50"] > last15["ema200"]
+        trend_short = last15["close"] < last15["ema20"] < last15["ema50"] < last15["ema200"]
+
+        vol_ok = last5["vol"] > (last5["vol_ma"] * 1.20 if pd.notna(last5["vol_ma"]) else 0)
+        adx_ok = last5["adx"] >= MIN_ADX
+
+        candle_range_atr = (last5["range"] / last5["atr"]) if last5["atr"] > 0 else 999
+        if candle_range_atr > MAX_LAST_CANDLE_RANGE_ATR:
+            return None
+
+        distance_from_ema20_atr = abs(last5["close"] - last5["ema20"]) / last5["atr"] if last5["atr"] > 0 else 999
+        if distance_from_ema20_atr > MAX_DISTANCE_FROM_EMA20_ATR:
+            return None
+
+        # LONG setup
+        long_ok = all([
+            trend_long,
+            breakout_long or (last5["close"] > last5["ema20"] and prev5["close"] <= prev5["ema20"]),
+            last5["rsi"] >= MIN_RSI_LONG,
+            adx_ok,
+            vol_ok,
+        ])
+
+        # SHORT setup
+        short_ok = all([
+            trend_short,
+            breakdown_short or (last5["close"] < last5["ema20"] and prev5["close"] >= prev5["ema20"]),
+            last5["rsi"] <= MAX_RSI_SHORT,
+            adx_ok,
+            vol_ok,
+        ])
+
+        if USE_BTC_REGIME_FILTER:
+            if btc_regime == "LONG_ONLY":
+                short_ok = False
+            elif btc_regime == "SHORT_ONLY":
+                long_ok = False
+            elif btc_regime == "NEUTRAL":
+                # nötr piyasada daha seçici ol
+                if not breakout_long:
+                    long_ok = False
+                if not breakdown_short:
+                    short_ok = False
+
+        if not long_ok and not short_ok:
+            return None
+
+        if long_ok and short_ok:
+            # Çakışmada trend gücüne bak
+            long_score_seed = (last5["rsi"] - 50) + (last5["adx"] - 15)
+            short_score_seed = (50 - last5["rsi"]) + (last5["adx"] - 15)
+            if long_score_seed >= short_score_seed:
+                short_ok = False
+            else:
+                long_ok = False
+
+        entry = float(last5["close"])
+        atrv = float(last5["atr"])
+
+        if long_ok:
+            side = "LONG"
+            sl = entry - atrv * SL_ATR_MULT
+            tp1 = entry + atrv * TP1_ATR_MULT
+            tp2 = entry + atrv * TP2_ATR_MULT
+            tp3 = entry + atrv * TP3_ATR_MULT
+            setup = "Breakout" if breakout_long else "EMA Reclaim"
+        else:
+            side = "SHORT"
+            sl = entry + atrv * SL_ATR_MULT
+            tp1 = entry - atrv * TP1_ATR_MULT
+            tp2 = entry - atrv * TP2_ATR_MULT
+            tp3 = entry - atrv * TP3_ATR_MULT
+            setup = "Breakdown" if breakdown_short else "EMA Reject"
+
+        rr = compute_rr(side, entry, sl, tp2)
+        if rr < MIN_RR_TO_TP2:
+            return None
+
+        strength = 0.0
+        strength += clamp(abs(last5["rsi"] - 50) * 0.20, 0, 3.0)
+        strength += clamp((last5["adx"] - 15) * 0.15, 0, 2.5)
+        strength += clamp(rr * 1.4, 0, 3.0)
+        strength += 0.8 if vol_ok else 0.0
+        strength += 0.8 if ((side == "LONG" and breakout_long) or (side == "SHORT" and breakdown_short)) else 0.0
+
+        # Funding aleyhe ise puan kır
+        if funding is not None:
+            if side == "LONG" and funding > 0:
+                strength -= clamp(funding * 1000, 0, 0.7)
+            elif side == "SHORT" and funding < 0:
+                strength -= clamp(abs(funding) * 1000, 0, 0.7)
+
+        spread_penalty = clamp(market_info["spread_pct"] * 3.0, 0, 1.0)
+        strength -= spread_penalty
+
+        score = round(clamp(strength, 1.0, 10.0), 1)
+
+        return {
+            "symbol": symbol,
+            "side": side,
+            "entry": round(entry, 10),
+            "sl": round(sl, 10),
+            "tp1": round(tp1, 10),
+            "tp2": round(tp2, 10),
+            "tp3": round(tp3, 10),
+            "rr": round(rr, 2),
+            "score": score,
+            "setup": setup,
+            "tf": "5m / 15m",
+            "spread_pct": round(market_info["spread_pct"], 3),
+            "amount24": market_info["amount24"],
+            "hold_vol": market_info["hold_vol"],
+            "funding": None if funding is None else round(funding * 100, 4),  # %
+            "rsi": round(float(last5["rsi"]), 1),
+            "adx": round(float(last5["adx"]), 1),
+            "btc_regime": btc_regime
+        }
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# MESAJ FORMAT
+# =========================================================
+def format_signal_message(sig: dict) -> str:
+    symbol = html.escape(sig["symbol"].replace("_", "/"))
+    side = html.escape(sig["side"])
+    setup = html.escape(sig["setup"])
+    tf = html.escape(sig["tf"])
+
+    funding_text = "N/A" if sig["funding"] is None else f"{sig['funding']}%"
+    emoji = "🟢" if sig["side"] == "LONG" else "🔴"
+
+    return (
+        f"🚨 <b>COINRADAR SIGNAL</b>\n\n"
+        f"{emoji} <b>{side} | {symbol}</b>\n"
+        f"<b>Entry:</b> {fmt_price(sig['entry'])}\n"
+        f"<b>Stop:</b> {fmt_price(sig['sl'])}\n\n"
+        f"<b>TP1:</b> {fmt_price(sig['tp1'])}\n"
+        f"<b>TP2:</b> {fmt_price(sig['tp2'])}\n"
+        f"<b>TP3:</b> {fmt_price(sig['tp3'])}\n\n"
+        f"<b>R/R:</b> {sig['rr']}\n"
+        f"<b>Score:</b> {sig['score']}/10\n"
+        f"<b>Setup:</b> {setup}\n"
+        f"<b>TF:</b> {tf}\n"
+        f"<b>RSI:</b> {sig['rsi']} | <b>ADX:</b> {sig['adx']}\n"
+        f"<b>Spread:</b> {sig['spread_pct']}%\n"
+        f"<b>Funding:</b> {funding_text}\n"
+        f"<b>BTC Bias:</b> {html.escape(sig['btc_regime'])}"
+    )
+
+
+def format_startup_message() -> str:
+    return (
+        "✅ <b>COINRADAR PRO++ başladı</b>\n\n"
+        "Tarama aktif.\n"
+        "MEXC futures market izleniyor.\n"
+        "Profesyonel format sinyal sistemi hazır."
+    )
+
+
+def format_heartbeat_message(symbol_count: int, btc_regime: str) -> str:
+    return (
+        "ℹ️ <b>COINRADAR PRO++ aktif</b>\n\n"
+        f"Taranan sözleşme: <b>{symbol_count}</b>\n"
+        f"BTC Bias: <b>{html.escape(btc_regime)}</b>\n"
+        "Şu turda uygun sinyal bulunmadı."
+    )
+
+
+def format_error_message(err: str) -> str:
+    txt = html.escape(err[:700])
+    return f"⚠️ <b>COINRADAR HATA</b>\n\n<code>{txt}</code>"
+
+
+# =========================================================
+# COOLDOWN / SEÇİM
+# =========================================================
+def is_on_cooldown(state: dict, symbol: str, side: str) -> bool:
+    key = f"{symbol}:{side}"
+    last_ts = state.get("last_sent", {}).get(key, 0)
+    return (now_ts() - last_ts) < SIGNAL_COOLDOWN_MINUTES * 60
+
+
+def mark_sent(state: dict, symbol: str, side: str):
+    key = f"{symbol}:{side}"
+    state.setdefault("last_sent", {})[key] = now_ts()
+
+
+def pick_top_signals(signals: List[dict], n: int) -> List[dict]:
+    signals = sorted(
+        signals,
+        key=lambda x: (x["score"], x["rr"], x["amount24"]),
+        reverse=True
+    )
+    return signals[:n]
+
+
+# =========================================================
+# ANA DÖNGÜ
+# =========================================================
+def run():
     state = load_state()
 
+    if SEND_STARTUP_MESSAGE:
+        telegram_send_html(format_startup_message())
+
     while True:
+        cycle_start = time.time()
         try:
-            run_once(state)
+            universe = build_market_universe()
+            btc_regime = get_btc_regime()
+
+            print(f"[INFO] Universe: {len(universe)} | BTC bias: {btc_regime}")
+
+            signals = []
+            for item in universe:
+                sym = item["symbol"]
+                sig = build_signal(sym, item, btc_regime)
+                if not sig:
+                    continue
+                if is_on_cooldown(state, sig["symbol"], sig["side"]):
+                    continue
+                signals.append(sig)
+
+            top_signals = pick_top_signals(signals, TOP_N_SIGNALS)
+
+            if top_signals:
+                for sig in top_signals:
+                    ok = telegram_send_html(format_signal_message(sig))
+                    if ok:
+                        mark_sent(state, sig["symbol"], sig["side"])
+                        print(f"[SENT] {sig['side']} {sig['symbol']} score={sig['score']} rr={sig['rr']}")
+                    else:
+                        print(f"[FAIL] Telegram gönderilemedi: {sig['symbol']}")
+            else:
+                print("[INFO] Uygun sinyal yok.")
+                if SEND_HEARTBEAT_IF_NO_SIGNAL:
+                    last_hb = state.get("last_heartbeat", 0)
+                    if (now_ts() - last_hb) >= HEARTBEAT_EVERY_MINUTES * 60:
+                        if telegram_send_html(format_heartbeat_message(len(universe), btc_regime)):
+                            state["last_heartbeat"] = now_ts()
+
+            save_state(state)
+
         except Exception as e:
-            logger.exception("Main loop error: %s", e)
-        time.sleep(CHECK_EVERY_SECONDS)
+            err = f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}"
+            print("[ERROR]", err)
+            telegram_send_html(format_error_message(err))
+
+        elapsed = time.time() - cycle_start
+        sleep_for = max(5, CHECK_EVERY_SECONDS - int(elapsed))
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
-    main()
+    run()
