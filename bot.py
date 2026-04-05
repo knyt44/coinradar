@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-BYBIT PRO SIGNAL BOT V3
-- Bybit spot data
+BINANCE DATA PRO SIGNAL BOT V4
+- Binance public spot market data
 - 1H trend + 15M entry
-- Long + Short
-- Fixed whitelist (no instruments-info call)
+- Long + Short signal engine
+- Fixed whitelist
 - Telegram optional
 - TP1 / TP2 / TP3 / SL
 - Active signal tracking
-- Balanced filters: not too tight, not too loose
+- Single-file version
 
 KURULUM:
 pip install requests pandas numpy
@@ -37,7 +37,7 @@ import pandas as pd
 # CONFIG
 # =========================================================
 
-BASE_URL = "https://api.bybit.com"
+BASE_URL = "https://api.binance.com"
 
 SYMBOL_RULES = {
     "BTCUSDT":   {"allow_long": True, "allow_short": True,  "short_tier": "majors"},
@@ -46,19 +46,19 @@ SYMBOL_RULES = {
     "SEIUSDT":   {"allow_long": True, "allow_short": False, "short_tier": "none"},
     "DOGEUSDT":  {"allow_long": True, "allow_short": False, "short_tier": "none"},
     "ARBUSDT":   {"allow_long": True, "allow_short": True,  "short_tier": "alts"},
-    "TRUMPUSDT": {"allow_long": True, "allow_short": False, "short_tier": "none"},
+    "TRUMPUSDT": {"allow_long": False, "allow_short": False, "short_tier": "none"},  # Binance spotta yoksa otomatik geçilecek
     "TAOUSDT":   {"allow_long": True, "allow_short": False, "short_tier": "none"},
     "FETUSDT":   {"allow_long": True, "allow_short": True,  "short_tier": "alts"},
     "RNDRUSDT":  {"allow_long": True, "allow_short": True,  "short_tier": "alts"},
     "APTUSDT":   {"allow_long": True, "allow_short": True,  "short_tier": "alts"},
 }
 
-STATE_FILE = "bybit_pro_signal_bot_v3_state.json"
-LOG_FILE = "bybit_pro_signal_bot_v3.log"
+STATE_FILE = "binance_data_pro_signal_bot_v4_state.json"
+LOG_FILE = "binance_data_pro_signal_bot_v4.log"
 
 SCAN_INTERVAL_SECONDS = 60
-TF_TREND = "60"
-TF_ENTRY = "15"
+TF_TREND = "1h"
+TF_ENTRY = "15m"
 LIVE_LIMIT_1H = 320
 LIVE_LIMIT_15M = 320
 
@@ -72,7 +72,8 @@ BTC_TREND_RSI_MAX_SHORT = 47
 ETH_TREND_RSI_MIN_LONG = 52
 ETH_TREND_RSI_MAX_SHORT = 48
 
-MIN_TURNOVER_USDT_24H = 6_000_000
+MIN_QUOTE_VOLUME_USDT_24H = 5_000_000
+MIN_TRADES_24H = 10_000
 MAX_SPREAD_PCT = 0.45
 MIN_24H_CHANGE_PCT = -12.0
 MAX_24H_PUMP_PCT_FOR_LONG = 12.0
@@ -142,7 +143,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HTTP_TIMEOUT = 20
 session = requests.Session()
-session.headers.update({"User-Agent": "bybit-pro-signal-bot-v3/3.0"})
+session.headers.update({"User-Agent": "binance-data-pro-signal-bot-v4/4.0"})
 
 
 # =========================================================
@@ -216,63 +217,86 @@ def send_telegram(text: str):
 
 
 # =========================================================
-# API
+# BINANCE API
 # =========================================================
 
-def bybit_get(path: str, params=None):
+def binance_get(path: str, params=None):
     url = f"{BASE_URL}{path}"
     r = session.get(url, params=params or {}, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-    data = r.json()
-    if str(data.get("retCode")) != "0":
-        raise RuntimeError(f"Bybit API error: {data.get('retCode')} {data.get('retMsg')}")
-    return data
+    return r.json()
 
 
 def get_exchange_symbols():
-    # 403 almamak için API'den instruments-info çekmiyoruz
-    return list(SYMBOL_RULES.keys())
+    try:
+        data = binance_get("/api/v3/exchangeInfo")
+        symbols = set()
+        for row in data.get("symbols", []):
+            if row.get("status") == "TRADING":
+                s = row.get("symbol")
+                if s:
+                    symbols.add(s)
+        return symbols
+    except Exception as e:
+        log(f"get_exchange_symbols error: {e}")
+        return set(SYMBOL_RULES.keys())
 
 
 def get_24h_tickers():
     try:
-        data = bybit_get("/v5/market/tickers", {"category": "spot"})
+        data = binance_get("/api/v3/ticker/24hr")
         out = {}
-        for row in data.get("result", {}).get("list", []):
-            symbol = row.get("symbol")
-            if symbol:
-                out[symbol] = row
+        for row in data:
+            s = row.get("symbol")
+            if s:
+                out[s] = row
         return out
     except Exception as e:
         log(f"get_24h_tickers error: {e}")
         return {}
 
 
+def get_orderbook_ticker():
+    try:
+        data = binance_get("/api/v3/ticker/bookTicker")
+        out = {}
+        for row in data:
+            s = row.get("symbol")
+            if s:
+                out[s] = row
+        return out
+    except Exception as e:
+        log(f"get_orderbook_ticker error: {e}")
+        return {}
+
+
 def _kline_request(symbol: str, interval: str, limit: int = 200):
-    data = bybit_get(
-        "/v5/market/kline",
+    return binance_get(
+        "/api/v3/klines",
         {
-            "category": "spot",
             "symbol": symbol,
             "interval": interval,
             "limit": min(limit, 1000),
         }
     )
-    return data.get("result", {}).get("list", [])
 
 
 def klines_to_df(raw):
     if not raw:
         return pd.DataFrame()
 
-    cols = ["open_time", "open", "high", "low", "close", "volume", "quote_volume"]
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trade_count",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ]
     df = pd.DataFrame(raw, columns=cols)
 
-    for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
+    for c in ["open", "high", "low", "close", "volume", "quote_volume", "trade_count"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms", utc=True)
-    df["close_time"] = df["open_time"]
+    df["close_time"] = pd.to_datetime(pd.to_numeric(df["close_time"], errors="coerce"), unit="ms", utc=True)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(subset=["open", "high", "low", "close", "volume", "quote_volume", "open_time"], inplace=True)
@@ -290,7 +314,9 @@ def klines_to_df(raw):
         return df
 
     df = df.sort_values("open_time").drop_duplicates(subset=["open_time"]).reset_index(drop=True)
-    return df
+    if len(df) > 1:
+        df = df.iloc[:-1].copy()  # open candle'ı at
+    return df.reset_index(drop=True)
 
 
 def get_klines(symbol: str, interval: str, limit: int = 300):
@@ -499,7 +525,7 @@ def is_alt_symbol(symbol: str) -> bool:
 
 def build_fallback_market_meta(symbol: str) -> dict:
     try:
-        df = get_klines(symbol, "60", 30)
+        df = get_klines(symbol, "1h", 30)
         if len(df) < 25:
             return {"ok": False, "reason": "fallback_insufficient"}
 
@@ -513,8 +539,8 @@ def build_fallback_market_meta(symbol: str) -> dict:
 
         return {
             "ok": True,
-            "turnover_24h": vol24,
-            "volume_24h": float(df.tail(24)["volume"].sum()) if "volume" in df.columns else 0.0,
+            "quote_volume": vol24,
+            "trade_count": 999999,
             "spread_pct": 0.06,
             "pct_change_24h": pct_change,
             "last_price": last_close,
@@ -525,37 +551,43 @@ def build_fallback_market_meta(symbol: str) -> dict:
         return {"ok": False, "reason": "fallback_error"}
 
 
-def symbol_market_ok(symbol: str, tickers_24h: dict) -> dict:
+def symbol_market_ok(symbol: str, tickers_24h: dict, books: dict) -> dict:
     row = tickers_24h.get(symbol)
+    book = books.get(symbol)
+
     if not row:
         return build_fallback_market_meta(symbol)
 
-    turnover_24h = safe_float(row.get("turnover24h"))
-    volume_24h = safe_float(row.get("volume24h"))
-    price_24h_pct = safe_float(row.get("price24hPcnt")) * 100.0
-    ask = safe_float(row.get("ask1Price"))
-    bid = safe_float(row.get("bid1Price"))
+    quote_volume = safe_float(row.get("quoteVolume"))
+    trade_count = safe_float(row.get("count"))
+    pct_change = safe_float(row.get("priceChangePercent"))
     last_price = safe_float(row.get("lastPrice"))
+
+    ask = safe_float(book.get("askPrice")) if book else 0.0
+    bid = safe_float(book.get("bidPrice")) if book else 0.0
 
     spread_pct = 999.0
     if bid > 0 and ask > 0:
         mid = (bid + ask) / 2.0
         if mid > 0:
             spread_pct = ((ask - bid) / mid) * 100.0
+    else:
+        spread_pct = 0.08
 
     ok = (
-        turnover_24h >= MIN_TURNOVER_USDT_24H and
+        quote_volume >= MIN_QUOTE_VOLUME_USDT_24H and
+        trade_count >= MIN_TRADES_24H and
         spread_pct <= MAX_SPREAD_PCT and
-        price_24h_pct >= MIN_24H_CHANGE_PCT and
+        pct_change >= MIN_24H_CHANGE_PCT and
         last_price > 0
     )
 
     return {
         "ok": bool(ok),
-        "turnover_24h": turnover_24h,
-        "volume_24h": volume_24h,
+        "quote_volume": quote_volume,
+        "trade_count": trade_count,
         "spread_pct": spread_pct,
-        "pct_change_24h": price_24h_pct,
+        "pct_change_24h": pct_change,
         "last_price": last_price,
         "reason": "ok" if ok else "market_filter_fail",
     }
@@ -805,9 +837,9 @@ def score_long_signal(trend_info, entry_info, signal, symbol_meta, btc_filter_in
     elif 0.28 <= signal["risk_pct"] <= 1.90:
         score += 3
 
-    if symbol_meta["turnover_24h"] >= 40_000_000:
+    if symbol_meta["quote_volume"] >= 40_000_000:
         score += 4
-    elif symbol_meta["turnover_24h"] >= 15_000_000:
+    elif symbol_meta["quote_volume"] >= 15_000_000:
         score += 2
 
     if symbol_meta["spread_pct"] <= 0.10:
@@ -852,9 +884,9 @@ def score_short_signal(trend_info, entry_info, signal, symbol_meta, btc_filter_i
     elif 0.28 <= signal["risk_pct"] <= 1.70:
         score += 3
 
-    if symbol_meta["turnover_24h"] >= 40_000_000:
+    if symbol_meta["quote_volume"] >= 40_000_000:
         score += 4
-    elif symbol_meta["turnover_24h"] >= 15_000_000:
+    elif symbol_meta["quote_volume"] >= 15_000_000:
         score += 2
 
     if symbol_meta["spread_pct"] <= 0.08:
@@ -883,8 +915,8 @@ def score_short_signal(trend_info, entry_info, signal, symbol_meta, btc_filter_i
     return round(score, 2)
 
 
-def scan_symbol_side(symbol: str, side: str, tickers_24h: dict, btc_filter_info: dict, eth_filter_info: dict):
-    symbol_meta = symbol_market_ok(symbol, tickers_24h)
+def scan_symbol_side(symbol: str, side: str, tickers_24h: dict, books: dict, btc_filter_info: dict, eth_filter_info: dict):
+    symbol_meta = symbol_market_ok(symbol, tickers_24h, books)
     if not symbol_meta["ok"]:
         return None
 
@@ -966,8 +998,8 @@ def make_active_record(sig: dict) -> dict:
 
 def venue_text(symbol: str, side: str) -> str:
     if side == "LONG":
-        return f"Bybit Spot LONG | {symbol}"
-    return f"Bybit Spot SHORT/Alarm | {symbol}"
+        return f"Binance Data LONG | {symbol}"
+    return f"Binance Data SHORT/Alarm | {symbol}"
 
 
 def signal_to_telegram(sig: dict) -> str:
@@ -980,7 +1012,7 @@ def signal_to_telegram(sig: dict) -> str:
     emoji = "🟢" if side == "LONG" else "🔴"
 
     lines = [
-        f"{emoji} <b>BYBIT PRO SIGNAL V3</b>",
+        f"{emoji} <b>BINANCE DATA PRO SIGNAL V4</b>",
         f"<b>Parite:</b> {symbol}",
         f"<b>Yön:</b> {side}",
         f"<b>Setup:</b> {venue_text(symbol, side)}",
@@ -995,7 +1027,7 @@ def signal_to_telegram(sig: dict) -> str:
         f"<b>Skor:</b> {sig['score']:.2f}",
         f"<b>24h Değişim:</b> %{market['pct_change_24h']:.2f}",
         f"<b>Spread:</b> %{market['spread_pct']:.3f}",
-        f"<b>Turnover 24h:</b> {market['turnover_24h']:,.0f} USDT",
+        f"<b>Quote Vol 24h:</b> {market['quote_volume']:,.0f} USDT",
         "",
         f"<b>Trend RSI:</b> {trend['rsi']:.2f}",
         f"<b>Trend ADX:</b> {trend['adx']:.2f}",
@@ -1163,17 +1195,23 @@ def choose_best_signals(candidates, top_n=MAX_SIGNALS_PER_ROUND):
 
 
 def main():
-    log("BYBIT PRO SIGNAL BOT V3 starting.")
+    log("BINANCE DATA PRO SIGNAL BOT V4 starting.")
     state = load_state()
 
     try:
-        valid_symbols = set(get_exchange_symbols())
+        exchange_symbols = get_exchange_symbols()
+        valid_symbols = {s for s in SYMBOL_RULES.keys() if s in exchange_symbols}
+        skipped = sorted(set(SYMBOL_RULES.keys()) - valid_symbols)
+
+        if skipped:
+            log(f"Skipped unsupported symbols: {', '.join(skipped)}")
+
         if not valid_symbols:
             log("No valid symbols.")
             return
 
         send_telegram(
-            f"✅ <b>BYBIT PRO BOT V3 BAŞLADI</b>\n\n"
+            f"✅ <b>BINANCE DATA PRO BOT V4 BAŞLADI</b>\n\n"
             f"<b>Aktif Pariteler:</b> {', '.join(sorted(valid_symbols))}\n"
             f"<b>Session Filter:</b> {'ON' if REQUIRE_SESSION_FILTER else 'OFF'}\n"
             f"<b>BTC Filter:</b> {'ON' if REQUIRE_BTC_CONFIRMATION else 'OFF'}\n"
@@ -1193,6 +1231,7 @@ def main():
                     continue
 
                 tickers_24h = get_24h_tickers()
+                books = get_orderbook_ticker()
                 btc_filter_info = market_regime_filter(BTC_CONFIRMATION_SYMBOL)
                 eth_filter_info = market_regime_filter(ETH_CONFIRMATION_SYMBOL)
 
@@ -1205,7 +1244,7 @@ def main():
                     if rules.get("allow_long", False):
                         if (not is_in_cooldown(state, symbol, "LONG")) and (not has_open_signal(state, symbol, "LONG")):
                             try:
-                                sig = scan_symbol_side(symbol, "LONG", tickers_24h, btc_filter_info, eth_filter_info)
+                                sig = scan_symbol_side(symbol, "LONG", tickers_24h, books, btc_filter_info, eth_filter_info)
                                 if sig:
                                     candidates.append(sig)
                             except Exception as e:
@@ -1214,7 +1253,7 @@ def main():
                     if rules.get("allow_short", False):
                         if (not is_in_cooldown(state, symbol, "SHORT")) and (not has_open_signal(state, symbol, "SHORT")):
                             try:
-                                sig = scan_symbol_side(symbol, "SHORT", tickers_24h, btc_filter_info, eth_filter_info)
+                                sig = scan_symbol_side(symbol, "SHORT", tickers_24h, books, btc_filter_info, eth_filter_info)
                                 if sig:
                                     candidates.append(sig)
                             except Exception as e:
