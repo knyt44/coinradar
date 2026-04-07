@@ -1,13 +1,12 @@
 # =========================================================
-# ETH + USDT.D PRO SIGNAL BOT V3
-# MEXC REST + CoinGecko Global
+# ETH + USDT.D PRO SIGNAL BOT V4
+# MEXC REST + CoinGecko
 # Railway friendly / signal bot only
 # =========================================================
 
 import os
 import time
 import json
-import math
 import traceback
 from datetime import datetime, timezone
 
@@ -32,55 +31,53 @@ ENTRY_TF = "5m"
 HTTP_TIMEOUT = 15
 CHECK_EVERY_SECONDS = 30
 
-STATE_FILE = "eth_usdtd_v3_state.json"
-LOG_PREFIX = "[ETH-USDTD-V3]"
+STATE_FILE = "eth_usdtd_v4_state.json"
+LOG_PREFIX = "[ETH-USDTD-V4]"
 
-# ----- indicator settings
+# ---- indicator settings
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
 RSI_PERIOD = 14
 ATR_PERIOD = 14
-BREAKOUT_LOOKBACK = 20
+BREAKOUT_LOOKBACK = 15
 
-# ----- filters
-MIN_RSI_15M = 53.0
-MIN_RSI_5M = 51.0
-MIN_ATR_PCT = 0.0020
-MAX_ATR_PCT = 0.0180
-MAX_SPREAD_PCT = 0.12
-MIN_15M_VOL_RATIO = 0.95
-ENTRY_BUFFER_PCT = 0.0012
-MAX_DISTANCE_FROM_EMA20_ATR = 2.1
+# ---- filters (V4 = hafif agresif)
+MIN_RSI_15M = 51.0
+MIN_RSI_5M = 49.0
+MIN_ATR_PCT = 0.0018
+MAX_ATR_PCT = 0.0220
+MAX_SPREAD_PCT = 0.18
+MIN_15M_VOL_RATIO = 0.88
+ENTRY_BUFFER_PCT = 0.0008
+MAX_DISTANCE_FROM_EMA20_ATR = 2.8
 
-# ----- usdt.d rolling filter
-USDTD_HISTORY_MAX = 600
-USDTD_MIN_POINTS_FOR_SIGNAL = 8
+# ---- usdt.d rolling filter
+USDTD_HISTORY_MAX = 800
+USDTD_MIN_POINTS_FOR_SIGNAL = 6
 USDTD_LOOKBACK_SHORT_MIN = 10
 USDTD_LOOKBACK_LONG_MIN = 45
-MAX_USDTD_SHORT_RISE = 0.030   # +0.03 puan üstü riskli
-MAX_USDTD_LONG_RISE = 0.090    # +0.09 puan üstü riskli
-GOOD_USDTD_DROP = -0.020       # düşüyorsa ekstra pozitif
+MAX_USDTD_SHORT_RISE = 0.045
+MAX_USDTD_LONG_RISE = 0.120
+GOOD_USDTD_DROP = -0.020
 
-# ----- trade / lifecycle
-SIGNAL_COOLDOWN_MIN = 45
+# ---- trade / lifecycle
+SIGNAL_COOLDOWN_MIN = 35
 MAX_TRADE_AGE_HOURS = 18
 HEARTBEAT_MIN = 180
 
-# ----- targets
+# ---- targets
 SL_ATR = 1.10
 TP1_ATR = 1.20
-TP2_ATR = 2.10
-TP3_ATR = 3.20
-MIN_RR_TO_TP2 = 1.35
+TP2_ATR = 2.20
+TP3_ATR = 3.40
+MIN_RR_TO_TP2 = 1.45
 
 # =========================================================
 # SESSION
 # =========================================================
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0"
-})
+session.headers.update({"User-Agent": "Mozilla/5.0"})
 
 # =========================================================
 # RUNTIME STATE
@@ -88,7 +85,7 @@ session.headers.update({
 ACTIVE_TRADE = None
 LAST_SIGNAL_TS = 0
 LAST_HEARTBEAT_TS = 0
-USDTD_HISTORY = []  # [{"ts": int, "value": float}]
+USDTD_HISTORY = []
 
 # =========================================================
 # UTILS
@@ -117,11 +114,6 @@ def round_price(x):
     if x >= 1:
         return round(x, 4)
     return round(x, 6)
-
-def pct(a, b):
-    if not a:
-        return 0.0
-    return ((b - a) / a) * 100.0
 
 def save_state():
     state = {
@@ -192,17 +184,11 @@ def mexc_klines(symbol, interval, limit=300):
     )
 
 def mexc_price(symbol):
-    data = http_get(
-        f"{MEXC_BASE}/api/v3/ticker/price",
-        params={"symbol": symbol}
-    )
+    data = http_get(f"{MEXC_BASE}/api/v3/ticker/price", params={"symbol": symbol})
     return safe_float(data["price"])
 
 def mexc_book_ticker(symbol):
-    return http_get(
-        f"{MEXC_BASE}/api/v3/ticker/bookTicker",
-        params={"symbol": symbol}
-    )
+    return http_get(f"{MEXC_BASE}/api/v3/ticker/bookTicker", params={"symbol": symbol})
 
 def get_usdt_d():
     data = http_get(COINGECKO_GLOBAL_URL)
@@ -263,13 +249,8 @@ def atr(kl, period=14):
         trs.append(tr)
     return sum(trs[-period:]) / period
 
-def highest(vals, lookback):
-    if len(vals) < lookback:
-        return None
-    return max(vals[-lookback:])
-
 # =========================================================
-# USDT.D ROLLING MEMORY
+# USDT.D MEMORY
 # =========================================================
 def update_usdtd_history():
     global USDTD_HISTORY
@@ -291,15 +272,14 @@ def get_history_value_minutes_ago(minutes):
     if not USDTD_HISTORY:
         return None
     target = now_ts() - (minutes * 60)
-    best = None
     for x in reversed(USDTD_HISTORY):
         if x["ts"] <= target:
-            best = x
-            break
-    return best["value"] if best else None
+            return x["value"]
+    return None
 
 def usdtd_bias():
     current = USDTD_HISTORY[-1]["value"] if USDTD_HISTORY else None
+
     if current is None or len(USDTD_HISTORY) < USDTD_MIN_POINTS_FOR_SIGNAL:
         return {
             "ready": False,
@@ -358,8 +338,8 @@ def analyze_market():
     c15 = closes(kl15)
     h15 = highs(kl15)
     v15 = volumes(kl15)
+
     c5 = closes(kl5)
-    v5 = volumes(kl5)
 
     last15 = c15[-1]
     last5 = c5[-1]
@@ -385,9 +365,19 @@ def analyze_market():
         last15 > ema20_15 > ema50_15 > ema200_15
     )
 
+    early_trend_ok = (
+        ema20_15 and ema50_15 and ema200_15 and
+        last15 > ema20_15 > ema50_15 and last15 > ema200_15
+    )
+
     entry_ok = (
         ema20_5 and ema50_5 and
         last5 > ema20_5 and ema20_5 >= ema50_5
+    )
+
+    pullback_entry_ok = (
+        ema20_5 and ema50_5 and
+        last5 >= ema20_5 * 0.999 and ema20_5 >= ema50_5
     )
 
     vol15_now = v15[-1]
@@ -404,8 +394,12 @@ def analyze_market():
 
     score = 0
     if trend_ok: score += 3
+    elif early_trend_ok: score += 2
+
     if breakout_ok: score += 2
     if entry_ok: score += 2
+    elif pullback_entry_ok: score += 1
+
     if rsi15 and rsi15 >= MIN_RSI_15M: score += 2
     if rsi5 and rsi5 >= MIN_RSI_5M: score += 1
     if vol_ok: score += 1
@@ -413,10 +407,22 @@ def analyze_market():
     if not_extended: score += 1
     if MIN_ATR_PCT <= atr_pct_15 <= MAX_ATR_PCT: score += 1
 
+    aggressive_ok = (
+        early_trend_ok and
+        (entry_ok or pullback_entry_ok) and
+        spread_ok and
+        vol_ok and
+        not_extended and
+        rsi15 is not None and rsi15 >= MIN_RSI_15M and
+        rsi5 is not None and rsi5 >= MIN_RSI_5M
+    )
+
     return {
         "price": last5,
         "trend_ok": trend_ok,
+        "early_trend_ok": early_trend_ok,
         "entry_ok": entry_ok,
+        "pullback_entry_ok": pullback_entry_ok,
         "breakout_ok": breakout_ok,
         "vol_ok": vol_ok,
         "spread_ok": spread_ok,
@@ -427,9 +433,7 @@ def analyze_market():
         "atr15": atr15,
         "atr_pct_15": atr_pct_15,
         "spread_pct": spread_pct,
-        "ema20_15": ema20_15,
-        "ema50_15": ema50_15,
-        "ema200_15": ema200_15
+        "aggressive_ok": aggressive_ok
     }
 
 def build_signal():
@@ -446,9 +450,21 @@ def build_signal():
 
     m = analyze_market()
 
-    if m["score"] < 10:
-        return None
-    if not (m["trend_ok"] and m["entry_ok"] and m["spread_ok"] and m["vol_ok"]):
+    standard_ok = (
+        m["score"] >= 9 and
+        m["spread_ok"] and
+        m["vol_ok"] and
+        (m["trend_ok"] or m["early_trend_ok"]) and
+        (m["entry_ok"] or m["pullback_entry_ok"])
+    )
+
+    aggressive_ok = (
+        m["score"] >= 8 and
+        m["aggressive_ok"] and
+        us["strong_bullish"]
+    )
+
+    if not (standard_ok or aggressive_ok):
         return None
 
     entry = m["price"]
@@ -463,6 +479,8 @@ def build_signal():
     if rr_tp2 < MIN_RR_TO_TP2:
         return None
 
+    mode = "AGRESIF" if aggressive_ok and not standard_ok else "STANDART"
+
     return {
         "symbol": SYMBOL,
         "side": "LONG",
@@ -473,6 +491,7 @@ def build_signal():
         "tp3": round_price(tp3),
         "atr": round_price(atrv),
         "score": m["score"],
+        "mode": mode,
         "rsi15": round(m["rsi15"], 2) if m["rsi15"] is not None else None,
         "rsi5": round(m["rsi5"], 2) if m["rsi5"] is not None else None,
         "spread_pct": round(m["spread_pct"], 4) if m["spread_pct"] is not None else None,
@@ -493,7 +512,7 @@ def build_signal():
 # =========================================================
 def startup_message():
     return (
-        f"<b>🟢 BOT AKTİF V3</b>\n\n"
+        f"<b>🟢 BOT AKTİF V4</b>\n\n"
         f"<b>Coin:</b> {SYMBOL}\n"
         f"<b>Trend TF:</b> {TREND_TF}\n"
         f"<b>Entry TF:</b> {ENTRY_TF}\n"
@@ -517,9 +536,10 @@ def signal_message(t):
         us_txt += " / GÜÇLÜ"
 
     return (
-        f"<b>🚀 ETH LONG SIGNAL V3</b>\n\n"
+        f"<b>🚀 ETH LONG SIGNAL V4</b>\n\n"
         f"<b>Coin:</b> {t['symbol']}\n"
         f"<b>Yön:</b> {t['side']}\n"
+        f"<b>Mod:</b> {t['mode']}\n"
         f"<b>Giriş:</b> {t['entry']}\n"
         f"<b>Stop:</b> {t['sl']}\n\n"
         f"<b>TP1:</b> {t['tp1']}\n"
@@ -545,7 +565,7 @@ def tp1_message(t, p):
         f"<b>Fiyat:</b> {round_price(p)}\n"
         f"<b>TP1:</b> {t['tp1']}\n"
         f"<b>Yeni Stop:</b> {t['sl']}\n\n"
-        f"Risk sıfırlandı. Stop artık <b>ENTRY</b> seviyesinde.\n"
+        f"Stop artık <b>ENTRY</b> seviyesine çekildi.\n"
         f"Trade açık, TP2 ve TP3 takip ediliyor."
     )
 
@@ -666,7 +686,6 @@ def maybe_signal():
     save_state()
 
 def warmup_usdtd():
-    # İlk açılışta biraz history toplasın
     for _ in range(3):
         update_usdtd_history()
         save_state()
@@ -685,7 +704,10 @@ def main():
         log(f"MEXC bağlantı hata: {e}")
 
     warmup_usdtd()
+
     tg(startup_message())
+    LAST_HEARTBEAT_TS = now_ts()
+    save_state()
 
     while True:
         try:
