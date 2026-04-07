@@ -1,15 +1,13 @@
 import os
 import time
-import math
 import json
 import requests
 from statistics import mean
 
 # ============================================================
 # ETH + USDT.D SCENARIO TELEGRAM BOT
-# Minimal dependency: requests
-# Public market data from Binance Futures
-# Telegram via Bot API
+# SPOT API VERSION
+# Tek parça, sade, requests dışında ek kütüphane yok
 # ============================================================
 
 # -----------------------------
@@ -21,29 +19,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 POLL_SECONDS = 3
 STATE_FILE = "eth_usdtd_bot_state.json"
 
-BINANCE_FAPI_BASE = "https://fapi.binance.com"
-HTTP_TIMEOUT = 15
+BINANCE_BASE = "https://api.binance.com"
+HTTP_TIMEOUT = 20
 
 ETH_SYMBOL = "ETHUSDT"
 BTC_SYMBOL = "BTCUSDT"
 INTERVAL = "30m"
 KLINE_LIMIT = 220
 
-# USDT.D -> ETH scenario coefficients
-# NOTE:
-# These are model assumptions, not guaranteed market truth.
-# Meaning:
-# If USDT.D changes by -0.10 percentage point:
-# weak/base/strong ETH reaction scenarios differ by regime.
+# USDT.D -> ETH senaryo katsayıları
+# Bu bölüm model varsayımıdır, kesin piyasa gerçeği değildir.
 DOM_BETA_WEAK = -0.80
 DOM_BETA_BASE = -1.20
 DOM_BETA_STRONG = -1.80
 
-# Cooldown for repeated identical replies
-REPLY_COOLDOWN_SECONDS = 5
+REPLY_COOLDOWN_SECONDS = 2
 
 # -----------------------------
-# HELPERS
+# STATE
 # -----------------------------
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -58,9 +51,15 @@ def load_state():
     }
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
+# -----------------------------
+# HTTP
+# -----------------------------
 def http_get(url, params=None):
     r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -71,7 +70,8 @@ def tg_send_message(text):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML"
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
     r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
@@ -79,37 +79,33 @@ def tg_send_message(text):
 
 def tg_get_updates(offset=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {
-        "timeout": 20
-    }
+    params = {"timeout": 20}
     if offset is not None:
         params["offset"] = offset
     r = requests.get(url, params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
-def chunk_to_float(x):
-    return float(x)
-
 # -----------------------------
-# BINANCE DATA
+# BINANCE SPOT DATA
 # -----------------------------
 def get_mark_price(symbol):
     data = http_get(
-        f"{BINANCE_FAPI_BASE}/fapi/v1/premiumIndex",
+        f"{BINANCE_BASE}/api/v3/ticker/price",
         params={"symbol": symbol}
     )
-    return float(data["markPrice"])
+    return float(data["price"])
 
 def get_klines(symbol, interval="30m", limit=220):
     data = http_get(
-        f"{BINANCE_FAPI_BASE}/fapi/v1/klines",
+        f"{BINANCE_BASE}/api/v3/klines",
         params={
             "symbol": symbol,
             "interval": interval,
             "limit": limit
         }
     )
+
     klines = []
     for row in data:
         klines.append({
@@ -145,6 +141,7 @@ def true_range(curr_high, curr_low, prev_close):
 def atr(klines, period=14):
     if len(klines) < period + 1:
         return None
+
     trs = []
     for i in range(1, len(klines)):
         tr = true_range(
@@ -153,13 +150,21 @@ def atr(klines, period=14):
             klines[i - 1]["close"]
         )
         trs.append(tr)
+
     if len(trs) < period:
         return None
+
     return mean(trs[-period:])
 
+# -----------------------------
+# MARKET CONTEXT
+# -----------------------------
 def calc_market_context():
     eth_klines = get_klines(ETH_SYMBOL, INTERVAL, KLINE_LIMIT)
     btc_klines = get_klines(BTC_SYMBOL, INTERVAL, KLINE_LIMIT)
+
+    if not eth_klines or not btc_klines:
+        raise RuntimeError("Piyasa verisi alınamadı.")
 
     eth_closes = [x["close"] for x in eth_klines]
     btc_closes = [x["close"] for x in btc_klines]
@@ -177,7 +182,6 @@ def calc_market_context():
     if eth_ema20 is None or eth_ema50 is None or btc_ema20 is None or btc_ema50 is None or eth_atr is None:
         raise RuntimeError("İndikatör hesaplamak için veri yetersiz.")
 
-    # ETH trend
     if eth_price > eth_ema20 > eth_ema50:
         eth_trend = "GÜÇLÜ YUKARI"
     elif eth_price > eth_ema20 and eth_ema20 >= eth_ema50:
@@ -189,19 +193,14 @@ def calc_market_context():
     else:
         eth_trend = "KARIŞIK"
 
-    # BTC regime
     if btc_price > btc_ema20 > btc_ema50:
         btc_regime = "RISK-ON"
-        regime_strength = "strong"
     elif btc_price > btc_ema20:
         btc_regime = "POZİTİF"
-        regime_strength = "base"
     elif btc_price < btc_ema20 < btc_ema50:
         btc_regime = "RISK-OFF"
-        regime_strength = "weak"
     else:
         btc_regime = "NÖTR"
-        regime_strength = "base"
 
     return {
         "eth_price": eth_price,
@@ -212,8 +211,7 @@ def calc_market_context():
         "btc_ema50": btc_ema50,
         "eth_atr": eth_atr,
         "eth_trend": eth_trend,
-        "btc_regime": btc_regime,
-        "regime_strength": regime_strength
+        "btc_regime": btc_regime
     }
 
 # -----------------------------
@@ -221,10 +219,13 @@ def calc_market_context():
 # -----------------------------
 def pct_change_from_dom_change(dom_current, dom_target, beta):
     """
-    beta = ETH % move / 1.00 absolute USDT.D point move
-    Example:
-    dom 7.922 -> 7.908 means delta = -0.014
-    with beta -1.20 => ETH expected move = (-0.014 * -1.20) = +0.0168 => +1.68%
+    Örnek:
+    dom_current = 7.922
+    dom_target  = 7.908
+    delta       = -0.014
+
+    beta = -1.20 ise:
+    beklenen ETH hareketi = (-0.014 * -1.20) * 100 = +1.68%
     """
     delta = dom_target - dom_current
     return delta * beta * 100.0
@@ -284,7 +285,12 @@ def build_scenario_text(dom_current, dom_target):
     stop, tp1, tp2, tp3 = stop_and_targets(eth_price, eth_atr, bias)
 
     dom_delta = dom_target - dom_current
-    direction = "DÜŞÜŞ" if dom_delta < 0 else ("YÜKSELİŞ" if dom_delta > 0 else "YATAY")
+    if dom_delta < 0:
+        direction = "DÜŞÜŞ"
+    elif dom_delta > 0:
+        direction = "YÜKSELİŞ"
+    else:
+        direction = "YATAY"
 
     msg = []
     msg.append("<b>ETH + USDT.D Senaryo Analizi</b>")
@@ -318,26 +324,17 @@ def build_scenario_text(dom_current, dom_target):
 
 def build_status_text():
     ctx = calc_market_context()
-    eth_price = ctx["eth_price"]
-    btc_price = ctx["btc_price"]
-    eth_ema20 = ctx["eth_ema20"]
-    eth_ema50 = ctx["eth_ema50"]
-    btc_ema20 = ctx["btc_ema20"]
-    btc_ema50 = ctx["btc_ema50"]
-    eth_atr = ctx["eth_atr"]
-    eth_trend = ctx["eth_trend"]
-    btc_regime = ctx["btc_regime"]
 
     msg = []
     msg.append("<b>Bot Durumu</b>")
     msg.append("")
-    msg.append(f"• ETH: <b>{eth_price:.2f}</b>")
-    msg.append(f"• BTC: <b>{btc_price:.2f}</b>")
-    msg.append(f"• ETH EMA20 / EMA50: <b>{eth_ema20:.2f} / {eth_ema50:.2f}</b>")
-    msg.append(f"• BTC EMA20 / EMA50: <b>{btc_ema20:.2f} / {btc_ema50:.2f}</b>")
-    msg.append(f"• ETH ATR(14,30m): <b>{eth_atr:.2f}</b>")
-    msg.append(f"• ETH trend: <b>{eth_trend}</b>")
-    msg.append(f"• BTC rejimi: <b>{btc_regime}</b>")
+    msg.append(f"• ETH: <b>{ctx['eth_price']:.2f}</b>")
+    msg.append(f"• BTC: <b>{ctx['btc_price']:.2f}</b>")
+    msg.append(f"• ETH EMA20 / EMA50: <b>{ctx['eth_ema20']:.2f} / {ctx['eth_ema50']:.2f}</b>")
+    msg.append(f"• BTC EMA20 / EMA50: <b>{ctx['btc_ema20']:.2f} / {ctx['btc_ema50']:.2f}</b>")
+    msg.append(f"• ETH ATR(14,30m): <b>{ctx['eth_atr']:.2f}</b>")
+    msg.append(f"• ETH trend: <b>{ctx['eth_trend']}</b>")
+    msg.append(f"• BTC rejimi: <b>{ctx['btc_regime']}</b>")
     msg.append("")
     msg.append("Komut: /senaryo 7.922 7.908")
     return "\n".join(msg)
@@ -354,13 +351,12 @@ def build_help_text():
     )
 
 # -----------------------------
-# COMMAND PARSER
+# COMMANDS
 # -----------------------------
 def parse_command(text):
     text = (text or "").strip()
     if not text:
         return None, []
-
     parts = text.split()
     cmd = parts[0].lower()
     args = parts[1:]
@@ -393,22 +389,19 @@ def handle_message(text):
     return "Bilinmeyen komut.\n/yardim yazarak komutları görebilirsin."
 
 # -----------------------------
-# MAIN LOOP
+# MAIN
 # -----------------------------
 def main():
     if "BURAYA_BOT_TOKEN" in TELEGRAM_BOT_TOKEN or "BURAYA_CHAT_ID" in TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "Önce TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID alanlarını doldur."
-        )
+        raise RuntimeError("Önce TELEGRAM_BOT_TOKEN ve TELEGRAM_CHAT_ID alanlarını doldur.")
 
     state = load_state()
     print("Bot başladı...")
 
-    # Initial test
     try:
         tg_send_message("✅ ETH + USDT.D senaryo botu başlatıldı.\nKomutlar için /yardim")
     except Exception as e:
-        print("Telegram test mesajı gönderilemedi:", e)
+        print("Telegram başlangıç mesajı gönderilemedi:", e)
         raise
 
     while True:
@@ -428,7 +421,7 @@ def main():
                     continue
 
                 chat_id = str(message.get("chat", {}).get("id", ""))
-                if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+                if str(chat_id) != str(TELEGRAM_CHAT_ID):
                     continue
 
                 text = message.get("text", "")
@@ -439,10 +432,18 @@ def main():
 
                 try:
                     reply = handle_message(text)
+                except requests.exceptions.HTTPError as e:
+                    reply = f"İşlem sırasında ağ hatası oluştu:\n{str(e)}"
+                except requests.exceptions.RequestException as e:
+                    reply = f"Bağlantı hatası oluştu:\n{str(e)}"
                 except Exception as e:
                     reply = f"İşlem sırasında hata oluştu:\n{str(e)}"
 
-                tg_send_message(reply)
+                try:
+                    tg_send_message(reply)
+                except Exception as send_err:
+                    print("Telegram mesaj gönderme hatası:", send_err)
+
                 state["last_reply_ts"] = now_ts
                 save_state(state)
 
