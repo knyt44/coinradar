@@ -80,7 +80,7 @@ ENTRY_NEAR_PCT = 0.12
 CANCEL_IF_TP1_BEFORE_ENTRY = True
 
 # ---------------------------------------------------------
-# PRO++ SMART RESEND / MESSAGE
+# PRO++ SMART RESEND
 # ---------------------------------------------------------
 RESEND_IF_SCORE_IMPROVED_BY = 1.0
 RESEND_IF_ENTRY_MOVED_PCT = 0.22
@@ -140,6 +140,14 @@ def fmt_price(v):
     except Exception:
         return str(v)
 
+def day_key_from_ts(ts):
+    return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
+
+def week_key_from_ts(ts):
+    dt = datetime.fromtimestamp(int(ts))
+    y, w, _ = dt.isocalendar()
+    return f"{y}-W{w:02d}"
+
 # =========================================================
 # TELEGRAM
 # =========================================================
@@ -152,7 +160,6 @@ def tg_send(text: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
 
@@ -166,6 +173,27 @@ def tg_send(text: str):
     except Exception as e:
         log(f"Telegram exception: {e}")
         return False
+
+def tg_get_updates(offset):
+    if not TELEGRAM_TOKEN:
+        return []
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {
+        "offset": offset,
+        "timeout": 1
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            return []
+        return data.get("result", [])
+    except Exception as e:
+        log(f"Telegram updates exception: {e}")
+        return []
 
 # =========================================================
 # HTTP
@@ -377,8 +405,19 @@ def lowest_low(candles, period):
     return min(x["low"] for x in candles[-period:])
 
 # =========================================================
-# STATE IO
+# STATE
 # =========================================================
+def default_stats():
+    return {
+        "total_signals": 0,
+        "wins": 0,
+        "losses": 0,
+        "tp1_hits": 0,
+        "tp2_hits": 0,
+        "tp3_hits": 0,
+        "stops": 0
+    }
+
 def default_state():
     return {
         "last_signal": None,
@@ -388,7 +427,9 @@ def default_state():
         "history": {
             "usdtd": []
         },
-        "manual_usdtd_override": None
+        "manual_usdtd_override": None,
+        "last_update_id": 0,
+        "stats": default_stats()
     }
 
 def load_state():
@@ -408,6 +449,12 @@ def load_state():
             data.setdefault("manual_usdtd_override", None)
             data.setdefault("history", {"usdtd": []})
             data["history"].setdefault("usdtd", [])
+            data.setdefault("last_update_id", 0)
+            data.setdefault("stats", default_stats())
+
+            for k, v in default_stats().items():
+                data["stats"].setdefault(k, v)
+
             return data
     except Exception as e:
         log(f"State load exception: {e}")
@@ -428,7 +475,12 @@ def append_usdtd_history(state, value):
     state["history"]["usdtd"] = hist[-USDTD_HISTORY_LIMIT:]
 
 def get_usdtd_values(state):
-    return [safe_float(x.get("value")) for x in state.get("history", {}).get("usdtd", []) if safe_float(x.get("value")) is not None]
+    values = []
+    for x in state.get("history", {}).get("usdtd", []):
+        val = safe_float(x.get("value"))
+        if val is not None:
+            values.append(val)
+    return values
 
 def get_usdtd_bias(state):
     if not USE_USDTD_FILTER:
@@ -473,12 +525,6 @@ def classify_signal_strength(score):
         return "ORTA"
     return "ZAYIF"
 
-def short_reason_text(reason, limit=180):
-    text = str(reason or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
-
 def build_signal_signature(sig):
     if not sig:
         return ""
@@ -506,10 +552,10 @@ def signal_upgrade_needed(old_sig, new_sig):
     entry_diff_pct = pct_diff(old_entry, new_entry) if old_entry else 999.0
 
     if score_diff >= RESEND_IF_SCORE_IMPROVED_BY:
-        return True, f"SCORE_UPGRADE:+{round(score_diff,2)}"
+        return True, f"SCORE_UPGRADE:+{round(score_diff, 2)}"
 
     if entry_diff_pct >= RESEND_IF_ENTRY_MOVED_PCT:
-        return True, f"ENTRY_SHIFT:{round(entry_diff_pct,3)}%"
+        return True, f"ENTRY_SHIFT:{round(entry_diff_pct, 3)}%"
 
     if RESEND_IF_REASON_CHANGED and old_reason != new_reason:
         return True, "REASON_CHANGED"
@@ -555,125 +601,186 @@ def format_signal_message(sig, current_price):
     direction = sig["direction"].upper()
     emoji = "🟢" if direction == "LONG" else "🔴"
 
-    entry = safe_float(sig.get("entry"), 0.0)
-    sl = safe_float(sig.get("sl"), 0.0)
-    tp1 = safe_float(sig.get("tp1"), 0.0)
-    tp2 = safe_float(sig.get("tp2"), 0.0)
-    tp3 = safe_float(sig.get("tp3"), 0.0)
-    score = safe_float(sig.get("score"), 0.0)
+    entry = sig["entry"]
+    sl = sig["sl"]
+    tp1 = sig["tp1"]
+    tp2 = sig["tp2"]
+    tp3 = sig["tp3"]
 
     risk = abs(entry - sl)
-    reward1 = abs(tp1 - entry)
-    reward2 = abs(tp2 - entry)
-    reward3 = abs(tp3 - entry)
+    reward = abs(tp2 - entry)
+    rr = reward / risk if risk > 0 else 0
 
-    rr1 = (reward1 / risk) if risk > 0 else 0.0
-    rr2 = (reward2 / risk) if risk > 0 else 0.0
-    rr3 = (reward3 / risk) if risk > 0 else 0.0
-
-    strength = classify_signal_strength(score)
+    strength = classify_signal_strength(sig["score"])
 
     return (
-        f"{emoji} <b>ETHUSDT {direction} SINYAL</b>\n\n"
-        f"<b>İşlem Gücü:</b> {strength}\n"
-        f"<b>Skor:</b> {score:.2f}\n"
-        f"<b>Kaynak:</b> MEXC\n"
-        f"<b>Anlık Fiyat:</b> {fmt_price(current_price)}\n\n"
-        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
-        f"<b>SL:</b> {fmt_price(sl)}\n"
-        f"<b>TP1:</b> {fmt_price(tp1)} | RR: {rr1:.2f}\n"
-        f"<b>TP2:</b> {fmt_price(tp2)} | RR: {rr2:.2f}\n"
-        f"<b>TP3:</b> {fmt_price(tp3)} | RR: {rr3:.2f}\n\n"
-        f"<b>Durum:</b> {'ACTIVE' if sig.get('active') else 'PENDING'}\n"
-        f"<b>Setup:</b> {sig.get('strategy_tag','-')}\n"
-        f"<b>Özet:</b> {short_reason_text(sig.get('reason',''))}\n"
-        f"<b>Zaman:</b> {now_str()}"
+        f"{emoji} ETHUSDT {direction}\n\n"
+        f"Entry: {fmt_price(entry)}\n"
+        f"SL: {fmt_price(sl)}\n\n"
+        f"TP1: {fmt_price(tp1)}\n"
+        f"TP2: {fmt_price(tp2)}\n"
+        f"TP3: {fmt_price(tp3)}\n\n"
+        f"RR: {rr:.2f}\n"
+        f"Güç: {strength}"
     )
 
 def format_upgraded_signal_message(old_sig, new_sig, current_price, upgrade_reason):
     direction = new_sig["direction"].upper()
-    emoji = "🟢" if direction == "LONG" else "🔴"
-
-    old_score = safe_float(old_sig.get("score"), 0.0)
-    new_score = safe_float(new_sig.get("score"), 0.0)
-    strength = classify_signal_strength(new_score)
-
-    entry = safe_float(new_sig.get("entry"), 0.0)
-    sl = safe_float(new_sig.get("sl"), 0.0)
-    tp1 = safe_float(new_sig.get("tp1"), 0.0)
-    tp2 = safe_float(new_sig.get("tp2"), 0.0)
-    tp3 = safe_float(new_sig.get("tp3"), 0.0)
-
-    risk = abs(entry - sl)
-    rr1 = abs(tp1 - entry) / risk if risk > 0 else 0.0
-    rr2 = abs(tp2 - entry) / risk if risk > 0 else 0.0
-    rr3 = abs(tp3 - entry) / risk if risk > 0 else 0.0
 
     return (
-        f"{emoji} <b>ETHUSDT {direction} SINYAL GUNCELLENDI</b>\n\n"
-        f"<b>İşlem Gücü:</b> {strength}\n"
-        f"<b>Skor:</b> {old_score:.2f} → {new_score:.2f}\n"
-        f"<b>Güncelleme Nedeni:</b> {upgrade_reason}\n"
-        f"<b>Anlık Fiyat:</b> {fmt_price(current_price)}\n\n"
-        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
-        f"<b>SL:</b> {fmt_price(sl)}\n"
-        f"<b>TP1:</b> {fmt_price(tp1)} | RR: {rr1:.2f}\n"
-        f"<b>TP2:</b> {fmt_price(tp2)} | RR: {rr2:.2f}\n"
-        f"<b>TP3:</b> {fmt_price(tp3)} | RR: {rr3:.2f}\n\n"
-        f"<b>Setup:</b> {new_sig.get('strategy_tag','-')}\n"
-        f"<b>Özet:</b> {short_reason_text(new_sig.get('reason',''))}\n"
-        f"<b>Zaman:</b> {now_str()}"
+        f"🔄 ETHUSDT {direction} (UPDATE)\n\n"
+        f"Skor: {old_sig['score']} → {new_sig['score']}\n"
+        f"Güç: {classify_signal_strength(new_sig['score'])}\n\n"
+        f"Entry: {fmt_price(new_sig['entry'])}\n"
+        f"SL: {fmt_price(new_sig['sl'])}\n\n"
+        f"TP1: {fmt_price(new_sig['tp1'])}\n"
+        f"TP2: {fmt_price(new_sig['tp2'])}\n"
+        f"TP3: {fmt_price(new_sig['tp3'])}"
     )
 
 def format_close_message(sig, close_reason, close_price=None):
-    direction_emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-    reason_map = {
-        "SL_HIT": "STOP ÇALIŞTI",
-        "TP3_HIT": "TP3 GÖRÜLDÜ",
-        "TIMEOUT": "SÜRE DOLDU",
-        "MAX_ACTIVE_AGE_EXCEEDED": "MAKSİMUM AKTİF SÜRE DOLDU",
-        "REVERSED_BY_STRONGER_SIGNAL": "DAHA GÜÇLÜ TERS SİNYAL GELDİ",
-        "CANCELLED_BEFORE_ENTRY_TP1": "ENTRY GELMEDEN TP1'E GİTTİ, SETUP İPTAL"
-    }
-    reason_text = reason_map.get(close_reason, close_reason)
+    if close_reason == "TP3_HIT":
+        return "🏁 TP3 HIT\n\nTrade tamamlandı"
+    if close_reason == "SL_HIT":
+        return "❌ STOP\n\nTrade kapandı"
+    if close_reason == "TIMEOUT":
+        return "⌛ TIMEOUT\n\nSinyal süresi doldu"
+    if close_reason == "CANCELLED_BEFORE_ENTRY_TP1":
+        return "⚠️ SETUP İPTAL\n\nEntry gelmeden TP1 oldu"
+    if close_reason == "REVERSED_BY_STRONGER_SIGNAL":
+        return "↩️ TERS SİNYAL\n\nDaha güçlü ters sinyal geldi"
+    return "Trade kapandı"
 
-    body = (
-        f"✅ <b>ETHUSDT SİNYAL KAPANDI</b>\n\n"
-        f"<b>Yön:</b> {direction_emoji} {sig['direction']}\n"
-        f"<b>İşlem Gücü:</b> {classify_signal_strength(sig.get('score'))}\n"
-        f"<b>Entry:</b> {fmt_price(sig.get('entry'))}\n"
-        f"<b>SL:</b> {fmt_price(sig.get('sl'))}\n"
-        f"<b>TP1:</b> {fmt_price(sig.get('tp1'))}\n"
-        f"<b>TP2:</b> {fmt_price(sig.get('tp2'))}\n"
-        f"<b>TP3:</b> {fmt_price(sig.get('tp3'))}\n"
-        f"<b>Kapanış Nedeni:</b> {reason_text}\n"
-    )
+def format_active_signal(sig):
+    if not sig:
+        return "Aktif işlem yok."
 
-    if close_price is not None:
-        body += f"<b>Kapanış Fiyatı:</b> {fmt_price(close_price)}\n"
+    risk = abs(sig["entry"] - sig["sl"])
+    reward = abs(sig["tp2"] - sig["entry"])
+    rr = reward / risk if risk > 0 else 0.0
 
-    body += (
-        f"<b>Skor:</b> {safe_float(sig.get('score'), 0.0):.2f}\n"
-        f"<b>Zaman:</b> {now_str()}"
-    )
-    return body
-
-def format_be_message(sig):
+    filled = "EVET" if sig.get("active") else "BEKLIYOR"
     return (
-        f"🛡️ <b>BE AKTİF</b>\n\n"
-        f"<b>Yön:</b> {sig['direction']}\n"
-        f"<b>Yeni Stop:</b> {fmt_price(sig['sl'])}\n"
-        f"<b>Zaman:</b> {now_str()}"
+        f"📌 AKTIF İSLEM\n\n"
+        f"Yön: {sig['direction']}\n"
+        f"Durum: {filled}\n"
+        f"Güç: {classify_signal_strength(sig.get('score'))}\n\n"
+        f"Entry: {fmt_price(sig['entry'])}\n"
+        f"SL: {fmt_price(sig['sl'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}\n"
+        f"TP2: {fmt_price(sig['tp2'])}\n"
+        f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        f"RR: {rr:.2f}"
     )
 
-def format_tp2_trailing_message(sig, current_price):
+def format_panel(state):
+    stats = state.get("stats", default_stats())
+    total = int(stats.get("total_signals", 0))
+    wins = int(stats.get("wins", 0))
+    losses = int(stats.get("losses", 0))
+
+    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+
     return (
-        f"🎯 <b>TP2 GELDİ - TRAILING AKTİF</b>\n\n"
-        f"<b>Yön:</b> {sig['direction']}\n"
-        f"<b>Fiyat:</b> {fmt_price(current_price)}\n"
-        f"<b>Trail Stop:</b> {fmt_price(sig['trail_stop'])}\n"
-        f"<b>Zaman:</b> {now_str()}"
+        f"📊 BOT PANEL\n\n"
+        f"Toplam Sinyal: {total}\n"
+        f"Kazanan: {wins}\n"
+        f"Kaybeden: {losses}\n"
+        f"Win Rate: %{win_rate:.1f}\n\n"
+        f"TP1 Hit: {int(stats.get('tp1_hits', 0))}\n"
+        f"TP2 Hit: {int(stats.get('tp2_hits', 0))}\n"
+        f"TP3 Hit: {int(stats.get('tp3_hits', 0))}\n"
+        f"STOP: {int(stats.get('stops', 0))}"
     )
+
+def aggregate_period_summary(state, period="daily"):
+    history = state.get("signal_history", [])
+    now = utc_ts()
+
+    if period == "daily":
+        key = day_key_from_ts(now)
+        title = "📅 GÜNLÜK ÖZET"
+        match_fn = lambda ts: day_key_from_ts(ts) == key
+    else:
+        key = week_key_from_ts(now)
+        title = "📈 HAFTALIK ÖZET"
+        match_fn = lambda ts: week_key_from_ts(ts) == key
+
+    total = 0
+    wins = 0
+    losses = 0
+    tp1 = 0
+    tp2 = 0
+    tp3 = 0
+    stops = 0
+
+    for sig in history:
+        closed_ts = sig.get("closed_ts")
+        if not closed_ts:
+            continue
+        if not match_fn(int(closed_ts)):
+            continue
+
+        total += 1
+        if sig.get("tp1_hit"):
+            tp1 += 1
+        if sig.get("tp2_hit"):
+            tp2 += 1
+        if sig.get("tp3_hit"):
+            tp3 += 1
+
+        reason = sig.get("close_reason")
+        if reason == "TP3_HIT":
+            wins += 1
+        elif reason == "SL_HIT":
+            losses += 1
+            stops += 1
+
+    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+
+    return (
+        f"{title}\n\n"
+        f"Toplam Sinyal: {total}\n"
+        f"Kazanan: {wins}\n"
+        f"Kaybeden: {losses}\n"
+        f"Win Rate: %{win_rate:.1f}\n\n"
+        f"TP1: {tp1}\n"
+        f"TP2: {tp2}\n"
+        f"TP3: {tp3}\n"
+        f"STOP: {stops}"
+    )
+
+def help_text():
+    return (
+        "🤖 KOMUTLAR\n\n"
+        "/panel\n"
+        "/gunluk\n"
+        "/haftalik\n"
+        "/aktif\n"
+        "/yardim"
+    )
+
+# =========================================================
+# STATS
+# =========================================================
+def update_stats_for_closed_signal(state, sig):
+    stats = state.setdefault("stats", default_stats())
+
+    stats["total_signals"] = int(stats.get("total_signals", 0)) + 1
+
+    if sig.get("tp1_hit"):
+        stats["tp1_hits"] = int(stats.get("tp1_hits", 0)) + 1
+    if sig.get("tp2_hit"):
+        stats["tp2_hits"] = int(stats.get("tp2_hits", 0)) + 1
+    if sig.get("tp3_hit"):
+        stats["tp3_hits"] = int(stats.get("tp3_hits", 0)) + 1
+
+    reason = sig.get("close_reason")
+    if reason == "TP3_HIT":
+        stats["wins"] = int(stats.get("wins", 0)) + 1
+    elif reason == "SL_HIT":
+        stats["losses"] = int(stats.get("losses", 0)) + 1
+        stats["stops"] = int(stats.get("stops", 0)) + 1
 
 # =========================================================
 # ACTIVE SIGNAL MGMT
@@ -694,6 +801,7 @@ def close_active_signal(state, close_reason, current_price=None, notify_telegram
         tg_send(format_close_message(active, close_reason, current_price))
 
     state["signal_history"].append(active)
+    update_stats_for_closed_signal(state, active)
     state["active_signal"] = None
     log(f"Aktif sinyal kapatildi: {close_reason}")
 
@@ -811,11 +919,8 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             active["status"] = "OPEN"
             active["updated_ts"] = utc_ts()
             tg_send(
-                f"✅ <b>ENTRY FILLED</b>\n\n"
-                f"<b>Yön:</b> {active['direction']}\n"
-                f"<b>Entry:</b> {fmt_price(active['entry'])}\n"
-                f"<b>Güncel Fiyat:</b> {fmt_price(current_price)}\n"
-                f"<b>Zaman:</b> {now_str()}"
+                f"✅ ENTRY FILLED\n\n"
+                f"{active['direction']} @ {fmt_price(active['entry'])}"
             )
             return
 
@@ -836,14 +941,7 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             active["trail_stop"] = round(float(active["entry"]), 4)
             active["breakeven_done"] = True
             active["updated_ts"] = utc_ts()
-            tg_send(
-                f"✅ <b>TP1 GELDİ</b>\n\n"
-                f"<b>Yön:</b> {active['direction']}\n"
-                f"<b>Fiyat:</b> {fmt_price(current_price)}\n"
-                f"<b>TP1:</b> {fmt_price(active['tp1'])}\n"
-                f"<b>Zaman:</b> {now_str()}"
-            )
-            tg_send(format_be_message(active))
+            tg_send("🎯 TP1 HIT\n\nBE aktif (risk sıfır)")
 
     if not active.get("tp2_hit") and is_tp2_hit(active, current_price):
         active["tp2_hit"] = True
@@ -851,7 +949,7 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
         if atr_now is not None and atr_now > 0:
             update_trailing_stop(active, current_price, atr_now)
         active["updated_ts"] = utc_ts()
-        tg_send(format_tp2_trailing_message(active, current_price))
+        tg_send("🚀 TP2 HIT\n\nTrailing aktif")
 
     if active.get("trail_active"):
         changed = update_trailing_stop(active, current_price, atr_now)
@@ -1202,12 +1300,55 @@ def build_trade_signal(state):
     return best, current_price, f"SIGNAL_READY | long={round(long_score, 2)} short={round(short_score, 2)}", atr5
 
 # =========================================================
+# COMMANDS
+# =========================================================
+def handle_command(state, text):
+    text = (text or "").strip().lower()
+
+    if text in ("/yardim", "/help", "/start"):
+        return help_text()
+
+    if text == "/panel":
+        return format_panel(state)
+
+    if text == "/gunluk":
+        return aggregate_period_summary(state, "daily")
+
+    if text == "/haftalik":
+        return aggregate_period_summary(state, "weekly")
+
+    if text == "/aktif":
+        return format_active_signal(state.get("active_signal"))
+
+    return None
+
+def process_telegram_commands(state):
+    updates = tg_get_updates(int(state.get("last_update_id", 0)) + 1)
+
+    for upd in updates:
+        state["last_update_id"] = upd.get("update_id", state.get("last_update_id", 0))
+
+        msg = upd.get("message") or upd.get("edited_message") or {}
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+
+        if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+            continue
+
+        text = msg.get("text", "")
+        reply = handle_command(state, text)
+        if reply:
+            tg_send(reply)
+
+# =========================================================
 # MAIN LOOP
 # =========================================================
 def run_once():
     state = load_state()
 
     try:
+        process_telegram_commands(state)
+
         current_price = get_last_price(SYMBOL)
 
         atr_now = None
@@ -1278,12 +1419,10 @@ def run_once():
 def send_startup_message():
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            f"🤖 <b>ETH MEXC SuperBot PRO++ başladı</b>\n\n"
-            f"<b>Zaman:</b> {now_str()}\n"
-            f"<b>Sembol:</b> {SYMBOL}\n"
-            f"<b>Kaynak:</b> MEXC Spot\n"
-            f"<b>Filtre:</b> BTC + USDT.D\n"
-            f"<b>TP Yönetimi:</b> TP1→BE / TP2→Trailing / TP3→Close"
+            "🤖 CoinRadar PRO++ başladı\n\n"
+            "Kaynak: MEXC Spot\n"
+            "Filtre: BTC + USDT.D\n"
+            "Komutlar: /panel /gunluk /haftalik /aktif /yardim"
         )
         log("Başlangıç mesajı gönderildi.")
     else:
