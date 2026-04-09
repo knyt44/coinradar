@@ -887,7 +887,7 @@ def get_btc_filter_bias():
 def build_trade_signal(state):
     candles_15m = get_klines(SYMBOL, "15m", 200)
     candles_5m = get_klines(SYMBOL, "5m", 200)
-    candles_1h = get_klines(SYMBOL, "1h", 150)
+    candles_1h = get_klines(SYMBOL, "60m", 150)
 
     tf15 = analyze_timeframe(candles_15m)
     tf5 = analyze_timeframe(candles_5m)
