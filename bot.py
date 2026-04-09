@@ -1,39 +1,62 @@
 import os
 import time
 import json
+import math
 import requests
 from statistics import mean
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", ""))
+# =========================================================
+# AYARLAR
+# =========================================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
 
 STATE_FILE = "state.json"
-POLL_SECONDS = 30
 HTTP_TIMEOUT = 20
+POLL_SECONDS = 20
+AUTO_SCAN_INTERVAL_SECONDS = 180
+SIGNAL_COOLDOWN_SECONDS = 3600
 
 ETH_SYMBOL = "ETHUSDT"
 BTC_SYMBOL = "BTCUSDT"
-
-AUTO_SCAN_INTERVAL_SECONDS = 300
-SIGNAL_COOLDOWN_SECONDS = 3600
-CG_CACHE_TTL_SECONDS = 180
+TIMEFRAME = "30m"
+KLINE_LIMIT = 220
 
 ETH_FAST_EMA = 20
 ETH_SLOW_EMA = 50
 BTC_FAST_EMA = 20
 BTC_SLOW_EMA = 50
+USDTD_FAST_EMA = 6
+USDTD_SLOW_EMA = 18
 ATR_PERIOD = 14
 
-MARKET_FAST_EMA = 6
-MARKET_SLOW_EMA = 18
-HISTORY_LIMIT = 240
+# Risk / hedef
+SL_ATR_MULT = 1.20
+TP1_ATR_MULT = 1.10
+TP2_ATR_MULT = 2.00
+TP3_ATR_MULT = 3.10
+TRAIL_AFTER_TP2_ATR = 1.05
 
-CG_IDS = "bitcoin,ethereum,tether"
-TRAIL_AFTER_TP2_ATR = 1.1
+# USDT dominance proxy cache
+CG_CACHE_TTL_SECONDS = 180
+USDTD_HISTORY_LIMIT = 240
 
-
+# =========================================================
+# YARDIMCI
+# =========================================================
 def log(msg):
-    print(msg, flush=True)
+    print(f"[LOG] {msg}", flush=True)
+
+
+def now_ts():
+    return int(time.time())
+
+
+def safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
 def load_state():
@@ -42,7 +65,7 @@ def load_state():
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
         except Exception as e:
-            log(f"STATE OKUMA HATASI: {e}")
+            log(f"STATE okuma hatasi: {e}")
             state = {}
     else:
         state = {}
@@ -55,11 +78,7 @@ def load_state():
     state.setdefault("last_signal_hash", "")
     state.setdefault("manual_usdtd_override", None)
     state.setdefault("cg_cache", {})
-    state.setdefault("history", {
-        "usdtd": [],
-        "total": [],
-        "total3": []
-    })
+    state.setdefault("history", {"usdtd": []})
     state.setdefault("active_trade", None)
     return state
 
@@ -69,14 +88,22 @@ def save_state(state):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log(f"STATE YAZMA HATASI: {e}")
+        log(f"STATE yazma hatasi: {e}")
 
 
-def tg_send(msg):
+# =========================================================
+# TELEGRAM
+# =========================================================
+def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN bos")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID bos")
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
+        "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
@@ -90,7 +117,11 @@ def tg_send(msg):
 
 def tg_updates(offset):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    r = requests.get(url, params={"offset": offset, "timeout": 20}, timeout=30)
+    r = requests.get(
+        url,
+        params={"offset": offset, "timeout": 20},
+        timeout=30
+    )
     r.raise_for_status()
     data = r.json()
     if not data.get("ok"):
@@ -98,33 +129,36 @@ def tg_updates(offset):
     return data
 
 
-# -------------------------------------------------
-# FIYAT VERISI: BINANCE -> BYBIT -> OKX FALLBACK
-# -------------------------------------------------
-def get_binance(symbol):
+# =========================================================
+# PİYASA VERİSİ
+# Önce Binance, olmazsa Bybit fallback
+# =========================================================
+def get_binance_klines(symbol, interval=TIMEFRAME, limit=KLINE_LIMIT):
     url = "https://api.binance.com/api/v3/klines"
     r = requests.get(
         url,
-        params={"symbol": symbol, "interval": "30m", "limit": 220},
+        params={"symbol": symbol, "interval": interval, "limit": limit},
         timeout=HTTP_TIMEOUT
     )
     r.raise_for_status()
-    data = r.json()
-    closes = [float(x[4]) for x in data]
-    highs = [float(x[2]) for x in data]
-    lows = [float(x[3]) for x in data]
-    return closes, highs, lows
+    rows = r.json()
+    if not isinstance(rows, list) or len(rows) < 60:
+        raise RuntimeError("Binance veri yetersiz")
+    closes = [float(x[4]) for x in rows]
+    highs = [float(x[2]) for x in rows]
+    lows = [float(x[3]) for x in rows]
+    return closes, highs, lows, "BINANCE"
 
 
-def get_bybit(symbol):
+def get_bybit_klines(symbol, interval="30", limit=KLINE_LIMIT):
     url = "https://api.bybit.com/v5/market/kline"
     r = requests.get(
         url,
         params={
             "category": "linear",
             "symbol": symbol,
-            "interval": "30",
-            "limit": 220
+            "interval": interval,
+            "limit": limit
         },
         timeout=HTTP_TIMEOUT
     )
@@ -133,104 +167,86 @@ def get_bybit(symbol):
     if data.get("retCode") != 0:
         raise RuntimeError(f"Bybit hata: {data}")
     rows = data["result"]["list"][::-1]
+    if len(rows) < 60:
+        raise RuntimeError("Bybit veri yetersiz")
     closes = [float(x[4]) for x in rows]
     highs = [float(x[2]) for x in rows]
     lows = [float(x[3]) for x in rows]
-    return closes, highs, lows
-
-
-def get_okx(symbol):
-    inst_id = symbol.replace("USDT", "-USDT-SWAP")
-    url = "https://www.okx.com/api/v5/market/candles"
-    r = requests.get(
-        url,
-        params={"instId": inst_id, "bar": "30m", "limit": 220},
-        timeout=HTTP_TIMEOUT
-    )
-    r.raise_for_status()
-    data = r.json()
-    if data.get("code") != "0":
-        raise RuntimeError(f"OKX hata: {data}")
-    rows = data["data"][::-1]
-    closes = [float(x[4]) for x in rows]
-    highs = [float(x[2]) for x in rows]
-    lows = [float(x[3]) for x in rows]
-    return closes, highs, lows
+    return closes, highs, lows, "BYBIT"
 
 
 def get_price_data(symbol):
     errors = []
-    for name, fn in [
-        ("Binance", get_binance),
-        ("Bybit", get_bybit),
-        ("OKX", get_okx),
-    ]:
-        try:
-            closes, highs, lows = fn(symbol)
-            if len(closes) < 60:
-                raise RuntimeError(f"{name} veri yetersiz")
-            return closes, highs, lows, name
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-    raise RuntimeError("Tum veri kaynaklari basarisiz -> " + " | ".join(errors))
+
+    try:
+        return get_binance_klines(symbol)
+    except Exception as e:
+        errors.append(f"Binance: {e}")
+
+    try:
+        return get_bybit_klines(symbol)
+    except Exception as e:
+        errors.append(f"Bybit: {e}")
+
+    raise RuntimeError("Fiyat verisi alinamadi -> " + " | ".join(errors))
 
 
-# -------------------------------------------------
-# COINGECKO PROXY: USDT.D / TOTAL / TOTAL3
-# -------------------------------------------------
+# =========================================================
+# COINGECKO -> USDT.D PROXY
+# USDT.D ~= tether market cap / total market cap * 100
+# =========================================================
 def cg_get_global_total_market_cap():
     url = "https://api.coingecko.com/api/v3/global"
     r = requests.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     data = r.json()
-    return float(data["data"]["total_market_cap"]["usd"])
+    total_mc = safe_float(data.get("data", {}).get("total_market_cap", {}).get("usd"))
+    if total_mc <= 0:
+        raise RuntimeError("Global market cap alinamadi")
+    return total_mc
 
 
-def cg_get_selected_market_caps():
+def cg_get_tether_market_cap():
     url = "https://api.coingecko.com/api/v3/simple/price"
     r = requests.get(
         url,
         params={
-            "ids": CG_IDS,
+            "ids": "tether",
             "vs_currencies": "usd",
             "include_market_cap": "true"
         },
         timeout=HTTP_TIMEOUT
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    usdt_mc = safe_float(data.get("tether", {}).get("usd_market_cap"))
+    if usdt_mc <= 0:
+        raise RuntimeError("Tether market cap alinamadi")
+    return usdt_mc
 
 
-def get_market_proxies(state):
-    now = int(time.time())
+def get_usdtd_proxy(state):
+    manual = state.get("manual_usdtd_override")
+    if manual is not None:
+        return {
+            "usdtd": float(manual),
+            "source": "MANUAL_OVERRIDE",
+            "ts": now_ts()
+        }
+
     cache = state.get("cg_cache", {})
-
-    if cache and now - int(cache.get("ts", 0)) < CG_CACHE_TTL_SECONDS:
+    if cache and now_ts() - int(cache.get("ts", 0)) < CG_CACHE_TTL_SECONDS:
         return cache
 
     try:
         total_mc = cg_get_global_total_market_cap()
-        caps = cg_get_selected_market_caps()
-
-        btc_mc = float(caps.get("bitcoin", {}).get("usd_market_cap", 0.0))
-        eth_mc = float(caps.get("ethereum", {}).get("usd_market_cap", 0.0))
-        usdt_mc = float(caps.get("tether", {}).get("usd_market_cap", 0.0))
-
-        if total_mc <= 0 or btc_mc <= 0 or eth_mc <= 0 or usdt_mc <= 0:
-            raise RuntimeError("CoinGecko verisi eksik")
-
-        total3_mc = max(total_mc - btc_mc - eth_mc, 0.0)
+        usdt_mc = cg_get_tether_market_cap()
         usdtd = (usdt_mc / total_mc) * 100.0
 
         result = {
-            "ts": now,
-            "total_mc": total_mc,
-            "btc_mc": btc_mc,
-            "eth_mc": eth_mc,
-            "total3_mc": total3_mc,
-            "usdt_mc": usdt_mc,
             "usdtd": usdtd,
-            "source": "COINGECKO_LIVE"
+            "source": "COINGECKO_LIVE",
+            "ts": now_ts()
         }
         state["cg_cache"] = result
         save_state(state)
@@ -240,17 +256,20 @@ def get_market_proxies(state):
         if cache:
             stale = dict(cache)
             stale["source"] = "COINGECKO_STALE_CACHE"
-            log(f"COINGECKO CACHE KULLANILIYOR: {e}")
+            log(f"CoinGecko cache kullaniliyor: {e}")
             return stale
-        raise
+        raise RuntimeError(f"USDT.D proxy alinamadi: {e}")
 
 
-# -------------------------------------------------
-# INDIKATORLER
-# -------------------------------------------------
+# =========================================================
+# İNDİKATÖRLER
+# =========================================================
 def ema(data, period):
+    if not data:
+        return 0.0
     if len(data) < period:
-        return data[-1]
+        return mean(data)
+
     k = 2 / (period + 1)
     e = mean(data[:period])
     for x in data[period:]:
@@ -259,39 +278,46 @@ def ema(data, period):
 
 
 def true_range(high, low, prev_close):
-    return max(high - low, abs(high - prev_close), abs(low - prev_close))
+    return max(
+        high - low,
+        abs(high - prev_close),
+        abs(low - prev_close)
+    )
 
 
 def atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return abs(closes[-1] - closes[-2])
+    if len(closes) < 3:
+        return abs(closes[-1] - closes[-2]) if len(closes) >= 2 else 0.0
+
     trs = []
     for i in range(1, len(closes)):
         trs.append(true_range(highs[i], lows[i], closes[i - 1]))
+
+    if not trs:
+        return 0.0
+
+    if len(trs) < period:
+        return mean(trs)
     return mean(trs[-period:])
 
 
-def append_history(state, key, value):
-    hist = state["history"].get(key, [])
-    hist.append({"ts": int(time.time()), "value": float(value)})
-    state["history"][key] = hist[-HISTORY_LIMIT:]
+def append_usdtd_history(state, value):
+    hist = state["history"].get("usdtd", [])
+    hist.append({"ts": now_ts(), "value": float(value)})
+    state["history"]["usdtd"] = hist[-USDTD_HISTORY_LIMIT:]
+    save_state(state)
 
 
-def get_hist_values(state, key):
-    return [x["value"] for x in state["history"].get(key, [])]
+def get_usdtd_values(state):
+    return [safe_float(x.get("value")) for x in state.get("history", {}).get("usdtd", [])]
 
 
-def fmt_t(v):
-    return f"{v/1_000_000_000_000:.3f}T"
-
-
-# -------------------------------------------------
-# ANALIZ
-# -------------------------------------------------
+# =========================================================
+# ANALİZ
+# =========================================================
 def analyze_market(state):
     eth_closes, eth_highs, eth_lows, eth_source = get_price_data(ETH_SYMBOL)
     btc_closes, btc_highs, btc_lows, btc_source = get_price_data(BTC_SYMBOL)
-    proxies = get_market_proxies(state)
 
     eth_price = eth_closes[-1]
     btc_price = btc_closes[-1]
@@ -302,47 +328,34 @@ def analyze_market(state):
     btc_ema50 = ema(btc_closes, BTC_SLOW_EMA)
     eth_atr = atr(eth_highs, eth_lows, eth_closes, ATR_PERIOD)
 
+    usdtd_info = get_usdtd_proxy(state)
+    usdtd_now = float(usdtd_info["usdtd"])
+    append_usdtd_history(state, usdtd_now)
+    usdtd_values = get_usdtd_values(state)
+
+    usdtd_fast = ema(usdtd_values, USDTD_FAST_EMA)
+    usdtd_slow = ema(usdtd_values, USDTD_SLOW_EMA)
+
     if eth_price > eth_ema20 > eth_ema50:
-        eth_trend = "GUCLU YUKARI"
+        eth_trend = "GUCLU_YUKARI"
     elif eth_price > eth_ema20 and eth_ema20 >= eth_ema50:
         eth_trend = "YUKARI"
     elif eth_price < eth_ema20 < eth_ema50:
-        eth_trend = "GUCLU ASAGI"
+        eth_trend = "GUCLU_ASAGI"
     elif eth_price < eth_ema20 and eth_ema20 <= eth_ema50:
         eth_trend = "ASAGI"
     else:
         eth_trend = "KARISIK"
 
     if btc_price > btc_ema20 > btc_ema50:
-        btc_regime = "RISK-ON"
+        btc_regime = "RISK_ON"
     elif btc_price < btc_ema20 < btc_ema50:
-        btc_regime = "RISK-OFF"
+        btc_regime = "RISK_OFF"
     else:
         btc_regime = "NOTR"
 
-    manual_override = state.get("manual_usdtd_override")
-    usdtd_now = float(manual_override) if manual_override is not None else float(proxies["usdtd"])
-    total_now = float(proxies["total_mc"])
-    total3_now = float(proxies["total3_mc"])
-
-    append_history(state, "usdtd", usdtd_now)
-    append_history(state, "total", total_now)
-    append_history(state, "total3", total3_now)
-    save_state(state)
-
-    usdtd_values = get_hist_values(state, "usdtd")
-    total_values = get_hist_values(state, "total")
-    total3_values = get_hist_values(state, "total3")
-
-    usdtd_fast = ema(usdtd_values, MARKET_FAST_EMA)
-    usdtd_slow = ema(usdtd_values, MARKET_SLOW_EMA)
-    total_fast = ema(total_values, MARKET_FAST_EMA)
-    total_slow = ema(total_values, MARKET_SLOW_EMA)
-    total3_fast = ema(total3_values, MARKET_FAST_EMA)
-    total3_slow = ema(total3_values, MARKET_SLOW_EMA)
-
     snap = {
-        "ts": int(time.time()),
+        "ts": now_ts(),
         "eth_price": eth_price,
         "btc_price": btc_price,
         "eth_ema20": eth_ema20,
@@ -355,47 +368,35 @@ def analyze_market(state):
         "usdtd_now": usdtd_now,
         "usdtd_fast": usdtd_fast,
         "usdtd_slow": usdtd_slow,
-        "total_now": total_now,
-        "total_fast": total_fast,
-        "total_slow": total_slow,
-        "total3_now": total3_now,
-        "total3_fast": total3_fast,
-        "total3_slow": total3_slow,
         "eth_source": eth_source,
         "btc_source": btc_source,
-        "market_source": proxies["source"]
+        "usdtd_source": usdtd_info["source"]
     }
     return snap
 
 
-# -------------------------------------------------
-# SINYAL MOTORU
-# -------------------------------------------------
+# =========================================================
+# SİNYAL MOTORU
+# =========================================================
 def build_signal(snapshot):
-    usdtd_bullish = snapshot["usdtd_fast"] < snapshot["usdtd_slow"] and snapshot["usdtd_now"] <= snapshot["usdtd_fast"]
-    usdtd_bearish = snapshot["usdtd_fast"] > snapshot["usdtd_slow"] and snapshot["usdtd_now"] >= snapshot["usdtd_fast"]
-
-    total_bullish = snapshot["total_fast"] > snapshot["total_slow"] and snapshot["total_now"] >= snapshot["total_fast"]
-    total_bearish = snapshot["total_fast"] < snapshot["total_slow"] and snapshot["total_now"] <= snapshot["total_fast"]
-
-    total3_bullish = snapshot["total3_fast"] > snapshot["total3_slow"] and snapshot["total3_now"] >= snapshot["total3_fast"]
-    total3_bearish = snapshot["total3_fast"] < snapshot["total3_slow"] and snapshot["total3_now"] <= snapshot["total3_fast"]
-
-    long_ok = (
-        usdtd_bullish and
-        total_bullish and
-        total3_bullish and
-        snapshot["eth_trend"] in ("YUKARI", "GUCLU YUKARI") and
-        snapshot["btc_regime"] in ("RISK-ON", "NOTR")
+    # USDT.D düşüyorsa risk-on, yükseliyorsa risk-off
+    usdtd_bullish = (
+        snapshot["usdtd_fast"] < snapshot["usdtd_slow"]
+        and snapshot["usdtd_now"] <= snapshot["usdtd_fast"]
+    )
+    usdtd_bearish = (
+        snapshot["usdtd_fast"] > snapshot["usdtd_slow"]
+        and snapshot["usdtd_now"] >= snapshot["usdtd_fast"]
     )
 
-    short_ok = (
-        usdtd_bearish and
-        total_bearish and
-        total3_bearish and
-        snapshot["eth_trend"] in ("ASAGI", "GUCLU ASAGI") and
-        snapshot["btc_regime"] in ("RISK-OFF", "NOTR")
-    )
+    eth_bullish = snapshot["eth_trend"] in ("YUKARI", "GUCLU_YUKARI")
+    eth_bearish = snapshot["eth_trend"] in ("ASAGI", "GUCLU_ASAGI")
+
+    btc_bullish = snapshot["btc_regime"] == "RISK_ON"
+    btc_bearish = snapshot["btc_regime"] == "RISK_OFF"
+
+    long_ok = usdtd_bullish and eth_bullish and btc_bullish
+    short_ok = usdtd_bearish and eth_bearish and btc_bearish
 
     if not long_ok and not short_ok:
         return None
@@ -404,24 +405,37 @@ def build_signal(snapshot):
     entry = snapshot["eth_price"]
     a = snapshot["eth_atr"]
 
-    if side == "LONG":
-        stop = entry - 1.25 * a
-        tp1 = entry + 1.10 * a
-        tp2 = entry + 2.00 * a
-        tp3 = entry + 3.00 * a
-        reason = "USDT zayif + TOTAL/TOTAL3 guclu + ETH yukari"
-    else:
-        stop = entry + 1.25 * a
-        tp1 = entry - 1.10 * a
-        tp2 = entry - 2.00 * a
-        tp3 = entry - 3.00 * a
-        reason = "USDT guclu + TOTAL/TOTAL3 zayif + ETH asagi"
-
-    rr = abs(tp2 - entry) / max(abs(entry - stop), 1e-9)
-    if rr < 1.2:
+    if a <= 0:
         return None
 
-    signal_hash = f"{side}|{round(entry,2)}|{round(stop,2)}|{round(snapshot['usdtd_now'],4)}"
+    if side == "LONG":
+        stop = entry - SL_ATR_MULT * a
+        tp1 = entry + TP1_ATR_MULT * a
+        tp2 = entry + TP2_ATR_MULT * a
+        tp3 = entry + TP3_ATR_MULT * a
+        reason = "BTC yukari + USDT.D zayif + ETH yukari"
+    else:
+        stop = entry + SL_ATR_MULT * a
+        tp1 = entry - TP1_ATR_MULT * a
+        tp2 = entry - TP2_ATR_MULT * a
+        tp3 = entry - TP3_ATR_MULT * a
+        reason = "BTC asagi + USDT.D guclu + ETH asagi"
+
+    risk = abs(entry - stop)
+    reward_tp2 = abs(tp2 - entry)
+    if risk <= 0:
+        return None
+
+    rr = reward_tp2 / risk
+    if rr < 1.20:
+        return None
+
+    signal_hash = (
+        f"{side}|"
+        f"{round(entry,2)}|{round(stop,2)}|"
+        f"{round(snapshot['usdtd_now'],4)}|"
+        f"{snapshot['btc_regime']}|{snapshot['eth_trend']}"
+    )
 
     return {
         "side": side,
@@ -437,18 +451,23 @@ def build_signal(snapshot):
 
 
 def should_send_signal(state, signal):
-    now_ts = int(time.time())
-    if state.get("last_signal_hash") == signal["signal_hash"]:
+    last_hash = state.get("last_signal_hash", "")
+    last_side = state.get("last_signal_side", "")
+    last_ts = int(state.get("last_signal_ts", 0))
+    cur_ts = now_ts()
+
+    if signal["signal_hash"] == last_hash:
         return False
-    if state.get("last_signal_side") == signal["side"]:
-        if now_ts - int(state.get("last_signal_ts", 0)) < SIGNAL_COOLDOWN_SECONDS:
-            return False
+
+    if signal["side"] == last_side and (cur_ts - last_ts) < SIGNAL_COOLDOWN_SECONDS:
+        return False
+
     return True
 
 
-# -------------------------------------------------
-# AKTIF ISLEM TAKIBI
-# -------------------------------------------------
+# =========================================================
+# AKTİF İŞLEM
+# =========================================================
 def create_active_trade(snapshot, signal):
     return {
         "is_open": True,
@@ -460,7 +479,7 @@ def create_active_trade(snapshot, signal):
         "tp3": signal["tp3"],
         "rr": signal["rr"],
         "reason": signal["reason"],
-        "opened_ts": int(time.time()),
+        "opened_ts": now_ts(),
         "tp1_hit": False,
         "tp2_hit": False,
         "tp3_hit": False,
@@ -474,12 +493,13 @@ def create_active_trade(snapshot, signal):
 def format_new_signal(snapshot, signal):
     return (
         f"🔥 <b>YENI {signal['side']} SINYALI</b>\n\n"
-        f"ETH: <b>{snapshot['eth_price']:.2f}</b>\n"
+        f"Parite: <b>{ETH_SYMBOL}</b>\n"
+        f"Fiyat: <b>{snapshot['eth_price']:.2f}</b>\n"
         f"ETH Trend: <b>{snapshot['eth_trend']}</b>\n"
-        f"BTC Rejimi: <b>{snapshot['btc_regime']}</b>\n"
+        f"BTC Rejim: <b>{snapshot['btc_regime']}</b>\n"
         f"USDT.D: <b>{snapshot['usdtd_now']:.3f}</b>\n"
-        f"TOTAL: <b>{fmt_t(snapshot['total_now'])}</b>\n"
-        f"TOTAL3: <b>{fmt_t(snapshot['total3_now'])}</b>\n\n"
+        f"USDT EMA{USDTD_FAST_EMA}/{USDTD_SLOW_EMA}: "
+        f"<b>{snapshot['usdtd_fast']:.3f} / {snapshot['usdtd_slow']:.3f}</b>\n\n"
         f"Giris: <b>{signal['entry']:.2f}</b>\n"
         f"Stop: <b>{signal['stop']:.2f}</b>\n"
         f"TP1: <b>{signal['tp1']:.2f}</b>\n"
@@ -513,27 +533,38 @@ def track_active_trade(state, snapshot):
 
     price = snapshot["eth_price"]
     atr_now = snapshot["eth_atr"]
-    msgs = []
+    messages = []
 
     trade["last_price"] = price
 
     if trade["side"] == "LONG":
         if not trade["tp1_hit"] and price >= trade["tp1"]:
             trade["tp1_hit"] = True
-            msgs.append(f"✅ <b>TP1 GELDI</b>\nLONG trade\nFiyat: <b>{price:.2f}</b>")
+            messages.append(
+                f"✅ <b>TP1 GELDI</b>\n"
+                f"LONG {ETH_SYMBOL}\n"
+                f"Fiyat: <b>{price:.2f}</b>"
+            )
 
         if trade["tp1_hit"] and not trade["breakeven_done"]:
             trade["stop"] = trade["entry"]
             trade["trail_stop"] = trade["entry"]
             trade["breakeven_done"] = True
-            msgs.append(f"🛡️ <b>STOP BREAKEVEN</b>\nYeni stop: <b>{trade['stop']:.2f}</b>")
+            messages.append(
+                f"🛡️ <b>STOP BREAKEVEN</b>\n"
+                f"Yeni stop: <b>{trade['stop']:.2f}</b>"
+            )
 
         if not trade["tp2_hit"] and price >= trade["tp2"]:
             trade["tp2_hit"] = True
             trade["trail_active"] = True
-            msgs.append(f"🎯 <b>TP2 GELDI</b>\nTrailing aktif.\nFiyat: <b>{price:.2f}</b>")
+            messages.append(
+                f"🎯 <b>TP2 GELDI</b>\n"
+                f"Trailing aktif.\n"
+                f"Fiyat: <b>{price:.2f}</b>"
+            )
 
-        if trade["trail_active"]:
+        if trade["trail_active"] and atr_now > 0:
             new_trail = price - TRAIL_AFTER_TP2_ATR * atr_now
             if new_trail > trade["trail_stop"]:
                 trade["trail_stop"] = new_trail
@@ -542,29 +573,46 @@ def track_active_trade(state, snapshot):
         if not trade["tp3_hit"] and price >= trade["tp3"]:
             trade["tp3_hit"] = True
             trade["is_open"] = False
-            msgs.append(f"🏁 <b>TP3 GELDI - ISLEM KAPANDI</b>\nCikis: <b>{price:.2f}</b>")
+            messages.append(
+                f"🏁 <b>TP3 GELDI - ISLEM KAPANDI</b>\n"
+                f"Cikis: <b>{price:.2f}</b>"
+            )
 
         if trade["is_open"] and price <= trade["stop"]:
             trade["is_open"] = False
-            msgs.append(f"⛔ <b>STOP CALISTI</b>\nCikis: <b>{price:.2f}</b>")
+            messages.append(
+                f"⛔ <b>STOP CALISTI</b>\n"
+                f"Cikis: <b>{price:.2f}</b>"
+            )
 
     else:
         if not trade["tp1_hit"] and price <= trade["tp1"]:
             trade["tp1_hit"] = True
-            msgs.append(f"✅ <b>TP1 GELDI</b>\nSHORT trade\nFiyat: <b>{price:.2f}</b>")
+            messages.append(
+                f"✅ <b>TP1 GELDI</b>\n"
+                f"SHORT {ETH_SYMBOL}\n"
+                f"Fiyat: <b>{price:.2f}</b>"
+            )
 
         if trade["tp1_hit"] and not trade["breakeven_done"]:
             trade["stop"] = trade["entry"]
             trade["trail_stop"] = trade["entry"]
             trade["breakeven_done"] = True
-            msgs.append(f"🛡️ <b>STOP BREAKEVEN</b>\nYeni stop: <b>{trade['stop']:.2f}</b>")
+            messages.append(
+                f"🛡️ <b>STOP BREAKEVEN</b>\n"
+                f"Yeni stop: <b>{trade['stop']:.2f}</b>"
+            )
 
         if not trade["tp2_hit"] and price <= trade["tp2"]:
             trade["tp2_hit"] = True
             trade["trail_active"] = True
-            msgs.append(f"🎯 <b>TP2 GELDI</b>\nTrailing aktif.\nFiyat: <b>{price:.2f}</b>")
+            messages.append(
+                f"🎯 <b>TP2 GELDI</b>\n"
+                f"Trailing aktif.\n"
+                f"Fiyat: <b>{price:.2f}</b>"
+            )
 
-        if trade["trail_active"]:
+        if trade["trail_active"] and atr_now > 0:
             new_trail = price + TRAIL_AFTER_TP2_ATR * atr_now
             if new_trail < trade["trail_stop"]:
                 trade["trail_stop"] = new_trail
@@ -573,60 +621,33 @@ def track_active_trade(state, snapshot):
         if not trade["tp3_hit"] and price <= trade["tp3"]:
             trade["tp3_hit"] = True
             trade["is_open"] = False
-            msgs.append(f"🏁 <b>TP3 GELDI - ISLEM KAPANDI</b>\nCikis: <b>{price:.2f}</b>")
+            messages.append(
+                f"🏁 <b>TP3 GELDI - ISLEM KAPANDI</b>\n"
+                f"Cikis: <b>{price:.2f}</b>"
+            )
 
         if trade["is_open"] and price >= trade["stop"]:
             trade["is_open"] = False
-            msgs.append(f"⛔ <b>STOP CALISTI</b>\nCikis: <b>{price:.2f}</b>")
+            messages.append(
+                f"⛔ <b>STOP CALISTI</b>\n"
+                f"Cikis: <b>{price:.2f}</b>"
+            )
 
     state["active_trade"] = trade
     save_state(state)
 
-    for m in msgs:
+    for msg in messages:
         try:
-            tg_send(m)
+            tg_send(msg)
         except Exception as e:
-            log(f"TRADE MESAJ HATASI: {e}")
+            log(f"Trade mesaj hatasi: {e}")
 
     return state
 
 
-# -------------------------------------------------
-# KOMUTLAR
-# -------------------------------------------------
-def status_text(state):
-    snap = analyze_market(state)
-    trade = state.get("active_trade")
-
-    base = (
-        f"<b>DURUM</b>\n\n"
-        f"ETH: <b>{snap['eth_price']:.2f}</b>\n"
-        f"BTC: <b>{snap['btc_price']:.2f}</b>\n"
-        f"ETH EMA20 / EMA50: <b>{snap['eth_ema20']:.2f} / {snap['eth_ema50']:.2f}</b>\n"
-        f"BTC EMA20 / EMA50: <b>{snap['btc_ema20']:.2f} / {snap['btc_ema50']:.2f}</b>\n"
-        f"ATR: <b>{snap['eth_atr']:.2f}</b>\n"
-        f"ETH Trend: <b>{snap['eth_trend']}</b>\n"
-        f"BTC Rejimi: <b>{snap['btc_regime']}</b>\n\n"
-        f"USDT.D: <b>{snap['usdtd_now']:.3f}</b>\n"
-        f"USDT EMA6/18: <b>{snap['usdtd_fast']:.3f} / {snap['usdtd_slow']:.3f}</b>\n"
-        f"TOTAL: <b>{fmt_t(snap['total_now'])}</b>\n"
-        f"TOTAL3: <b>{fmt_t(snap['total3_now'])}</b>\n\n"
-        f"Otomatik Tarama: <b>{'ACIK' if state.get('auto_scan_enabled') else 'KAPALI'}</b>"
-    )
-
-    if trade and trade.get("is_open"):
-        base += (
-            f"\n\nAktif Islem: <b>{trade['side']}</b>\n"
-            f"Giris: <b>{trade['entry']:.2f}</b>\n"
-            f"Stop: <b>{trade['stop']:.2f}</b>\n"
-            f"TP1/TP2/TP3: <b>{trade['tp1']:.2f} / {trade['tp2']:.2f} / {trade['tp3']:.2f}</b>"
-        )
-    else:
-        base += "\n\nAktif Islem: <b>YOK</b>"
-
-    return base
-
-
+# =========================================================
+# METİNLER
+# =========================================================
 def help_text():
     return (
         "<b>Komutlar</b>\n\n"
@@ -641,10 +662,47 @@ def help_text():
     )
 
 
+def status_text(state):
+    snap = analyze_market(state)
+    trade = state.get("active_trade")
+
+    text = (
+        f"<b>DURUM</b>\n\n"
+        f"Parite: <b>{ETH_SYMBOL}</b>\n"
+        f"ETH: <b>{snap['eth_price']:.2f}</b>\n"
+        f"BTC: <b>{snap['btc_price']:.2f}</b>\n\n"
+        f"ETH EMA20 / EMA50: <b>{snap['eth_ema20']:.2f} / {snap['eth_ema50']:.2f}</b>\n"
+        f"BTC EMA20 / EMA50: <b>{snap['btc_ema20']:.2f} / {snap['btc_ema50']:.2f}</b>\n"
+        f"ATR: <b>{snap['eth_atr']:.2f}</b>\n\n"
+        f"ETH Trend: <b>{snap['eth_trend']}</b>\n"
+        f"BTC Rejim: <b>{snap['btc_regime']}</b>\n\n"
+        f"USDT.D: <b>{snap['usdtd_now']:.3f}</b>\n"
+        f"USDT EMA{USDTD_FAST_EMA}/{USDTD_SLOW_EMA}: "
+        f"<b>{snap['usdtd_fast']:.3f} / {snap['usdtd_slow']:.3f}</b>\n"
+        f"USDT Kaynak: <b>{snap['usdtd_source']}</b>\n\n"
+        f"Otomatik Tarama: <b>{'ACIK' if state.get('auto_scan_enabled') else 'KAPALI'}</b>"
+    )
+
+    if trade and trade.get("is_open"):
+        text += (
+            f"\n\nAktif Islem: <b>{trade['side']}</b>\n"
+            f"Giris: <b>{trade['entry']:.2f}</b>\n"
+            f"Stop: <b>{trade['stop']:.2f}</b>\n"
+            f"TP1/TP2/TP3: <b>{trade['tp1']:.2f} / {trade['tp2']:.2f} / {trade['tp3']:.2f}</b>"
+        )
+    else:
+        text += "\n\nAktif Islem: <b>YOK</b>"
+
+    return text
+
+
+# =========================================================
+# KOMUTLAR
+# =========================================================
 def handle_command(state, text):
     text = (text or "").strip()
 
-    if text in ("/start", "/yardim", "/help"):
+    if text in ("/start", "/help", "/yardim"):
         return help_text()
 
     if text.startswith("/durum"):
@@ -677,12 +735,12 @@ def handle_command(state, text):
         if len(parts) != 2:
             return "Kullanim: /usdtdset 7.850"
         try:
-            v = float(parts[1].replace(",", "."))
+            value = float(parts[1].replace(",", "."))
         except ValueError:
             return "Gecersiz sayi."
-        state["manual_usdtd_override"] = v
+        state["manual_usdtd_override"] = value
         save_state(state)
-        return f"✅ Manuel USDT override aktif: {v:.3f}"
+        return f"✅ Manuel USDT override aktif: {value:.3f}"
 
     if text.startswith("/sinyal"):
         snap = analyze_market(state)
@@ -691,32 +749,33 @@ def handle_command(state, text):
             return (
                 "Su an net sinyal yok.\n\n"
                 f"ETH Trend: {snap['eth_trend']}\n"
-                f"BTC Rejimi: {snap['btc_regime']}\n"
+                f"BTC Rejim: {snap['btc_regime']}\n"
                 f"USDT.D: {snap['usdtd_now']:.3f}\n"
-                f"TOTAL: {fmt_t(snap['total_now'])}\n"
-                f"TOTAL3: {fmt_t(snap['total3_now'])}"
+                f"USDT EMA{USDTD_FAST_EMA}/{USDTD_SLOW_EMA}: "
+                f"{snap['usdtd_fast']:.3f} / {snap['usdtd_slow']:.3f}"
             )
         return format_new_signal(snap, sig)
 
     return "Komut taninmadi. /yardim"
 
 
-# -------------------------------------------------
-# OTOMATIK TARAMA
-# -------------------------------------------------
+# =========================================================
+# OTOMATİK TARAMA
+# =========================================================
 def auto_scan_if_needed(state):
     if not state.get("auto_scan_enabled", True):
         return state
 
-    now_ts = int(time.time())
-    if now_ts - int(state.get("last_auto_scan_ts", 0)) < AUTO_SCAN_INTERVAL_SECONDS:
+    current_ts = now_ts()
+    last_scan = int(state.get("last_auto_scan_ts", 0))
+
+    if current_ts - last_scan < AUTO_SCAN_INTERVAL_SECONDS:
         return state
 
-    state["last_auto_scan_ts"] = now_ts
+    state["last_auto_scan_ts"] = current_ts
     save_state(state)
 
     snap = analyze_market(state)
-
     state = track_active_trade(state, snap)
 
     trade = state.get("active_trade")
@@ -726,7 +785,7 @@ def auto_scan_if_needed(state):
     sig = build_signal(snap)
     if sig and should_send_signal(state, sig):
         tg_send(format_new_signal(snap, sig))
-        state["last_signal_ts"] = now_ts
+        state["last_signal_ts"] = current_ts
         state["last_signal_side"] = sig["side"]
         state["last_signal_hash"] = sig["signal_hash"]
         state["active_trade"] = create_active_trade(snap, sig)
@@ -735,9 +794,9 @@ def auto_scan_if_needed(state):
     return state
 
 
-# -------------------------------------------------
+# =========================================================
 # MAIN
-# -------------------------------------------------
+# =========================================================
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN bos")
@@ -747,9 +806,13 @@ def main():
     state = load_state()
 
     try:
-        tg_send("✅ ETH trade signal botu aktif.\nKomutlar: /yardim")
+        tg_send(
+            "✅ ETH sade trade signal botu aktif.\n"
+            "Filtre: BTC + USDT.D + ETH trend\n"
+            "Komutlar: /yardim"
+        )
     except Exception as e:
-        log(f"Baslangic mesaji hatasi: {e}")
+        log(f"Baslangic mesaji gonderilemedi: {e}")
 
     while True:
         try:
@@ -766,6 +829,7 @@ def main():
                     continue
 
                 text = msg.get("text", "")
+
                 try:
                     reply = handle_command(state, text)
                 except Exception as e:
@@ -774,14 +838,14 @@ def main():
                 try:
                     tg_send(reply)
                 except Exception as e:
-                    log(f"Telegram gonderim hatasi: {e}")
+                    log(f"Telegram cevap gonderim hatasi: {e}")
 
                 save_state(state)
 
             time.sleep(POLL_SECONDS)
 
         except Exception as e:
-            log(f"ANA DONGU HATASI: {e}")
+            log(f"Ana dongu hatasi: {e}")
             time.sleep(5)
 
 
