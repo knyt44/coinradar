@@ -26,66 +26,62 @@ TELEGRAM_CHAT_ID = (
     or os.getenv("CHAT_ID_ETH", "").strip()
 )
 
-CHECK_EVERY_SECONDS = 15
-STATE_FILE = "eth_mexc_superbot_state.json"
+CHECK_EVERY_SECONDS = 20
+STATE_FILE = "eth_mexc_final_state.json"
 
-# ---------------------------------------------------------
-# STATE / SIGNAL LIFECYCLE
-# ---------------------------------------------------------
-MIN_SIGNAL_GAP_MINUTES = 25
-MAX_ACTIVE_SIGNAL_AGE_MINUTES = 180
+# =========================================================
+# GENERAL
+# =========================================================
+MAX_HTTP_RETRY = 3
+HTTP_TIMEOUT = 15
+
+# =========================================================
+# SIGNAL / LIFECYCLE
+# =========================================================
+MIN_SIGNAL_GAP_MINUTES = 20
 SIGNAL_TIMEOUT_MINUTES = 120
-MIN_PRICE_DISTANCE_PCT = 0.45
-REVERSE_SIGNAL_STRENGTH_BONUS = 1.75
-SAME_DIRECTION_SCORE_BONUS = 2.5
+MAX_ACTIVE_SIGNAL_AGE_MINUTES = 240
+MIN_PRICE_DISTANCE_PCT = 0.35
 
-# ---------------------------------------------------------
-# SIGNAL THRESHOLDS
-# ---------------------------------------------------------
-LONG_SCORE_THRESHOLD = 9.5
-SHORT_SCORE_THRESHOLD = 9.5
-MIN_RR_TO_TP2 = 1.35
+ALLOW_SMART_REPEAT_SIGNAL = False
+RESEND_IF_SCORE_IMPROVED_BY = 1.2
+RESEND_IF_ENTRY_MOVED_PCT = 0.30
 
-# ---------------------------------------------------------
+# =========================================================
+# THRESHOLDS
+# =========================================================
+LONG_SCORE_THRESHOLD = 11.0
+SHORT_SCORE_THRESHOLD = 11.0
+MIN_RR_TO_TP2 = 1.40
+
+# =========================================================
 # RISK
-# ---------------------------------------------------------
-ATR_SL_MULTIPLIER = 1.20
-ATR_TP1_MULTIPLIER = 1.25
-ATR_TP2_MULTIPLIER = 2.20
-ATR_TP3_MULTIPLIER = 3.30
-TRAIL_AFTER_TP2_ATR = 1.05
+# =========================================================
+ATR_SL_MULTIPLIER = 1.25
+ATR_TP1_MULTIPLIER = 1.20
+ATR_TP2_MULTIPLIER = 2.10
+ATR_TP3_MULTIPLIER = 3.10
+TRAIL_AFTER_TP2_ATR = 1.00
 
-# ---------------------------------------------------------
+# =========================================================
 # FILTERS
-# ---------------------------------------------------------
+# =========================================================
 USE_BTC_FILTER = True
-BTC_15M_TREND_THRESHOLD = 0.12
-
 USE_USDTD_FILTER = True
+
 USDTD_FAST_EMA = 6
 USDTD_SLOW_EMA = 18
 USDTD_HISTORY_LIMIT = 240
 CG_CACHE_TTL_SECONDS = 180
-USDTD_LONG_SCORE_BONUS = 1.25
-USDTD_SHORT_SCORE_BONUS = 1.25
-USDTD_OPPOSITE_PENALTY = 0.90
 
-MAX_HTTP_RETRY = 3
-HTTP_TIMEOUT = 15
-
-# ---------------------------------------------------------
-# MESSAGE / ENTRY LOGIC
-# ---------------------------------------------------------
-ENTRY_NEAR_PCT = 0.12
+ENTRY_FILL_TOLERANCE_PCT = 0.05
 CANCEL_IF_TP1_BEFORE_ENTRY = True
 
-# ---------------------------------------------------------
-# PRO++ SMART RESEND
-# ---------------------------------------------------------
-RESEND_IF_SCORE_IMPROVED_BY = 1.0
-RESEND_IF_ENTRY_MOVED_PCT = 0.22
-RESEND_IF_REASON_CHANGED = True
-ALLOW_SMART_REPEAT_SIGNAL = True
+# hard filters
+REQUIRE_4H_TREND_LOCK = True
+REQUIRE_15M_TREND_LOCK = True
+REQUIRE_BTC_CONFIRMATION = True
+REQUIRE_USDTD_CONFIRMATION = False  # False = veto değil, güçlü filtre/puan etkisi
 
 # =========================================================
 # UTILS
@@ -140,6 +136,9 @@ def fmt_price(v):
     except Exception:
         return str(v)
 
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
 def day_key_from_ts(ts):
     return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
 
@@ -153,7 +152,7 @@ def week_key_from_ts(ts):
 # =========================================================
 def tg_send(text: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram ENV eksik: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        log("Telegram ENV eksik")
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -165,10 +164,9 @@ def tg_send(text: str):
 
     try:
         r = requests.post(url, json=payload, timeout=20)
-        log(f"Telegram status={r.status_code}")
         if r.status_code == 200:
             return True
-        log(f"Telegram hata cevabi: {r.text}")
+        log(f"Telegram hata: {r.status_code} | {r.text}")
         return False
     except Exception as e:
         log(f"Telegram exception: {e}")
@@ -179,10 +177,7 @@ def tg_get_updates(offset):
         return []
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {
-        "offset": offset,
-        "timeout": 1
-    }
+    params = {"offset": offset, "timeout": 1}
 
     try:
         r = requests.get(url, params=params, timeout=10)
@@ -212,7 +207,7 @@ def http_get_json(url: str, params=None):
     raise last_err
 
 # =========================================================
-# MEXC MARKET DATA
+# MEXC
 # =========================================================
 def get_klines(symbol: str, interval: str, limit: int = 200):
     url = f"{MEXC_BASE_URL}/api/v3/klines"
@@ -241,14 +236,14 @@ def get_last_price(symbol: str):
     return float(data["price"])
 
 # =========================================================
-# COINGECKO -> USDT.D PROXY
+# USDT.D PROXY (CoinGecko)
 # =========================================================
 def cg_get_global_total_market_cap():
     url = f"{COINGECKO_BASE_URL}/global"
     data = http_get_json(url)
     total_mc = safe_float(data.get("data", {}).get("total_market_cap", {}).get("usd"))
     if total_mc is None or total_mc <= 0:
-        raise RuntimeError("CoinGecko total market cap alınamadı")
+        raise RuntimeError("Global market cap alınamadı")
     return total_mc
 
 def cg_get_tether_market_cap():
@@ -260,7 +255,7 @@ def cg_get_tether_market_cap():
     })
     usdt_mc = safe_float(data.get("tether", {}).get("usd_market_cap"))
     if usdt_mc is None or usdt_mc <= 0:
-        raise RuntimeError("CoinGecko tether market cap alınamadı")
+        raise RuntimeError("Tether market cap alınamadı")
     return usdt_mc
 
 def get_usdtd_proxy(state):
@@ -291,11 +286,6 @@ def get_usdtd_proxy(state):
 # =========================================================
 # INDICATORS
 # =========================================================
-def sma(values, period):
-    if len(values) < period:
-        return None
-    return sum(values[-period:]) / period
-
 def ema_series(values, period):
     if len(values) < period:
         return [None] * len(values)
@@ -424,9 +414,7 @@ def default_state():
         "active_signal": None,
         "signal_history": [],
         "cg_cache": {},
-        "history": {
-            "usdtd": []
-        },
+        "history": {"usdtd": []},
         "manual_usdtd_override": None,
         "last_update_id": 0,
         "stats": default_stats()
@@ -484,7 +472,13 @@ def get_usdtd_values(state):
 
 def get_usdtd_bias(state):
     if not USE_USDTD_FILTER:
-        return "NEUTRAL", "USDTD_FILTER_DISABLED", None, None, None
+        return {
+            "bias": "NEUTRAL",
+            "reason": "USDTD_DISABLED",
+            "now": None,
+            "fast": None,
+            "slow": None
+        }
 
     try:
         info = get_usdtd_proxy(state)
@@ -493,7 +487,13 @@ def get_usdtd_bias(state):
         values = get_usdtd_values(state)
 
         if len(values) < USDTD_SLOW_EMA:
-            return "NEUTRAL", f"USDTD_WAIT_HISTORY:{len(values)}", usdtd_now, None, None
+            return {
+                "bias": "NEUTRAL",
+                "reason": f"WAIT_HISTORY:{len(values)}",
+                "now": usdtd_now,
+                "fast": None,
+                "slow": None
+            }
 
         fast_series = ema_series(values, USDTD_FAST_EMA)
         slow_series = ema_series(values, USDTD_SLOW_EMA)
@@ -502,26 +502,136 @@ def get_usdtd_bias(state):
         usdtd_slow = slow_series[-1]
 
         if usdtd_fast is None or usdtd_slow is None:
-            return "NEUTRAL", "USDTD_EMA_NOT_READY", usdtd_now, usdtd_fast, usdtd_slow
+            return {
+                "bias": "NEUTRAL",
+                "reason": "EMA_NOT_READY",
+                "now": usdtd_now,
+                "fast": usdtd_fast,
+                "slow": usdtd_slow
+            }
 
+        # USDT.D yükseliyorsa risk-off => short lehine
+        if usdtd_fast > usdtd_slow and usdtd_now >= usdtd_fast:
+            return {
+                "bias": "SHORT",
+                "reason": f"RISK_OFF:{round(usdtd_now, 3)}",
+                "now": usdtd_now,
+                "fast": usdtd_fast,
+                "slow": usdtd_slow
+            }
+
+        # USDT.D düşüyorsa risk-on => long lehine
         if usdtd_fast < usdtd_slow and usdtd_now <= usdtd_fast:
-            return "LONG", f"USDTD_RISK_ON:{round(usdtd_now, 3)}", usdtd_now, usdtd_fast, usdtd_slow
-        elif usdtd_fast > usdtd_slow and usdtd_now >= usdtd_fast:
-            return "SHORT", f"USDTD_RISK_OFF:{round(usdtd_now, 3)}", usdtd_now, usdtd_fast, usdtd_slow
-        else:
-            return "NEUTRAL", f"USDTD_NEUTRAL:{round(usdtd_now, 3)}", usdtd_now, usdtd_fast, usdtd_slow
+            return {
+                "bias": "LONG",
+                "reason": f"RISK_ON:{round(usdtd_now, 3)}",
+                "now": usdtd_now,
+                "fast": usdtd_fast,
+                "slow": usdtd_slow
+            }
 
+        return {
+            "bias": "NEUTRAL",
+            "reason": f"NEUTRAL:{round(usdtd_now, 3)}",
+            "now": usdtd_now,
+            "fast": usdtd_fast,
+            "slow": usdtd_slow
+        }
     except Exception as e:
-        return "NEUTRAL", f"USDTD_FAIL_OPEN:{e}", None, None, None
+        return {
+            "bias": "NEUTRAL",
+            "reason": f"FAIL_OPEN:{e}",
+            "now": None,
+            "fast": None,
+            "slow": None
+        }
+
+# =========================================================
+# ANALYZE TF
+# =========================================================
+def analyze_timeframe(candles):
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    volumes = [c["volume"] for c in candles]
+    opens = [c["open"] for c in candles]
+
+    ema9 = ema_series(closes, 9)
+    ema12 = ema_series(closes, 12)
+    ema20 = ema_series(closes, 20)
+    ema21 = ema_series(closes, 21)
+    ema50 = ema_series(closes, 50)
+    ema200 = ema_series(closes, 200)
+
+    rsi14 = rsi_series(closes, 14)
+    macd_line, macd_signal, macd_hist = macd_series(closes, 12, 26, 9)
+    atr14 = atr(candles, 14)
+
+    volume_avg_20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else None
+    candle_range = highs[-1] - lows[-1]
+    body = abs(closes[-1] - opens[-1])
+
+    trend_up_stack = (
+        ema20[-1] is not None and ema50[-1] is not None and ema200[-1] is not None and
+        closes[-1] > ema20[-1] > ema50[-1] > ema200[-1]
+    )
+    trend_down_stack = (
+        ema20[-1] is not None and ema50[-1] is not None and ema200[-1] is not None and
+        closes[-1] < ema20[-1] < ema50[-1] < ema200[-1]
+    )
+
+    hh3 = highs[-1] > highs[-2] > highs[-3] if len(highs) >= 3 else False
+    hl3 = lows[-1] > lows[-2] > lows[-3] if len(lows) >= 3 else False
+    lh3 = highs[-1] < highs[-2] < highs[-3] if len(highs) >= 3 else False
+    ll3 = lows[-1] < lows[-2] < lows[-3] if len(lows) >= 3 else False
+
+    close_up_3 = closes[-1] > closes[-2] > closes[-3] if len(closes) >= 3 else False
+    close_down_3 = closes[-1] < closes[-2] < closes[-3] if len(closes) >= 3 else False
+
+    return {
+        "close": closes[-1],
+        "open": opens[-1],
+        "high": highs[-1],
+        "low": lows[-1],
+        "volume": volumes[-1],
+        "volume_avg_20": volume_avg_20,
+        "ema9": ema9[-1],
+        "ema12": ema12[-1],
+        "ema20": ema20[-1],
+        "ema21": ema21[-1],
+        "ema50": ema50[-1],
+        "ema200": ema200[-1],
+        "rsi14": rsi14[-1],
+        "macd": macd_line[-1],
+        "macd_signal": macd_signal[-1],
+        "macd_hist": macd_hist[-1],
+        "atr14": atr14,
+        "trend_up_stack": trend_up_stack,
+        "trend_down_stack": trend_down_stack,
+        "hh3": hh3,
+        "hl3": hl3,
+        "lh3": lh3,
+        "ll3": ll3,
+        "close_up_3": close_up_3,
+        "close_down_3": close_down_3,
+        "candle_range": candle_range,
+        "body": body,
+        "highest_20": highest_high(candles, 20),
+        "lowest_20": lowest_low(candles, 20),
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "opens": opens
+    }
 
 # =========================================================
 # MESSAGE HELPERS
 # =========================================================
 def classify_signal_strength(score):
     s = safe_float(score, 0.0)
-    if s >= 12.0:
+    if s >= 14.0:
         return "GUCLU"
-    elif s >= 10.0:
+    elif s >= 11.5:
         return "ORTA"
     return "ZAYIF"
 
@@ -532,38 +642,11 @@ def build_signal_signature(sig):
         f"{sig.get('direction','')}"
         f"|{round(safe_float(sig.get('entry'), 0.0), 2)}"
         f"|{round(safe_float(sig.get('score'), 0.0), 2)}"
-        f"|{sig.get('strategy_tag','')}"
+        f"|{sig.get('reason','')}"
     )
 
-def signal_upgrade_needed(old_sig, new_sig):
-    if not old_sig or not new_sig:
-        return False, "NO_COMPARE"
-
-    old_score = safe_float(old_sig.get("score"), 0.0)
-    new_score = safe_float(new_sig.get("score"), 0.0)
-
-    old_entry = safe_float(old_sig.get("entry"), 0.0)
-    new_entry = safe_float(new_sig.get("entry"), 0.0)
-
-    old_reason = str(old_sig.get("reason", "")).strip()
-    new_reason = str(new_sig.get("reason", "")).strip()
-
-    score_diff = new_score - old_score
-    entry_diff_pct = pct_diff(old_entry, new_entry) if old_entry else 999.0
-
-    if score_diff >= RESEND_IF_SCORE_IMPROVED_BY:
-        return True, f"SCORE_UPGRADE:+{round(score_diff, 2)}"
-
-    if entry_diff_pct >= RESEND_IF_ENTRY_MOVED_PCT:
-        return True, f"ENTRY_SHIFT:{round(entry_diff_pct, 3)}%"
-
-    if RESEND_IF_REASON_CHANGED and old_reason != new_reason:
-        return True, "REASON_CHANGED"
-
-    return False, "NO_MEANINGFUL_UPGRADE"
-
-def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason):
-    return {
+def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, reason, extra=None):
+    payload = {
         "direction": direction.upper(),
         "entry": round(float(entry), 4),
         "sl": round(float(sl), 4),
@@ -571,7 +654,6 @@ def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_ta
         "tp2": round(float(tp2), 4),
         "tp3": round(float(tp3), 4),
         "score": round(float(score), 2),
-        "strategy_tag": strategy_tag,
         "reason": reason,
         "created_ts": utc_ts(),
         "updated_ts": utc_ts(),
@@ -583,62 +665,53 @@ def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_ta
         "breakeven_done": False,
         "trail_active": False,
         "trail_stop": round(float(sl), 4),
-        "signal_signature": ""
+        "signal_signature": "",
+        "extra": extra or {}
     }
+    payload["signal_signature"] = build_signal_signature(payload)
+    return payload
 
-def is_same_direction(a, b):
-    return bool(a and b and a.get("direction") == b.get("direction"))
-
-def is_opposite_direction(a, b):
-    return bool(a and b and a.get("direction") != b.get("direction"))
-
-def entry_distance_pct(sig_a, sig_b):
-    if not sig_a or not sig_b:
-        return 999.0
-    return pct_diff(sig_a.get("entry"), sig_b.get("entry"))
-
-def format_signal_message(sig, current_price):
+def format_signal_message(sig):
     direction = sig["direction"].upper()
     emoji = "🟢" if direction == "LONG" else "🔴"
-
-    entry = sig["entry"]
-    sl = sig["sl"]
-    tp1 = sig["tp1"]
-    tp2 = sig["tp2"]
-    tp3 = sig["tp3"]
-
-    risk = abs(entry - sl)
-    reward = abs(tp2 - entry)
-    rr = reward / risk if risk > 0 else 0
-
     strength = classify_signal_strength(sig["score"])
+
+    extra = sig.get("extra", {})
+    btc_bias = extra.get("btc_bias", "-")
+    usdtd_bias = extra.get("usdtd_bias", "-")
+
+    risk = abs(sig["entry"] - sig["sl"])
+    reward = abs(sig["tp2"] - sig["entry"])
+    rr = reward / risk if risk > 0 else 0
 
     return (
         f"{emoji} ETHUSDT {direction}\n\n"
-        f"Entry: {fmt_price(entry)}\n"
-        f"SL: {fmt_price(sl)}\n\n"
-        f"TP1: {fmt_price(tp1)}\n"
-        f"TP2: {fmt_price(tp2)}\n"
-        f"TP3: {fmt_price(tp3)}\n\n"
-        f"RR: {rr:.2f}\n"
-        f"Güç: {strength}"
+        f"Güç: {strength}\n"
+        f"Skor: {sig['score']}\n"
+        f"BTC: {btc_bias}\n"
+        f"USDT.D: {usdtd_bias}\n\n"
+        f"Entry: {fmt_price(sig['entry'])}\n"
+        f"SL: {fmt_price(sig['sl'])}\n"
+        f"TP1: {fmt_price(sig['tp1'])}\n"
+        f"TP2: {fmt_price(sig['tp2'])}\n"
+        f"TP3: {fmt_price(sig['tp3'])}\n\n"
+        f"RR: {rr:.2f}"
     )
 
-def format_upgraded_signal_message(old_sig, new_sig, current_price, upgrade_reason):
+def format_upgraded_signal_message(old_sig, new_sig, upgrade_reason):
     direction = new_sig["direction"].upper()
-
     return (
-        f"🔄 ETHUSDT {direction} (UPDATE)\n\n"
-        f"Skor: {old_sig['score']} → {new_sig['score']}\n"
-        f"Güç: {classify_signal_strength(new_sig['score'])}\n\n"
+        f"🔄 ETHUSDT {direction} UPDATE\n\n"
+        f"Skor: {old_sig['score']} -> {new_sig['score']}\n"
+        f"Neden: {upgrade_reason}\n\n"
         f"Entry: {fmt_price(new_sig['entry'])}\n"
-        f"SL: {fmt_price(new_sig['sl'])}\n\n"
+        f"SL: {fmt_price(new_sig['sl'])}\n"
         f"TP1: {fmt_price(new_sig['tp1'])}\n"
         f"TP2: {fmt_price(new_sig['tp2'])}\n"
         f"TP3: {fmt_price(new_sig['tp3'])}"
     )
 
-def format_close_message(sig, close_reason, close_price=None):
+def format_close_message(sig, close_reason):
     if close_reason == "TP3_HIT":
         return "🏁 TP3 HIT\n\nTrade tamamlandı"
     if close_reason == "SL_HIT":
@@ -646,7 +719,7 @@ def format_close_message(sig, close_reason, close_price=None):
     if close_reason == "TIMEOUT":
         return "⌛ TIMEOUT\n\nSinyal süresi doldu"
     if close_reason == "CANCELLED_BEFORE_ENTRY_TP1":
-        return "⚠️ SETUP İPTAL\n\nEntry gelmeden TP1 oldu"
+        return "⚠️ SETUP IPTAL\n\nEntry gelmeden TP1 oldu"
     if close_reason == "REVERSED_BY_STRONGER_SIGNAL":
         return "↩️ TERS SİNYAL\n\nDaha güçlü ters sinyal geldi"
     return "Trade kapandı"
@@ -660,8 +733,9 @@ def format_active_signal(sig):
     rr = reward / risk if risk > 0 else 0.0
 
     filled = "EVET" if sig.get("active") else "BEKLIYOR"
+
     return (
-        f"📌 AKTIF İSLEM\n\n"
+        f"📌 AKTIF ISLEM\n\n"
         f"Yön: {sig['direction']}\n"
         f"Durum: {filled}\n"
         f"Güç: {classify_signal_strength(sig.get('score'))}\n\n"
@@ -678,7 +752,6 @@ def format_panel(state):
     total = int(stats.get("total_signals", 0))
     wins = int(stats.get("wins", 0))
     losses = int(stats.get("losses", 0))
-
     win_rate = (wins / total * 100.0) if total > 0 else 0.0
 
     return (
@@ -699,11 +772,11 @@ def aggregate_period_summary(state, period="daily"):
 
     if period == "daily":
         key = day_key_from_ts(now)
-        title = "📅 GÜNLÜK ÖZET"
+        title = "📅 GUNLUK OZET"
         match_fn = lambda ts: day_key_from_ts(ts) == key
     else:
         key = week_key_from_ts(now)
-        title = "📈 HAFTALIK ÖZET"
+        title = "📈 HAFTALIK OZET"
         match_fn = lambda ts: week_key_from_ts(ts) == key
 
     total = 0
@@ -757,7 +830,9 @@ def help_text():
         "/gunluk\n"
         "/haftalik\n"
         "/aktif\n"
-        "/yardim"
+        "/yardim\n"
+        "/usdtd\n"
+        "/fiyat"
     )
 
 # =========================================================
@@ -765,7 +840,6 @@ def help_text():
 # =========================================================
 def update_stats_for_closed_signal(state, sig):
     stats = state.setdefault("stats", default_stats())
-
     stats["total_signals"] = int(stats.get("total_signals", 0)) + 1
 
     if sig.get("tp1_hit"):
@@ -783,87 +857,54 @@ def update_stats_for_closed_signal(state, sig):
         stats["stops"] = int(stats.get("stops", 0)) + 1
 
 # =========================================================
-# ACTIVE SIGNAL MGMT
+# SIGNAL HELPERS
 # =========================================================
-def close_active_signal(state, close_reason, current_price=None, notify_telegram=True):
-    active = state.get("active_signal")
-    if not active:
-        return
+def is_same_direction(a, b):
+    return bool(a and b and a.get("direction") == b.get("direction"))
 
-    active["status"] = "CLOSED"
-    active["close_reason"] = close_reason
-    active["closed_ts"] = utc_ts()
+def is_opposite_direction(a, b):
+    return bool(a and b and a.get("direction") != b.get("direction"))
 
-    if current_price is not None:
-        active["close_price"] = round(float(current_price), 4)
-
-    if notify_telegram:
-        tg_send(format_close_message(active, close_reason, current_price))
-
-    state["signal_history"].append(active)
-    update_stats_for_closed_signal(state, active)
-    state["active_signal"] = None
-    log(f"Aktif sinyal kapatildi: {close_reason}")
+def entry_distance_pct(sig_a, sig_b):
+    if not sig_a or not sig_b:
+        return 999.0
+    return pct_diff(sig_a.get("entry"), sig_b.get("entry"))
 
 def is_tp1_hit(signal, current_price):
     if not signal:
         return False
-
-    direction = signal["direction"]
     tp1 = safe_float(signal.get("tp1"))
     cp = safe_float(current_price)
-
     if tp1 is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp >= tp1
-    return cp <= tp1
+    return cp >= tp1 if signal["direction"] == "LONG" else cp <= tp1
 
 def is_tp2_hit(signal, current_price):
     if not signal:
         return False
-
-    direction = signal["direction"]
     tp2 = safe_float(signal.get("tp2"))
     cp = safe_float(current_price)
-
     if tp2 is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp >= tp2
-    return cp <= tp2
+    return cp >= tp2 if signal["direction"] == "LONG" else cp <= tp2
 
 def is_tp3_hit(signal, current_price):
     if not signal:
         return False
-
-    direction = signal["direction"]
     tp3 = safe_float(signal.get("tp3"))
     cp = safe_float(current_price)
-
     if tp3 is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp >= tp3
-    return cp <= tp3
+    return cp >= tp3 if signal["direction"] == "LONG" else cp <= tp3
 
 def is_sl_hit(signal, current_price):
     if not signal:
         return False
-
-    direction = signal["direction"]
     sl = safe_float(signal.get("sl"))
     cp = safe_float(current_price)
-
     if sl is None or cp is None:
         return False
-
-    if direction == "LONG":
-        return cp <= sl
-    return cp >= sl
+    return cp <= sl if signal["direction"] == "LONG" else cp >= sl
 
 def is_entry_filled(signal, current_price):
     if not signal:
@@ -872,7 +913,7 @@ def is_entry_filled(signal, current_price):
     cp = safe_float(current_price)
     if entry is None or cp is None or entry == 0:
         return False
-    return (abs(cp - entry) / entry * 100.0) <= ENTRY_NEAR_PCT
+    return (abs(cp - entry) / entry * 100.0) <= ENTRY_FILL_TOLERANCE_PCT
 
 def is_expired(signal):
     if not signal:
@@ -882,7 +923,6 @@ def is_expired(signal):
 def update_trailing_stop(signal, current_price, atr_now):
     if not signal or not signal.get("trail_active"):
         return False
-
     if atr_now is None or atr_now <= 0:
         return False
 
@@ -904,9 +944,36 @@ def update_trailing_stop(signal, current_price, atr_now):
 
     return False
 
+# =========================================================
+# ACTIVE SIGNAL MGMT
+# =========================================================
+def close_active_signal(state, close_reason, current_price=None, notify_telegram=True):
+    active = state.get("active_signal")
+    if not active:
+        return
+
+    active["status"] = "CLOSED"
+    active["close_reason"] = close_reason
+    active["closed_ts"] = utc_ts()
+
+    if current_price is not None:
+        active["close_price"] = round(float(current_price), 4)
+
+    if notify_telegram:
+        tg_send(format_close_message(active, close_reason))
+
+    state["signal_history"].append(active)
+    update_stats_for_closed_signal(state, active)
+    state["active_signal"] = None
+    log(f"Aktif sinyal kapatildi: {close_reason}")
+
 def refresh_active_signal_if_needed(state, current_price, atr_now=None):
     active = state.get("active_signal")
     if not active:
+        return
+
+    if minutes_since(active.get("created_ts")) >= MAX_ACTIVE_SIGNAL_AGE_MINUTES:
+        close_active_signal(state, "TIMEOUT", current_price, notify_telegram=True)
         return
 
     if not active.get("active"):
@@ -941,7 +1008,7 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             active["trail_stop"] = round(float(active["entry"]), 4)
             active["breakeven_done"] = True
             active["updated_ts"] = utc_ts()
-            tg_send("🎯 TP1 HIT\n\nBE aktif (risk sıfır)")
+            tg_send("🎯 TP1 HIT\n\nBE aktif")
 
     if not active.get("tp2_hit") and is_tp2_hit(active, current_price):
         active["tp2_hit"] = True
@@ -969,6 +1036,378 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
         close_active_signal(state, "TIMEOUT", current_price, notify_telegram=True)
         return
 
+# =========================================================
+# BTC / TREND BIAS
+# =========================================================
+def get_btc_bias():
+    try:
+        btc_15m = analyze_timeframe(get_klines(BTC_SYMBOL, "15m", 220))
+        btc_1h = analyze_timeframe(get_klines(BTC_SYMBOL, "1h", 220))
+
+        bull = (
+            btc_15m["ema20"] is not None and btc_15m["ema50"] is not None and
+            btc_15m["close"] > btc_15m["ema20"] and btc_15m["ema20"] > btc_15m["ema50"] and
+            btc_15m["rsi14"] is not None and btc_15m["rsi14"] >= 52 and
+            btc_1h["close"] > btc_1h["ema20"]
+        )
+
+        bear = (
+            btc_15m["ema20"] is not None and btc_15m["ema50"] is not None and
+            btc_15m["close"] < btc_15m["ema20"] and btc_15m["ema20"] < btc_15m["ema50"] and
+            btc_15m["rsi14"] is not None and btc_15m["rsi14"] <= 48 and
+            btc_1h["close"] < btc_1h["ema20"]
+        )
+
+        if bull:
+            return "LONG"
+        if bear:
+            return "SHORT"
+        return "NEUTRAL"
+    except Exception as e:
+        log(f"BTC bias exception: {e}")
+        return "NEUTRAL"
+
+# =========================================================
+# CORE STRATEGY
+# =========================================================
+def build_trade_signal(state):
+    candles_5m = get_klines(SYMBOL, "5m", 240)
+    candles_15m = get_klines(SYMBOL, "15m", 240)
+    candles_1h = get_klines(SYMBOL, "1h", 240)
+    candles_4h = get_klines(SYMBOL, "4h", 240)
+
+    tf5 = analyze_timeframe(candles_5m)
+    tf15 = analyze_timeframe(candles_15m)
+    tf1h = analyze_timeframe(candles_1h)
+    tf4h = analyze_timeframe(candles_4h)
+
+    current_price = tf5["close"]
+    atr_now = tf5["atr14"]
+
+    if atr_now is None or atr_now <= 0:
+        return None, current_price, "ATR_NOT_READY", {}
+
+    btc_bias = get_btc_bias() if USE_BTC_FILTER else "NEUTRAL"
+    usdtd_info = get_usdtd_bias(state)
+    usdtd_bias = usdtd_info["bias"]
+
+    long_score = 0.0
+    short_score = 0.0
+    reasons_long = []
+    reasons_short = []
+
+    # -----------------------------------------------------
+    # HARD TREND LOCK
+    # -----------------------------------------------------
+    allow_long = True
+    allow_short = True
+
+    # 4H structure lock
+    if REQUIRE_4H_TREND_LOCK:
+        long_4h_ok = (
+            tf4h["ema20"] is not None and tf4h["ema50"] is not None and
+            tf4h["close"] > tf4h["ema20"] and
+            tf4h["ema20"] >= tf4h["ema50"] and
+            tf4h["rsi14"] is not None and tf4h["rsi14"] >= 50
+        )
+
+        short_4h_ok = (
+            tf4h["ema20"] is not None and tf4h["ema50"] is not None and
+            tf4h["close"] < tf4h["ema20"] and
+            tf4h["ema20"] <= tf4h["ema50"] and
+            tf4h["rsi14"] is not None and tf4h["rsi14"] <= 50
+        )
+
+        if not long_4h_ok:
+            allow_long = False
+        if not short_4h_ok:
+            allow_short = False
+
+    # 15m lock
+    if REQUIRE_15M_TREND_LOCK:
+        long_15m_ok = (
+            tf15["ema9"] is not None and tf15["ema21"] is not None and tf15["ema50"] is not None and
+            tf15["close"] > tf15["ema21"] and
+            tf15["ema9"] >= tf15["ema21"] >= tf15["ema50"] and
+            tf15["rsi14"] is not None and tf15["rsi14"] >= 51 and
+            tf15["macd_hist"] is not None and tf15["macd_hist"] >= 0
+        )
+
+        short_15m_ok = (
+            tf15["ema9"] is not None and tf15["ema21"] is not None and tf15["ema50"] is not None and
+            tf15["close"] < tf15["ema21"] and
+            tf15["ema9"] <= tf15["ema21"] <= tf15["ema50"] and
+            tf15["rsi14"] is not None and tf15["rsi14"] <= 49 and
+            tf15["macd_hist"] is not None and tf15["macd_hist"] <= 0
+        )
+
+        if not long_15m_ok:
+            allow_long = False
+        if not short_15m_ok:
+            allow_short = False
+
+    # BTC confirmation
+    if REQUIRE_BTC_CONFIRMATION:
+        if btc_bias == "SHORT":
+            allow_long = False
+        elif btc_bias == "LONG":
+            allow_short = False
+
+    # USDTD optional veto
+    if REQUIRE_USDTD_CONFIRMATION:
+        if usdtd_bias == "SHORT":
+            allow_long = False
+        elif usdtd_bias == "LONG":
+            allow_short = False
+
+    # -----------------------------------------------------
+    # LONG SCORE
+    # -----------------------------------------------------
+    if allow_long:
+        if tf4h["close"] > tf4h["ema20"]:
+            long_score += 2.0
+            reasons_long.append("4H_EMA20")
+        if tf4h["ema20"] >= tf4h["ema50"]:
+            long_score += 1.5
+            reasons_long.append("4H_STACK")
+        if tf1h["close"] > tf1h["ema20"]:
+            long_score += 1.5
+            reasons_long.append("1H_EMA20")
+        if tf15["close"] > tf15["ema21"]:
+            long_score += 1.5
+            reasons_long.append("15M_EMA21")
+        if tf15["ema9"] >= tf15["ema21"] >= tf15["ema50"]:
+            long_score += 2.0
+            reasons_long.append("15M_STACK")
+        if tf15["rsi14"] is not None and tf15["rsi14"] >= 53:
+            long_score += 1.0
+            reasons_long.append("15M_RSI")
+        if tf15["macd_hist"] is not None and tf15["macd_hist"] > 0:
+            long_score += 1.0
+            reasons_long.append("15M_MACD")
+        if tf5["close"] > tf5["ema21"]:
+            long_score += 0.75
+            reasons_long.append("5M_ABOVE_EMA21")
+        if tf5["ema9"] is not None and tf5["ema21"] is not None and tf5["ema9"] >= tf5["ema21"]:
+            long_score += 0.75
+            reasons_long.append("5M_STACK")
+        if tf5["rsi14"] is not None and 51 <= tf5["rsi14"] <= 68:
+            long_score += 0.75
+            reasons_long.append("5M_RSI_OK")
+        if tf5["macd"] is not None and tf5["macd_signal"] is not None and tf5["macd"] >= tf5["macd_signal"]:
+            long_score += 0.75
+            reasons_long.append("5M_MACD")
+        if tf5["close_up_3"]:
+            long_score += 0.75
+            reasons_long.append("5M_CLOSE_UP3")
+        if tf5["hl3"]:
+            long_score += 0.75
+            reasons_long.append("5M_HL3")
+        if tf5["volume_avg_20"] and tf5["volume"] >= tf5["volume_avg_20"] * 1.10:
+            long_score += 0.75
+            reasons_long.append("VOL_OK")
+
+        if btc_bias == "LONG":
+            long_score += 1.0
+            reasons_long.append("BTC_OK")
+
+        if usdtd_bias == "LONG":
+            long_score += 1.0
+            reasons_long.append("USDTD_RISK_ON")
+        elif usdtd_bias == "SHORT":
+            long_score -= 1.25
+            reasons_long.append("USDTD_HEADWIND")
+
+    # -----------------------------------------------------
+    # SHORT SCORE
+    # -----------------------------------------------------
+    if allow_short:
+        if tf4h["close"] < tf4h["ema20"]:
+            short_score += 2.0
+            reasons_short.append("4H_EMA20")
+        if tf4h["ema20"] <= tf4h["ema50"]:
+            short_score += 1.5
+            reasons_short.append("4H_STACK")
+        if tf1h["close"] < tf1h["ema20"]:
+            short_score += 1.5
+            reasons_short.append("1H_EMA20")
+        if tf15["close"] < tf15["ema21"]:
+            short_score += 1.5
+            reasons_short.append("15M_EMA21")
+        if tf15["ema9"] <= tf15["ema21"] <= tf15["ema50"]:
+            short_score += 2.0
+            reasons_short.append("15M_STACK")
+        if tf15["rsi14"] is not None and tf15["rsi14"] <= 47:
+            short_score += 1.0
+            reasons_short.append("15M_RSI")
+        if tf15["macd_hist"] is not None and tf15["macd_hist"] < 0:
+            short_score += 1.0
+            reasons_short.append("15M_MACD")
+        if tf5["close"] < tf5["ema21"]:
+            short_score += 0.75
+            reasons_short.append("5M_BELOW_EMA21")
+        if tf5["ema9"] is not None and tf5["ema21"] is not None and tf5["ema9"] <= tf5["ema21"]:
+            short_score += 0.75
+            reasons_short.append("5M_STACK")
+        if tf5["rsi14"] is not None and 32 <= tf5["rsi14"] <= 49:
+            short_score += 0.75
+            reasons_short.append("5M_RSI_OK")
+        if tf5["macd"] is not None and tf5["macd_signal"] is not None and tf5["macd"] <= tf5["macd_signal"]:
+            short_score += 0.75
+            reasons_short.append("5M_MACD")
+        if tf5["close_down_3"]:
+            short_score += 0.75
+            reasons_short.append("5M_CLOSE_DOWN3")
+        if tf5["ll3"]:
+            short_score += 0.75
+            reasons_short.append("5M_LL3")
+        if tf5["volume_avg_20"] and tf5["volume"] >= tf5["volume_avg_20"] * 1.10:
+            short_score += 0.75
+            reasons_short.append("VOL_OK")
+
+        if btc_bias == "SHORT":
+            short_score += 1.0
+            reasons_short.append("BTC_OK")
+
+        if usdtd_bias == "SHORT":
+            short_score += 1.0
+            reasons_short.append("USDTD_RISK_OFF")
+        elif usdtd_bias == "LONG":
+            short_score -= 1.25
+            reasons_short.append("USDTD_HEADWIND")
+
+    # -----------------------------------------------------
+    # ENTRY CONFIRMATION / FAKE MOVE FILTER
+    # -----------------------------------------------------
+    long_entry_ok = False
+    short_entry_ok = False
+
+    if allow_long:
+        long_entry_ok = (
+            tf5["ema9"] is not None and tf5["ema21"] is not None and
+            tf5["close"] >= tf5["ema9"] >= tf5["ema21"] and
+            tf5["close_up_3"] and
+            not tf5["close_down_3"] and
+            tf5["hl3"] and
+            tf5["macd_hist"] is not None and tf5["macd_hist"] >= 0
+        )
+
+        # pump kovalamayı azalt
+        if tf5["atr14"] and tf5["ema20"] is not None:
+            dist_from_ema20 = abs(tf5["close"] - tf5["ema20"])
+            if dist_from_ema20 > tf5["atr14"] * 1.8:
+                long_entry_ok = False
+
+    if allow_short:
+        short_entry_ok = (
+            tf5["ema9"] is not None and tf5["ema21"] is not None and
+            tf5["close"] <= tf5["ema9"] <= tf5["ema21"] and
+            tf5["close_down_3"] and
+            not tf5["close_up_3"] and
+            tf5["ll3"] and
+            tf5["macd_hist"] is not None and tf5["macd_hist"] <= 0
+        )
+
+        if tf5["atr14"] and tf5["ema20"] is not None:
+            dist_from_ema20 = abs(tf5["close"] - tf5["ema20"])
+            if dist_from_ema20 > tf5["atr14"] * 1.8:
+                short_entry_ok = False
+
+    # -----------------------------------------------------
+    # BUILD FINAL
+    # -----------------------------------------------------
+    best_direction = None
+    best_score = 0.0
+    reason = ""
+    extra = {
+        "btc_bias": btc_bias,
+        "usdtd_bias": usdtd_bias,
+        "usdtd_reason": usdtd_info.get("reason"),
+    }
+
+    if allow_long and long_entry_ok and long_score >= LONG_SCORE_THRESHOLD and long_score > short_score:
+        entry = current_price
+        sl = entry - (atr_now * ATR_SL_MULTIPLIER)
+        tp1 = entry + (atr_now * ATR_TP1_MULTIPLIER)
+        tp2 = entry + (atr_now * ATR_TP2_MULTIPLIER)
+        tp3 = entry + (atr_now * ATR_TP3_MULTIPLIER)
+
+        risk = abs(entry - sl)
+        reward = abs(tp2 - entry)
+        rr = reward / risk if risk > 0 else 0
+
+        if rr >= MIN_RR_TO_TP2:
+            best_direction = "LONG"
+            best_score = long_score
+            reason = "|".join(reasons_long[:8])
+            signal = build_signal_payload("LONG", entry, sl, tp1, tp2, tp3, best_score, reason, extra)
+            return signal, current_price, "LONG_READY", {
+                "tf5": tf5,
+                "tf15": tf15,
+                "tf1h": tf1h,
+                "tf4h": tf4h
+            }
+
+    if allow_short and short_entry_ok and short_score >= SHORT_SCORE_THRESHOLD and short_score > long_score:
+        entry = current_price
+        sl = entry + (atr_now * ATR_SL_MULTIPLIER)
+        tp1 = entry - (atr_now * ATR_TP1_MULTIPLIER)
+        tp2 = entry - (atr_now * ATR_TP2_MULTIPLIER)
+        tp3 = entry - (atr_now * ATR_TP3_MULTIPLIER)
+
+        risk = abs(entry - sl)
+        reward = abs(tp2 - entry)
+        rr = reward / risk if risk > 0 else 0
+
+        if rr >= MIN_RR_TO_TP2:
+            best_direction = "SHORT"
+            best_score = short_score
+            reason = "|".join(reasons_short[:8])
+            signal = build_signal_payload("SHORT", entry, sl, tp1, tp2, tp3, best_score, reason, extra)
+            return signal, current_price, "SHORT_READY", {
+                "tf5": tf5,
+                "tf15": tf15,
+                "tf1h": tf1h,
+                "tf4h": tf4h
+            }
+
+    debug_info = (
+        f"NO_SIGNAL | "
+        f"allowL={allow_long} allowS={allow_short} "
+        f"entryL={long_entry_ok} entryS={short_entry_ok} "
+        f"scoreL={round(long_score,2)} scoreS={round(short_score,2)} "
+        f"btc={btc_bias} usdtd={usdtd_bias}"
+    )
+    return None, current_price, debug_info, {
+        "tf5": tf5,
+        "tf15": tf15,
+        "tf1h": tf1h,
+        "tf4h": tf4h
+    }
+
+# =========================================================
+# SEND RULES
+# =========================================================
+def signal_upgrade_needed(old_sig, new_sig):
+    if not old_sig or not new_sig:
+        return False, "NO_COMPARE"
+
+    old_score = safe_float(old_sig.get("score"), 0.0)
+    new_score = safe_float(new_sig.get("score"), 0.0)
+    old_entry = safe_float(old_sig.get("entry"), 0.0)
+    new_entry = safe_float(new_sig.get("entry"), 0.0)
+
+    score_diff = new_score - old_score
+    entry_diff_pct = pct_diff(old_entry, new_entry) if old_entry else 999.0
+
+    if score_diff >= RESEND_IF_SCORE_IMPROVED_BY:
+        return True, f"SCORE_UP:+{round(score_diff, 2)}"
+
+    if entry_diff_pct >= RESEND_IF_ENTRY_MOVED_PCT:
+        return True, f"ENTRY_SHIFT:{round(entry_diff_pct, 3)}%"
+
+    return False, "NO_MEANINGFUL_UPGRADE"
+
 def recent_gap_blocked(state, new_signal):
     last_signal = state.get("last_signal")
     if not last_signal:
@@ -993,311 +1432,30 @@ def should_send_signal(state, new_signal, current_price):
             return False, "RECENT_DUPLICATE_GAP"
         return True, "NO_ACTIVE_SIGNAL"
 
-    active_age = minutes_since(active.get("created_ts"))
-    if active_age >= MAX_ACTIVE_SIGNAL_AGE_MINUTES:
-        close_active_signal(state, "MAX_ACTIVE_AGE_EXCEEDED", current_price, notify_telegram=True)
-        if recent_gap_blocked(state, new_signal):
-            return False, "RECENT_DUPLICATE_GAP"
-        return True, "ACTIVE_TOO_OLD"
+    # aynı yön, aynı entry civarı ise spam engeli
+    if is_same_direction(active, new_signal):
+        dist = entry_distance_pct(active, new_signal)
+        if dist < MIN_PRICE_DISTANCE_PCT:
+            upgraded, reason = signal_upgrade_needed(active, new_signal)
+            if upgraded and ALLOW_SMART_REPEAT_SIGNAL:
+                return True, f"UPGRADE:{reason}"
+            return False, "ACTIVE_DUPLICATE"
 
+    # ters sinyal sadece daha güçlü ise
     if is_opposite_direction(active, new_signal):
-        active_score = safe_float(active.get("score"), 0.0)
+        old_score = safe_float(active.get("score"), 0.0)
         new_score = safe_float(new_signal.get("score"), 0.0)
 
-        if new_score >= active_score + REVERSE_SIGNAL_STRENGTH_BONUS:
+        if new_score >= old_score + 1.75:
             close_active_signal(state, "REVERSED_BY_STRONGER_SIGNAL", current_price, notify_telegram=True)
-            return True, "OPPOSITE_STRONG_SIGNAL"
+            return True, "REVERSED_BY_STRONGER_SIGNAL"
+        return False, "OPPOSITE_NOT_STRONG_ENOUGH"
 
-        return False, "OPPOSITE_SIGNAL_NOT_STRONG_ENOUGH"
+    return False, "BLOCKED"
 
-    dist_pct = entry_distance_pct(active, new_signal)
-    active_score = safe_float(active.get("score"), 0.0)
-    new_score = safe_float(new_signal.get("score"), 0.0)
-
-    if dist_pct >= MIN_PRICE_DISTANCE_PCT:
-        return True, "SAME_DIRECTION_NEW_ZONE"
-
-    if new_score >= active_score + SAME_DIRECTION_SCORE_BONUS:
-        return True, "SAME_DIRECTION_MUCH_STRONGER"
-
-    if ALLOW_SMART_REPEAT_SIGNAL:
-        upgraded, why = signal_upgrade_needed(active, new_signal)
-        if upgraded:
-            return True, why
-
-    return False, "SIMILAR_ACTIVE_SIGNAL_STILL_OPEN"
-
-def register_sent_signal(state, sent_signal):
-    sent_signal["created_ts"] = utc_ts()
-    sent_signal["updated_ts"] = utc_ts()
-    sent_signal["status"] = "PENDING"
-    sent_signal["active"] = False
-    sent_signal["signal_signature"] = build_signal_signature(sent_signal)
-    state["active_signal"] = sent_signal
-    state["last_signal"] = sent_signal
-
-# =========================================================
-# ANALYSIS HELPERS
-# =========================================================
-def analyze_timeframe(candles):
-    closed = candles[:-1] if len(candles) > 2 else candles[:]
-    if len(closed) < 60:
-        raise ValueError("Yeterli kapalı mum verisi yok")
-
-    closes = [c["close"] for c in closed]
-    highs = [c["high"] for c in closed]
-    lows = [c["low"] for c in closed]
-    volumes = [c["volume"] for c in closed]
-
-    ema9 = ema_series(closes, 9)
-    ema21 = ema_series(closes, 21)
-    ema50 = ema_series(closes, 50)
-    rsi14 = rsi_series(closes, 14)
-    macd_line, macd_signal, macd_hist = macd_series(closes, 12, 26, 9)
-
-    return {
-        "close": closes[-1],
-        "prev_close": closes[-2] if len(closes) >= 2 else closes[-1],
-        "ema9": ema9[-1],
-        "ema21": ema21[-1],
-        "ema50": ema50[-1],
-        "rsi14": rsi14[-1],
-        "macd": macd_line[-1],
-        "macd_signal": macd_signal[-1],
-        "macd_hist": macd_hist[-1],
-        "atr14": atr(closed, 14),
-        "swing_high_20": highest_high(closed, 20),
-        "swing_low_20": lowest_low(closed, 20),
-        "vol_last": volumes[-1],
-        "vol_sma20": sma(volumes, 20),
-        "high_last": highs[-1],
-        "low_last": lows[-1],
-    }
-
-def get_btc_filter_bias():
-    if not USE_BTC_FILTER:
-        return "NEUTRAL", "BTC_FILTER_DISABLED"
-
-    try:
-        btc_15m = get_klines(BTC_SYMBOL, "15m", 80)
-        closed = btc_15m[:-1] if len(btc_15m) > 6 else btc_15m
-
-        btc_close_prev = closed[-5]["close"]
-        btc_close_now = closed[-1]["close"]
-        btc_move = pct_change(btc_close_prev, btc_close_now)
-
-        if btc_move >= BTC_15M_TREND_THRESHOLD:
-            return "LONG", f"BTC_BULL:{round(btc_move, 3)}%"
-        elif btc_move <= -BTC_15M_TREND_THRESHOLD:
-            return "SHORT", f"BTC_BEAR:{round(btc_move, 3)}%"
-        else:
-            return "NEUTRAL", f"BTC_FLAT:{round(btc_move, 3)}%"
-    except Exception as e:
-        return "NEUTRAL", f"BTC_FILTER_FAIL_OPEN:{e}"
-
-# =========================================================
-# SIGNAL ENGINE
-# =========================================================
-def build_trade_signal(state):
-    candles_15m = get_klines(SYMBOL, "15m", 200)
-    candles_5m = get_klines(SYMBOL, "5m", 200)
-    candles_1h = get_klines(SYMBOL, "60m", 150)
-
-    tf15 = analyze_timeframe(candles_15m)
-    tf5 = analyze_timeframe(candles_5m)
-    tf1h = analyze_timeframe(candles_1h)
-
-    current_price = tf5["close"]
-    btc_bias, btc_reason = get_btc_filter_bias()
-    usdtd_bias, usdtd_reason, usdtd_now, usdtd_fast, usdtd_slow = get_usdtd_bias(state)
-
-    long_score = 0.0
-    short_score = 0.0
-    reasons_long = []
-    reasons_short = []
-
-    if tf15["ema9"] and tf15["ema21"] and tf15["ema50"]:
-        if tf15["ema9"] > tf15["ema21"] > tf15["ema50"]:
-            long_score += 3.0
-            reasons_long.append("15m ema bull stack")
-
-        if tf15["ema9"] < tf15["ema21"] < tf15["ema50"]:
-            short_score += 3.0
-            reasons_short.append("15m ema bear stack")
-
-    if tf15["close"] > (tf15["ema21"] or 0):
-        long_score += 1.5
-        reasons_long.append("15m close > ema21")
-    else:
-        short_score += 1.5
-        reasons_short.append("15m close < ema21")
-
-    if tf15["rsi14"] is not None:
-        if 52 <= tf15["rsi14"] <= 72:
-            long_score += 1.5
-            reasons_long.append(f"15m rsi strong {round(tf15['rsi14'], 2)}")
-        if 28 <= tf15["rsi14"] <= 48:
-            short_score += 1.5
-            reasons_short.append(f"15m rsi weak {round(tf15['rsi14'], 2)}")
-
-    if tf15["macd_hist"] is not None:
-        if tf15["macd_hist"] > 0:
-            long_score += 1.5
-            reasons_long.append("15m macd hist > 0")
-        if tf15["macd_hist"] < 0:
-            short_score += 1.5
-            reasons_short.append("15m macd hist < 0")
-
-    if tf1h["ema21"] and tf1h["ema50"]:
-        if tf1h["close"] > tf1h["ema21"] and tf1h["ema21"] > tf1h["ema50"]:
-            long_score += 1.5
-            reasons_long.append("60m strong long trend")
-
-        if tf1h["close"] < tf1h["ema21"] and tf1h["ema21"] < tf1h["ema50"]:
-            short_score += 1.5
-            reasons_short.append("60m strong short trend")
-
-    if tf1h["rsi14"] is not None:
-        if tf1h["rsi14"] >= 52:
-            long_score += 0.5
-            reasons_long.append(f"60m rsi bullish {round(tf1h['rsi14'], 2)}")
-        elif tf1h["rsi14"] <= 48:
-            short_score += 0.5
-            reasons_short.append(f"60m rsi bearish {round(tf1h['rsi14'], 2)}")
-
-    if btc_bias == "LONG":
-        long_score += 1.0
-        short_score -= 0.75
-        reasons_long.append("btc supports long")
-        reasons_short.append("btc against short")
-    elif btc_bias == "SHORT":
-        short_score += 1.0
-        long_score -= 0.75
-        reasons_short.append("btc supports short")
-        reasons_long.append("btc against long")
-    else:
-        long_score -= 0.20
-        short_score -= 0.20
-
-    if usdtd_bias == "LONG":
-        long_score += USDTD_LONG_SCORE_BONUS
-        short_score -= USDTD_OPPOSITE_PENALTY
-        reasons_long.append("usdtd risk-on")
-        reasons_short.append("usdtd against short")
-    elif usdtd_bias == "SHORT":
-        short_score += USDTD_SHORT_SCORE_BONUS
-        long_score -= USDTD_OPPOSITE_PENALTY
-        reasons_short.append("usdtd risk-off")
-        reasons_long.append("usdtd against long")
-    else:
-        reasons_long.append("usdtd neutral")
-        reasons_short.append("usdtd neutral")
-
-    long_entry_ok = False
-    short_entry_ok = False
-
-    if tf5["ema9"] and tf5["ema21"] and tf5["ema50"]:
-        if (
-            current_price > tf5["ema21"] and
-            tf5["ema9"] >= tf5["ema21"] and
-            tf5["ema21"] >= tf5["ema50"] and
-            tf5["rsi14"] is not None and 48 <= tf5["rsi14"] <= 68 and
-            tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] >= tf5["macd_signal"]
-        ):
-            long_score += 3.0
-            reasons_long.append("5m entry aligned")
-            long_entry_ok = True
-
-        if (
-            current_price < tf5["ema21"] and
-            tf5["ema9"] <= tf5["ema21"] and
-            tf5["ema21"] <= tf5["ema50"] and
-            tf5["rsi14"] is not None and 32 <= tf5["rsi14"] <= 52 and
-            tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] <= tf5["macd_signal"]
-        ):
-            short_score += 3.0
-            reasons_short.append("5m entry aligned")
-            short_entry_ok = True
-
-    if tf5["vol_last"] and tf5["vol_sma20"]:
-        if tf5["vol_last"] > tf5["vol_sma20"] * 1.08:
-            if long_entry_ok:
-                long_score += 1.0
-                reasons_long.append("5m vol strong confirm")
-            if short_entry_ok:
-                short_score += 1.0
-                reasons_short.append("5m vol strong confirm")
-
-    atr5 = tf5["atr14"]
-    if atr5 is None or atr5 <= 0:
-        return None, current_price, "ATR_UNAVAILABLE", atr5
-
-    candidates = []
-
-    if long_entry_ok and long_score >= LONG_SCORE_THRESHOLD:
-        entry = current_price
-        sl = entry - (atr5 * ATR_SL_MULTIPLIER)
-        tp1 = entry + (atr5 * ATR_TP1_MULTIPLIER)
-        tp2 = entry + (atr5 * ATR_TP2_MULTIPLIER)
-        tp3 = entry + (atr5 * ATR_TP3_MULTIPLIER)
-
-        risk = entry - sl
-        reward_tp2 = tp2 - entry
-        rr = reward_tp2 / risk if risk > 0 else 0
-
-        if rr >= MIN_RR_TO_TP2:
-            reasons = reasons_long[:8] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
-            if usdtd_now is not None and usdtd_fast is not None and usdtd_slow is not None:
-                reasons.append(f"USDTD:{round(usdtd_now,3)} F/S:{round(usdtd_fast,3)}/{round(usdtd_slow,3)}")
-
-            candidates.append(build_signal_payload(
-                direction="LONG",
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                score=long_score,
-                strategy_tag="ETH_MEXC_15M_TREND_5M_ENTRY_USDTD",
-                reason=" | ".join(reasons)
-            ))
-
-    if short_entry_ok and short_score >= SHORT_SCORE_THRESHOLD:
-        entry = current_price
-        sl = entry + (atr5 * ATR_SL_MULTIPLIER)
-        tp1 = entry - (atr5 * ATR_TP1_MULTIPLIER)
-        tp2 = entry - (atr5 * ATR_TP2_MULTIPLIER)
-        tp3 = entry - (atr5 * ATR_TP3_MULTIPLIER)
-
-        risk = sl - entry
-        reward_tp2 = entry - tp2
-        rr = reward_tp2 / risk if risk > 0 else 0
-
-        if rr >= MIN_RR_TO_TP2:
-            reasons = reasons_short[:8] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
-            if usdtd_now is not None and usdtd_fast is not None and usdtd_slow is not None:
-                reasons.append(f"USDTD:{round(usdtd_now,3)} F/S:{round(usdtd_fast,3)}/{round(usdtd_slow,3)}")
-
-            candidates.append(build_signal_payload(
-                direction="SHORT",
-                entry=entry,
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                score=short_score,
-                strategy_tag="ETH_MEXC_15M_TREND_5M_ENTRY_USDTD",
-                reason=" | ".join(reasons)
-            ))
-
-    if not candidates:
-        return None, current_price, f"NO_VALID_SIGNAL | long={round(long_score, 2)} short={round(short_score, 2)}", atr5
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best = candidates[0]
-    return best, current_price, f"SIGNAL_READY | long={round(long_score, 2)} short={round(short_score, 2)}", atr5
+def register_sent_signal(state, signal):
+    state["last_signal"] = signal
+    state["active_signal"] = signal
 
 # =========================================================
 # COMMANDS
@@ -1305,28 +1463,42 @@ def build_trade_signal(state):
 def handle_command(state, text):
     text = (text or "").strip().lower()
 
-    if text in ("/yardim", "/help", "/start"):
-        return help_text()
-
     if text == "/panel":
         return format_panel(state)
-
     if text == "/gunluk":
         return aggregate_period_summary(state, "daily")
-
     if text == "/haftalik":
         return aggregate_period_summary(state, "weekly")
-
     if text == "/aktif":
         return format_active_signal(state.get("active_signal"))
+    if text == "/yardim":
+        return help_text()
+    if text == "/usdtd":
+        info = get_usdtd_bias(state)
+        return (
+            f"USDT.D\n\n"
+            f"Bias: {info['bias']}\n"
+            f"Now: {fmt_price(info['now']) if info['now'] is not None else '-'}\n"
+            f"Fast: {fmt_price(info['fast']) if info['fast'] is not None else '-'}\n"
+            f"Slow: {fmt_price(info['slow']) if info['slow'] is not None else '-'}\n"
+            f"Reason: {info['reason']}"
+        )
+    if text == "/fiyat":
+        try:
+            p = get_last_price(SYMBOL)
+            return f"ETHUSDT: {fmt_price(p)}"
+        except Exception as e:
+            return f"Fiyat alınamadı: {e}"
 
     return None
 
 def process_telegram_commands(state):
-    updates = tg_get_updates(int(state.get("last_update_id", 0)) + 1)
+    offset = int(state.get("last_update_id", 0)) + 1
+    updates = tg_get_updates(offset)
 
     for upd in updates:
-        state["last_update_id"] = upd.get("update_id", state.get("last_update_id", 0))
+        update_id = int(upd.get("update_id", 0))
+        state["last_update_id"] = max(int(state.get("last_update_id", 0)), update_id)
 
         msg = upd.get("message") or upd.get("edited_message") or {}
         chat = msg.get("chat", {})
@@ -1377,26 +1549,22 @@ def run_once():
                 if old_active and is_same_direction(old_active, signal):
                     upgraded, upgrade_reason = signal_upgrade_needed(old_active, signal)
 
-                    if upgraded:
-                        message = format_upgraded_signal_message(
-                            old_sig=old_active,
-                            new_sig=signal,
-                            current_price=current_price,
-                            upgrade_reason=upgrade_reason
-                        )
+                    if upgraded and ALLOW_SMART_REPEAT_SIGNAL:
+                        message = format_upgraded_signal_message(old_active, signal, upgrade_reason)
                     else:
-                        message = format_signal_message(signal, current_price)
+                        message = format_signal_message(signal)
                 else:
-                    message = format_signal_message(signal, current_price)
+                    message = format_signal_message(signal)
 
                 sent = tg_send(message)
 
                 if sent:
                     register_sent_signal(state, signal)
                     log(
-                        f"YENI/UPDATED SINYAL GONDERILDI | {signal['direction']} | "
-                        f"entry={signal['entry']} sl={signal['sl']} tp1={signal['tp1']} "
-                        f"tp2={signal['tp2']} tp3={signal['tp3']} score={signal['score']} | {reason_code}"
+                        f"SINYAL | {signal['direction']} | "
+                        f"entry={signal['entry']} sl={signal['sl']} "
+                        f"tp1={signal['tp1']} tp2={signal['tp2']} tp3={signal['tp3']} "
+                        f"score={signal['score']} | {reason_code}"
                     )
                 else:
                     log("Sinyal bulundu ama Telegram gönderimi başarısız.")
@@ -1419,23 +1587,18 @@ def run_once():
 def send_startup_message():
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            "🤖 CoinRadar PRO++ başladı\n\n"
-            "Kaynak: MEXC Spot\n"
-            "Filtre: BTC + USDT.D\n"
-            "Komutlar: /panel /gunluk /haftalik /aktif /yardim"
+            "🤖 CoinRadar FINAL başladı\n\n"
+            "Kaynak: MEXC\n"
+            "Filtre: BTC + USDT.D + Hard Trend Lock\n"
+            "Komutlar: /panel /gunluk /haftalik /aktif /yardim /usdtd /fiyat"
         )
         log("Başlangıç mesajı gönderildi.")
     else:
         log("Başlangıç mesajı gönderilemedi: Telegram ENV eksik.")
 
 def main():
-    log("Bot başlıyor...")
-    log(f"Telegram token var mi: {'EVET' if TELEGRAM_TOKEN else 'HAYIR'}")
-    log(f"Telegram chat id: {TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else 'BOS'}")
     send_startup_message()
-
     while True:
-        log("Analiz yapılıyor...")
         run_once()
         time.sleep(CHECK_EVERY_SECONDS)
 
