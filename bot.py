@@ -11,13 +11,9 @@ import requests
 SYMBOL = "ETHUSDT"
 BTC_SYMBOL = "BTCUSDT"
 
-# MEXC Spot V3 public market endpoints
 MEXC_BASE_URL = "https://api.mexc.com"
-
-# CoinGecko global data for USDT dominance proxy
 COINGECKO_BASE_URL = "https://api.coingecko.com/api/v3"
 
-# Telegram ENV fallback
 TELEGRAM_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     or os.getenv("BOT_TOKEN", "").strip()
@@ -82,6 +78,14 @@ HTTP_TIMEOUT = 15
 # ---------------------------------------------------------
 ENTRY_NEAR_PCT = 0.12
 CANCEL_IF_TP1_BEFORE_ENTRY = True
+
+# ---------------------------------------------------------
+# PRO++ SMART RESEND / MESSAGE
+# ---------------------------------------------------------
+RESEND_IF_SCORE_IMPROVED_BY = 1.0
+RESEND_IF_ENTRY_MOVED_PCT = 0.22
+RESEND_IF_REASON_CHANGED = True
+ALLOW_SMART_REPEAT_SIGNAL = True
 
 # =========================================================
 # UTILS
@@ -148,6 +152,7 @@ def tg_send(text: str):
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
 
@@ -209,7 +214,6 @@ def get_last_price(symbol: str):
 
 # =========================================================
 # COINGECKO -> USDT.D PROXY
-# USDT.D ~= tether market cap / total market cap * 100
 # =========================================================
 def cg_get_global_total_market_cap():
     url = f"{COINGECKO_BASE_URL}/global"
@@ -448,7 +452,6 @@ def get_usdtd_bias(state):
         if usdtd_fast is None or usdtd_slow is None:
             return "NEUTRAL", "USDTD_EMA_NOT_READY", usdtd_now, usdtd_fast, usdtd_slow
 
-        # USDT.D düşüşü risk-on, yükselişi risk-off
         if usdtd_fast < usdtd_slow and usdtd_now <= usdtd_fast:
             return "LONG", f"USDTD_RISK_ON:{round(usdtd_now, 3)}", usdtd_now, usdtd_fast, usdtd_slow
         elif usdtd_fast > usdtd_slow and usdtd_now >= usdtd_fast:
@@ -460,8 +463,59 @@ def get_usdtd_bias(state):
         return "NEUTRAL", f"USDTD_FAIL_OPEN:{e}", None, None, None
 
 # =========================================================
-# SIGNAL / MESSAGE HELPERS
+# MESSAGE HELPERS
 # =========================================================
+def classify_signal_strength(score):
+    s = safe_float(score, 0.0)
+    if s >= 12.0:
+        return "GUCLU"
+    elif s >= 10.0:
+        return "ORTA"
+    return "ZAYIF"
+
+def short_reason_text(reason, limit=180):
+    text = str(reason or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+def build_signal_signature(sig):
+    if not sig:
+        return ""
+    return (
+        f"{sig.get('direction','')}"
+        f"|{round(safe_float(sig.get('entry'), 0.0), 2)}"
+        f"|{round(safe_float(sig.get('score'), 0.0), 2)}"
+        f"|{sig.get('strategy_tag','')}"
+    )
+
+def signal_upgrade_needed(old_sig, new_sig):
+    if not old_sig or not new_sig:
+        return False, "NO_COMPARE"
+
+    old_score = safe_float(old_sig.get("score"), 0.0)
+    new_score = safe_float(new_sig.get("score"), 0.0)
+
+    old_entry = safe_float(old_sig.get("entry"), 0.0)
+    new_entry = safe_float(new_sig.get("entry"), 0.0)
+
+    old_reason = str(old_sig.get("reason", "")).strip()
+    new_reason = str(new_sig.get("reason", "")).strip()
+
+    score_diff = new_score - old_score
+    entry_diff_pct = pct_diff(old_entry, new_entry) if old_entry else 999.0
+
+    if score_diff >= RESEND_IF_SCORE_IMPROVED_BY:
+        return True, f"SCORE_UPGRADE:+{round(score_diff,2)}"
+
+    if entry_diff_pct >= RESEND_IF_ENTRY_MOVED_PCT:
+        return True, f"ENTRY_SHIFT:{round(entry_diff_pct,3)}%"
+
+    if RESEND_IF_REASON_CHANGED and old_reason != new_reason:
+        return True, "REASON_CHANGED"
+
+    return False, "NO_MEANINGFUL_UPGRADE"
+
 def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason):
     return {
         "direction": direction.upper(),
@@ -482,7 +536,8 @@ def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_ta
         "tp3_hit": False,
         "breakeven_done": False,
         "trail_active": False,
-        "trail_stop": round(float(sl), 4)
+        "trail_stop": round(float(sl), 4),
+        "signal_signature": ""
     }
 
 def is_same_direction(a, b):
@@ -497,72 +552,127 @@ def entry_distance_pct(sig_a, sig_b):
     return pct_diff(sig_a.get("entry"), sig_b.get("entry"))
 
 def format_signal_message(sig, current_price):
-    emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
-    risk = abs(sig["entry"] - sig["sl"])
-    reward_tp2 = abs(sig["tp2"] - sig["entry"])
-    rr = (reward_tp2 / risk) if risk > 0 else 0
+    direction = sig["direction"].upper()
+    emoji = "🟢" if direction == "LONG" else "🔴"
+
+    entry = safe_float(sig.get("entry"), 0.0)
+    sl = safe_float(sig.get("sl"), 0.0)
+    tp1 = safe_float(sig.get("tp1"), 0.0)
+    tp2 = safe_float(sig.get("tp2"), 0.0)
+    tp3 = safe_float(sig.get("tp3"), 0.0)
+    score = safe_float(sig.get("score"), 0.0)
+
+    risk = abs(entry - sl)
+    reward1 = abs(tp1 - entry)
+    reward2 = abs(tp2 - entry)
+    reward3 = abs(tp3 - entry)
+
+    rr1 = (reward1 / risk) if risk > 0 else 0.0
+    rr2 = (reward2 / risk) if risk > 0 else 0.0
+    rr3 = (reward3 / risk) if risk > 0 else 0.0
+
+    strength = classify_signal_strength(score)
 
     return (
-        f"{emoji} ETHUSDT {sig['direction']} SINYAL\n"
-        f"Kaynak: MEXC\n"
-        f"Fiyat: {fmt_price(current_price)}\n"
-        f"Entry: {fmt_price(sig['entry'])}\n"
-        f"SL: {fmt_price(sig['sl'])}\n"
-        f"TP1: {fmt_price(sig['tp1'])}\n"
-        f"TP2: {fmt_price(sig['tp2'])}\n"
-        f"TP3: {fmt_price(sig['tp3'])}\n"
-        f"RR(TP2): {rr:.2f}\n"
-        f"Score: {sig['score']}\n"
-        f"Setup: {sig['strategy_tag']}\n"
-        f"Durum: {'ACTIVE' if sig.get('active') else 'PENDING'}\n"
-        f"Neden: {sig['reason']}\n"
-        f"Zaman: {now_str()}"
+        f"{emoji} <b>ETHUSDT {direction} SINYAL</b>\n\n"
+        f"<b>İşlem Gücü:</b> {strength}\n"
+        f"<b>Skor:</b> {score:.2f}\n"
+        f"<b>Kaynak:</b> MEXC\n"
+        f"<b>Anlık Fiyat:</b> {fmt_price(current_price)}\n\n"
+        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
+        f"<b>SL:</b> {fmt_price(sl)}\n"
+        f"<b>TP1:</b> {fmt_price(tp1)} | RR: {rr1:.2f}\n"
+        f"<b>TP2:</b> {fmt_price(tp2)} | RR: {rr2:.2f}\n"
+        f"<b>TP3:</b> {fmt_price(tp3)} | RR: {rr3:.2f}\n\n"
+        f"<b>Durum:</b> {'ACTIVE' if sig.get('active') else 'PENDING'}\n"
+        f"<b>Setup:</b> {sig.get('strategy_tag','-')}\n"
+        f"<b>Özet:</b> {short_reason_text(sig.get('reason',''))}\n"
+        f"<b>Zaman:</b> {now_str()}"
+    )
+
+def format_upgraded_signal_message(old_sig, new_sig, current_price, upgrade_reason):
+    direction = new_sig["direction"].upper()
+    emoji = "🟢" if direction == "LONG" else "🔴"
+
+    old_score = safe_float(old_sig.get("score"), 0.0)
+    new_score = safe_float(new_sig.get("score"), 0.0)
+    strength = classify_signal_strength(new_score)
+
+    entry = safe_float(new_sig.get("entry"), 0.0)
+    sl = safe_float(new_sig.get("sl"), 0.0)
+    tp1 = safe_float(new_sig.get("tp1"), 0.0)
+    tp2 = safe_float(new_sig.get("tp2"), 0.0)
+    tp3 = safe_float(new_sig.get("tp3"), 0.0)
+
+    risk = abs(entry - sl)
+    rr1 = abs(tp1 - entry) / risk if risk > 0 else 0.0
+    rr2 = abs(tp2 - entry) / risk if risk > 0 else 0.0
+    rr3 = abs(tp3 - entry) / risk if risk > 0 else 0.0
+
+    return (
+        f"{emoji} <b>ETHUSDT {direction} SINYAL GUNCELLENDI</b>\n\n"
+        f"<b>İşlem Gücü:</b> {strength}\n"
+        f"<b>Skor:</b> {old_score:.2f} → {new_score:.2f}\n"
+        f"<b>Güncelleme Nedeni:</b> {upgrade_reason}\n"
+        f"<b>Anlık Fiyat:</b> {fmt_price(current_price)}\n\n"
+        f"<b>ENTRY:</b> {fmt_price(entry)}\n"
+        f"<b>SL:</b> {fmt_price(sl)}\n"
+        f"<b>TP1:</b> {fmt_price(tp1)} | RR: {rr1:.2f}\n"
+        f"<b>TP2:</b> {fmt_price(tp2)} | RR: {rr2:.2f}\n"
+        f"<b>TP3:</b> {fmt_price(tp3)} | RR: {rr3:.2f}\n\n"
+        f"<b>Setup:</b> {new_sig.get('strategy_tag','-')}\n"
+        f"<b>Özet:</b> {short_reason_text(new_sig.get('reason',''))}\n"
+        f"<b>Zaman:</b> {now_str()}"
     )
 
 def format_close_message(sig, close_reason, close_price=None):
     direction_emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
     reason_map = {
-        "SL_HIT": "Stop oldu",
-        "TP3_HIT": "TP3 görüldü",
-        "TIMEOUT": "Süre doldu",
-        "MAX_ACTIVE_AGE_EXCEEDED": "Maks aktif süre doldu",
-        "REVERSED_BY_STRONGER_SIGNAL": "Daha güçlü ters sinyal geldi",
-        "CANCELLED_BEFORE_ENTRY_TP1": "Entry gelmeden TP1'e gitti, setup iptal",
+        "SL_HIT": "STOP ÇALIŞTI",
+        "TP3_HIT": "TP3 GÖRÜLDÜ",
+        "TIMEOUT": "SÜRE DOLDU",
+        "MAX_ACTIVE_AGE_EXCEEDED": "MAKSİMUM AKTİF SÜRE DOLDU",
+        "REVERSED_BY_STRONGER_SIGNAL": "DAHA GÜÇLÜ TERS SİNYAL GELDİ",
+        "CANCELLED_BEFORE_ENTRY_TP1": "ENTRY GELMEDEN TP1'E GİTTİ, SETUP İPTAL"
     }
     reason_text = reason_map.get(close_reason, close_reason)
 
     body = (
-        f"✅ ETHUSDT SINYAL KAPANDI\n"
-        f"Yön: {direction_emoji} {sig['direction']}\n"
-        f"Entry: {fmt_price(sig.get('entry'))}\n"
-        f"SL: {fmt_price(sig.get('sl'))}\n"
-        f"TP1: {fmt_price(sig.get('tp1'))}\n"
-        f"TP2: {fmt_price(sig.get('tp2'))}\n"
-        f"TP3: {fmt_price(sig.get('tp3'))}\n"
-        f"Kapanış nedeni: {reason_text}\n"
+        f"✅ <b>ETHUSDT SİNYAL KAPANDI</b>\n\n"
+        f"<b>Yön:</b> {direction_emoji} {sig['direction']}\n"
+        f"<b>İşlem Gücü:</b> {classify_signal_strength(sig.get('score'))}\n"
+        f"<b>Entry:</b> {fmt_price(sig.get('entry'))}\n"
+        f"<b>SL:</b> {fmt_price(sig.get('sl'))}\n"
+        f"<b>TP1:</b> {fmt_price(sig.get('tp1'))}\n"
+        f"<b>TP2:</b> {fmt_price(sig.get('tp2'))}\n"
+        f"<b>TP3:</b> {fmt_price(sig.get('tp3'))}\n"
+        f"<b>Kapanış Nedeni:</b> {reason_text}\n"
     )
 
     if close_price is not None:
-        body += f"Kapanış fiyatı: {fmt_price(close_price)}\n"
+        body += f"<b>Kapanış Fiyatı:</b> {fmt_price(close_price)}\n"
 
-    body += f"İlk score: {sig.get('score')}\nZaman: {now_str()}"
+    body += (
+        f"<b>Skor:</b> {safe_float(sig.get('score'), 0.0):.2f}\n"
+        f"<b>Zaman:</b> {now_str()}"
+    )
     return body
 
 def format_be_message(sig):
     return (
-        f"🛡️ BE AKTİF\n"
-        f"Yön: {sig['direction']}\n"
-        f"Yeni Stop: {fmt_price(sig['sl'])}\n"
-        f"Zaman: {now_str()}"
+        f"🛡️ <b>BE AKTİF</b>\n\n"
+        f"<b>Yön:</b> {sig['direction']}\n"
+        f"<b>Yeni Stop:</b> {fmt_price(sig['sl'])}\n"
+        f"<b>Zaman:</b> {now_str()}"
     )
 
 def format_tp2_trailing_message(sig, current_price):
     return (
-        f"🎯 TP2 GELDİ - TRAILING AKTİF\n"
-        f"Yön: {sig['direction']}\n"
-        f"Fiyat: {fmt_price(current_price)}\n"
-        f"Trail Stop: {fmt_price(sig['trail_stop'])}\n"
-        f"Zaman: {now_str()}"
+        f"🎯 <b>TP2 GELDİ - TRAILING AKTİF</b>\n\n"
+        f"<b>Yön:</b> {sig['direction']}\n"
+        f"<b>Fiyat:</b> {fmt_price(current_price)}\n"
+        f"<b>Trail Stop:</b> {fmt_price(sig['trail_stop'])}\n"
+        f"<b>Zaman:</b> {now_str()}"
     )
 
 # =========================================================
@@ -701,11 +811,11 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             active["status"] = "OPEN"
             active["updated_ts"] = utc_ts()
             tg_send(
-                f"✅ ENTRY FILLED\n"
-                f"Yön: {active['direction']}\n"
-                f"Entry: {fmt_price(active['entry'])}\n"
-                f"Güncel fiyat: {fmt_price(current_price)}\n"
-                f"Zaman: {now_str()}"
+                f"✅ <b>ENTRY FILLED</b>\n\n"
+                f"<b>Yön:</b> {active['direction']}\n"
+                f"<b>Entry:</b> {fmt_price(active['entry'])}\n"
+                f"<b>Güncel Fiyat:</b> {fmt_price(current_price)}\n"
+                f"<b>Zaman:</b> {now_str()}"
             )
             return
 
@@ -715,7 +825,6 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
 
         return
 
-    # OPEN trade management
     if is_sl_hit(active, current_price):
         close_active_signal(state, "SL_HIT", current_price, notify_telegram=True)
         return
@@ -728,11 +837,11 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             active["breakeven_done"] = True
             active["updated_ts"] = utc_ts()
             tg_send(
-                f"✅ TP1 GELDİ\n"
-                f"Yön: {active['direction']}\n"
-                f"Fiyat: {fmt_price(current_price)}\n"
-                f"TP1: {fmt_price(active['tp1'])}\n"
-                f"Zaman: {now_str()}"
+                f"✅ <b>TP1 GELDİ</b>\n\n"
+                f"<b>Yön:</b> {active['direction']}\n"
+                f"<b>Fiyat:</b> {fmt_price(current_price)}\n"
+                f"<b>TP1:</b> {fmt_price(active['tp1'])}\n"
+                f"<b>Zaman:</b> {now_str()}"
             )
             tg_send(format_be_message(active))
 
@@ -804,13 +913,19 @@ def should_send_signal(state, new_signal, current_price):
         return False, "OPPOSITE_SIGNAL_NOT_STRONG_ENOUGH"
 
     dist_pct = entry_distance_pct(active, new_signal)
+    active_score = safe_float(active.get("score"), 0.0)
+    new_score = safe_float(new_signal.get("score"), 0.0)
+
     if dist_pct >= MIN_PRICE_DISTANCE_PCT:
         return True, "SAME_DIRECTION_NEW_ZONE"
 
-    active_score = safe_float(active.get("score"), 0.0)
-    new_score = safe_float(new_signal.get("score"), 0.0)
     if new_score >= active_score + SAME_DIRECTION_SCORE_BONUS:
         return True, "SAME_DIRECTION_MUCH_STRONGER"
+
+    if ALLOW_SMART_REPEAT_SIGNAL:
+        upgraded, why = signal_upgrade_needed(active, new_signal)
+        if upgraded:
+            return True, why
 
     return False, "SIMILAR_ACTIVE_SIGNAL_STILL_OPEN"
 
@@ -819,6 +934,7 @@ def register_sent_signal(state, sent_signal):
     sent_signal["updated_ts"] = utc_ts()
     sent_signal["status"] = "PENDING"
     sent_signal["active"] = False
+    sent_signal["signal_signature"] = build_signal_signature(sent_signal)
     state["active_signal"] = sent_signal
     state["last_signal"] = sent_signal
 
@@ -902,7 +1018,6 @@ def build_trade_signal(state):
     reasons_long = []
     reasons_short = []
 
-    # 15m structure
     if tf15["ema9"] and tf15["ema21"] and tf15["ema50"]:
         if tf15["ema9"] > tf15["ema21"] > tf15["ema50"]:
             long_score += 3.0
@@ -935,25 +1050,23 @@ def build_trade_signal(state):
             short_score += 1.5
             reasons_short.append("15m macd hist < 0")
 
-    # 1h trend support
     if tf1h["ema21"] and tf1h["ema50"]:
         if tf1h["close"] > tf1h["ema21"] and tf1h["ema21"] > tf1h["ema50"]:
             long_score += 1.5
-            reasons_long.append("1h strong long trend")
+            reasons_long.append("60m strong long trend")
 
         if tf1h["close"] < tf1h["ema21"] and tf1h["ema21"] < tf1h["ema50"]:
             short_score += 1.5
-            reasons_short.append("1h strong short trend")
+            reasons_short.append("60m strong short trend")
 
     if tf1h["rsi14"] is not None:
         if tf1h["rsi14"] >= 52:
             long_score += 0.5
-            reasons_long.append(f"1h rsi bullish {round(tf1h['rsi14'], 2)}")
+            reasons_long.append(f"60m rsi bullish {round(tf1h['rsi14'], 2)}")
         elif tf1h["rsi14"] <= 48:
             short_score += 0.5
-            reasons_short.append(f"1h rsi bearish {round(tf1h['rsi14'], 2)}")
+            reasons_short.append(f"60m rsi bearish {round(tf1h['rsi14'], 2)}")
 
-    # BTC filter
     if btc_bias == "LONG":
         long_score += 1.0
         short_score -= 0.75
@@ -968,7 +1081,6 @@ def build_trade_signal(state):
         long_score -= 0.20
         short_score -= 0.20
 
-    # USDT.D filter
     if usdtd_bias == "LONG":
         long_score += USDTD_LONG_SCORE_BONUS
         short_score -= USDTD_OPPOSITE_PENALTY
@@ -983,7 +1095,6 @@ def build_trade_signal(state):
         reasons_long.append("usdtd neutral")
         reasons_short.append("usdtd neutral")
 
-    # 5m entry timing
     long_entry_ok = False
     short_entry_ok = False
 
@@ -1012,7 +1123,6 @@ def build_trade_signal(state):
             reasons_short.append("5m entry aligned")
             short_entry_ok = True
 
-    # volume confirm
     if tf5["vol_last"] and tf5["vol_sma20"]:
         if tf5["vol_last"] > tf5["vol_sma20"] * 1.08:
             if long_entry_ok:
@@ -1100,7 +1210,6 @@ def run_once():
     try:
         current_price = get_last_price(SYMBOL)
 
-        # active signal management first
         atr_now = None
         try:
             candles_5m_for_mgmt = get_klines(SYMBOL, "5m", 80)
@@ -1111,10 +1220,12 @@ def run_once():
 
         refresh_active_signal_if_needed(state, current_price, atr_now)
 
-        signal, signal_price, info, atr_from_signal = build_trade_signal(state)
+        signal, signal_price, info, _ = build_trade_signal(state)
         current_price = signal_price if signal_price else current_price
 
         if signal:
+            old_active = state.get("active_signal")
+
             can_send, reason_code = should_send_signal(
                 state=state,
                 new_signal=signal,
@@ -1122,14 +1233,29 @@ def run_once():
             )
 
             if can_send:
-                message = format_signal_message(signal, current_price)
+                if old_active and is_same_direction(old_active, signal):
+                    upgraded, upgrade_reason = signal_upgrade_needed(old_active, signal)
+
+                    if upgraded:
+                        message = format_upgraded_signal_message(
+                            old_sig=old_active,
+                            new_sig=signal,
+                            current_price=current_price,
+                            upgrade_reason=upgrade_reason
+                        )
+                    else:
+                        message = format_signal_message(signal, current_price)
+                else:
+                    message = format_signal_message(signal, current_price)
+
                 sent = tg_send(message)
+
                 if sent:
                     register_sent_signal(state, signal)
                     log(
-                        f"YENI SINYAL GONDERILDI | {signal['direction']} | "
-                        f"entry={signal['entry']} sl={signal['sl']} tp1={signal['tp1']} tp2={signal['tp2']} tp3={signal['tp3']} "
-                        f"score={signal['score']} | {reason_code}"
+                        f"YENI/UPDATED SINYAL GONDERILDI | {signal['direction']} | "
+                        f"entry={signal['entry']} sl={signal['sl']} tp1={signal['tp1']} "
+                        f"tp2={signal['tp2']} tp3={signal['tp3']} score={signal['score']} | {reason_code}"
                     )
                 else:
                     log("Sinyal bulundu ama Telegram gönderimi başarısız.")
@@ -1152,13 +1278,12 @@ def run_once():
 def send_startup_message():
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         tg_send(
-            f"🤖 ETH MEXC SuperBot başladı.\n"
-            f"Zaman: {now_str()}\n"
-            f"Sembol: {SYMBOL}\n"
-            f"Kaynak: MEXC Spot\n"
-            f"Filtre: BTC + USDT.D\n"
-            f"TP Yönetimi: TP1->BE / TP2->Trailing / TP3->Close\n"
-            f"ChatID: {TELEGRAM_CHAT_ID}"
+            f"🤖 <b>ETH MEXC SuperBot PRO++ başladı</b>\n\n"
+            f"<b>Zaman:</b> {now_str()}\n"
+            f"<b>Sembol:</b> {SYMBOL}\n"
+            f"<b>Kaynak:</b> MEXC Spot\n"
+            f"<b>Filtre:</b> BTC + USDT.D\n"
+            f"<b>TP Yönetimi:</b> TP1→BE / TP2→Trailing / TP3→Close"
         )
         log("Başlangıç mesajı gönderildi.")
     else:
