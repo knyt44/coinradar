@@ -27,50 +27,47 @@ TELEGRAM_CHAT_ID = (
 )
 
 CHECK_EVERY_SECONDS = 20
-STATE_FILE = "eth_mexc_usdtd_final_state.json"
+STATE_FILE = "eth_mexc_usdtd_elit_state.json"
 
 # =========================================================
 # SIGNAL / LIFECYCLE
 # =========================================================
-MIN_SIGNAL_GAP_MINUTES = 15
+MIN_SIGNAL_GAP_MINUTES = 30
 SIGNAL_TIMEOUT_MINUTES = 90
 MAX_ACTIVE_SIGNAL_AGE_MINUTES = 180
-MIN_PRICE_DISTANCE_PCT = 0.30
-REVERSE_SIGNAL_STRENGTH_BONUS = 1.40
-SAME_DIRECTION_SCORE_BONUS = 2.00
+MIN_PRICE_DISTANCE_PCT = 0.55
+REVERSE_SIGNAL_STRENGTH_BONUS = 1.80
+SAME_DIRECTION_SCORE_BONUS = 3.20
 
 # =========================================================
 # THRESHOLDS
 # =========================================================
-LONG_SCORE_THRESHOLD = 8.8
-SHORT_SCORE_THRESHOLD = 8.8
-NEUTRAL_USDTD_EXTRA_SCORE = 0.4
-MIN_RR_TO_TP2 = 1.30
+LONG_SCORE_THRESHOLD = 11.2
+SHORT_SCORE_THRESHOLD = 11.2
+NEUTRAL_USDTD_EXTRA_SCORE = 0.9
+MIN_RR_TO_TP2 = 1.45
 
 # =========================================================
 # RISK
 # =========================================================
-ATR_SL_MULTIPLIER = 1.20
-ATR_TP1_MULTIPLIER = 1.20
-ATR_TP2_MULTIPLIER = 2.20
-ATR_TP3_MULTIPLIER = 3.20
+ATR_SL_MULTIPLIER = 1.55
+ATR_TP1_MULTIPLIER = 1.30
+ATR_TP2_MULTIPLIER = 2.50
+ATR_TP3_MULTIPLIER = 3.80
 TRAIL_AFTER_TP2_ATR = 1.00
 
 # =========================================================
 # FILTERS
 # =========================================================
 USE_BTC_FILTER = True
-BTC_15M_TREND_THRESHOLD = 0.10
+BTC_15M_TREND_THRESHOLD = 0.20
 
 USE_USDTD_FILTER = True
 USDTD_FAST_EMA = 6
 USDTD_SLOW_EMA = 18
 USDTD_HISTORY_LIMIT = 240
 CG_CACHE_TTL_SECONDS = 180
-
-# Dengeli mod:
-# USDT.D bias yön verir ama tek başına işlemi bloklamaz
-STRICT_USDTD_BLOCK = False
+STRICT_USDTD_BLOCK = True
 
 MAX_HTTP_RETRY = 3
 HTTP_TIMEOUT = 15
@@ -78,16 +75,16 @@ HTTP_TIMEOUT = 15
 # =========================================================
 # ENTRY / MESSAGE
 # =========================================================
-ENTRY_NEAR_PCT = 0.20
+ENTRY_NEAR_PCT = 0.10
 CANCEL_IF_TP1_BEFORE_ENTRY = True
 
 # =========================================================
 # SMART RESEND
 # =========================================================
-RESEND_IF_SCORE_IMPROVED_BY = 0.8
-RESEND_IF_ENTRY_MOVED_PCT = 0.20
+RESEND_IF_SCORE_IMPROVED_BY = 1.5
+RESEND_IF_ENTRY_MOVED_PCT = 0.40
 RESEND_IF_REASON_CHANGED = True
-ALLOW_SMART_REPEAT_SIGNAL = True
+ALLOW_SMART_REPEAT_SIGNAL = False
 
 # =========================================================
 # AUTO REPORTS
@@ -496,9 +493,27 @@ def get_usdtd_bias(state):
         return "NEUTRAL", "USDTD_FILTER_DISABLED", None, None, None
 
     try:
-        info = get_usdtd_proxy(state)
-        usdtd_now = float(info["usdtd"])
-        append_usdtd_history(state, usdtd_now)
+        manual = state.get("manual_usdtd_override")
+        cache = state.get("cg_cache", {})
+        used_cache = False
+
+        if manual is not None:
+            usdtd_now = float(manual)
+        elif cache and (utc_ts() - int(cache.get("ts", 0)) < CG_CACHE_TTL_SECONDS):
+            usdtd_now = float(cache["usdtd"])
+            used_cache = True
+        else:
+            info = get_usdtd_proxy(state)
+            usdtd_now = float(info["usdtd"])
+
+        hist = state.get("history", {}).get("usdtd", [])
+        last_hist_val = None
+        if hist:
+            last_hist_val = safe_float(hist[-1].get("value"))
+
+        if (not used_cache) or last_hist_val is None or abs(last_hist_val - usdtd_now) > 0.00001:
+            append_usdtd_history(state, usdtd_now)
+
         values = get_usdtd_values(state)
 
         if len(values) < USDTD_SLOW_EMA:
@@ -529,9 +544,9 @@ def get_usdtd_bias(state):
 # =========================================================
 def classify_signal_strength(score):
     s = safe_float(score, 0.0)
-    if s >= 12.0:
+    if s >= 13.0:
         return "GUCLU"
-    elif s >= 10.5:
+    elif s >= 11.5:
         return "ORTA"
     return "ZAYIF"
 
@@ -882,11 +897,19 @@ def is_sl_hit(signal, current_price):
 def is_entry_filled(signal, current_price):
     if not signal:
         return False
+
     entry = safe_float(signal.get("entry"))
     cp = safe_float(current_price)
+
     if entry is None or cp is None or entry == 0:
         return False
-    return (abs(cp - entry) / entry * 100.0) <= ENTRY_NEAR_PCT
+
+    near_pct = (abs(cp - entry) / entry) * 100.0
+
+    if signal["direction"] == "LONG":
+        return cp >= entry and near_pct <= ENTRY_NEAR_PCT
+    else:
+        return cp <= entry and near_pct <= ENTRY_NEAR_PCT
 
 def is_expired(signal):
     if not signal:
@@ -1021,16 +1044,11 @@ def should_send_signal(state, new_signal, current_price):
     active_score = safe_float(active.get("score"), 0.0)
     new_score = safe_float(new_signal.get("score"), 0.0)
 
-    if dist_pct >= MIN_PRICE_DISTANCE_PCT:
+    if dist_pct >= MIN_PRICE_DISTANCE_PCT and new_score >= active_score + 1.0:
         return True, "SAME_DIRECTION_NEW_ZONE"
 
-    if new_score >= active_score + SAME_DIRECTION_SCORE_BONUS:
+    if new_score >= active_score + SAME_DIRECTION_SCORE_BONUS and dist_pct >= 0.30:
         return True, "SAME_DIRECTION_MUCH_STRONGER"
-
-    if ALLOW_SMART_REPEAT_SIGNAL:
-        upgraded, why = signal_upgrade_needed(active, new_signal)
-        if upgraded:
-            return True, why
 
     return False, "SIMILAR_ACTIVE_SIGNAL_STILL_OPEN"
 
@@ -1104,10 +1122,12 @@ def get_btc_filter_bias():
 def build_trade_signal(state, live_price):
     candles_15m = get_klines(SYMBOL, "15m", 200)
     candles_5m = get_klines(SYMBOL, "5m", 200)
+    candles_30m = get_klines(SYMBOL, "30m", 200)
     candles_1h = get_klines(SYMBOL, "60m", 150)
 
     tf15 = analyze_timeframe(candles_15m)
     tf5 = analyze_timeframe(candles_5m)
+    tf30 = analyze_timeframe(candles_30m)
     tf1h = analyze_timeframe(candles_1h)
 
     current_price = float(live_price)
@@ -1119,6 +1139,7 @@ def build_trade_signal(state, live_price):
     reasons_long = []
     reasons_short = []
 
+    # 15m ana trend
     if tf15["ema9"] and tf15["ema21"] and tf15["ema50"]:
         if tf15["ema9"] > tf15["ema21"] > tf15["ema50"]:
             long_score += 3.0
@@ -1128,111 +1149,139 @@ def build_trade_signal(state, live_price):
             reasons_short.append("15m trend down")
 
     if tf15["close"] > (tf15["ema21"] or 0):
-        long_score += 1.3
+        long_score += 1.4
         reasons_long.append("15m above ema21")
     else:
-        short_score += 1.3
+        short_score += 1.4
         reasons_short.append("15m below ema21")
 
     if tf15["rsi14"] is not None:
-        if 52 <= tf15["rsi14"] <= 70:
+        if 55 <= tf15["rsi14"] <= 67:
             long_score += 1.4
             reasons_long.append("15m rsi long")
-        if 30 <= tf15["rsi14"] <= 48:
+        if 33 <= tf15["rsi14"] <= 45:
             short_score += 1.4
             reasons_short.append("15m rsi short")
 
     if tf15["macd_hist"] is not None:
         if tf15["macd_hist"] > 0:
-            long_score += 1.4
+            long_score += 1.5
             reasons_long.append("15m macd up")
         if tf15["macd_hist"] < 0:
-            short_score += 1.4
+            short_score += 1.5
             reasons_short.append("15m macd down")
 
+    # 30m teyit
+    if tf30["ema21"] and tf30["ema50"]:
+        if tf30["close"] > tf30["ema21"] and tf30["ema21"] > tf30["ema50"]:
+            long_score += 2.0
+            reasons_long.append("30m trend up")
+        if tf30["close"] < tf30["ema21"] and tf30["ema21"] < tf30["ema50"]:
+            short_score += 2.0
+            reasons_short.append("30m trend down")
+
+    if tf30["rsi14"] is not None:
+        if tf30["rsi14"] >= 54:
+            long_score += 0.9
+            reasons_long.append("30m rsi bull")
+        elif tf30["rsi14"] <= 46:
+            short_score += 0.9
+            reasons_short.append("30m rsi bear")
+
+    if tf30["macd_hist"] is not None:
+        if tf30["macd_hist"] > 0:
+            long_score += 0.9
+            reasons_long.append("30m macd up")
+        elif tf30["macd_hist"] < 0:
+            short_score += 0.9
+            reasons_short.append("30m macd down")
+
+    # 1h teyit
     if tf1h["ema21"] and tf1h["ema50"]:
         if tf1h["close"] > tf1h["ema21"] and tf1h["ema21"] > tf1h["ema50"]:
-            long_score += 1.6
+            long_score += 1.9
             reasons_long.append("1h trend up")
         if tf1h["close"] < tf1h["ema21"] and tf1h["ema21"] < tf1h["ema50"]:
-            short_score += 1.6
+            short_score += 1.9
             reasons_short.append("1h trend down")
 
     if tf1h["rsi14"] is not None:
-        if tf1h["rsi14"] >= 52:
-            long_score += 0.7
+        if tf1h["rsi14"] >= 54:
+            long_score += 0.9
             reasons_long.append("1h rsi bull")
-        elif tf1h["rsi14"] <= 48:
-            short_score += 0.7
+        elif tf1h["rsi14"] <= 46:
+            short_score += 0.9
             reasons_short.append("1h rsi bear")
 
+    # BTC filtresi
     if btc_bias == "LONG":
-        long_score += 1.0
-        short_score -= 0.8
+        long_score += 1.2
+        short_score -= 1.1
         reasons_long.append("btc supports")
     elif btc_bias == "SHORT":
-        short_score += 1.0
-        long_score -= 0.8
+        short_score += 1.2
+        long_score -= 1.1
         reasons_short.append("btc supports")
     else:
-        long_score -= 0.2
-        short_score -= 0.2
+        long_score -= 0.3
+        short_score -= 0.3
 
     long_entry_ok = False
     short_entry_ok = False
 
+    # 5m sıkı entry
     if tf5["ema9"] and tf5["ema21"] and tf5["ema50"]:
         if (
             current_price > tf5["ema21"] and
-            tf5["ema9"] >= tf5["ema21"] and
-            tf5["ema21"] >= tf5["ema50"] and
-            tf5["rsi14"] is not None and 48 <= tf5["rsi14"] <= 68 and
+            tf5["ema9"] > tf5["ema21"] > tf5["ema50"] and
+            tf5["rsi14"] is not None and 51 <= tf5["rsi14"] <= 62 and
             tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] >= tf5["macd_signal"]
+            tf5["macd"] > tf5["macd_signal"] and
+            tf5["macd_hist"] is not None and tf5["macd_hist"] > 0
         ):
-            long_score += 3.0
+            long_score += 3.4
             reasons_long.append("5m entry")
             long_entry_ok = True
 
         if (
             current_price < tf5["ema21"] and
-            tf5["ema9"] <= tf5["ema21"] and
-            tf5["ema21"] <= tf5["ema50"] and
-            tf5["rsi14"] is not None and 32 <= tf5["rsi14"] <= 52 and
+            tf5["ema9"] < tf5["ema21"] < tf5["ema50"] and
+            tf5["rsi14"] is not None and 38 <= tf5["rsi14"] <= 49 and
             tf5["macd"] is not None and tf5["macd_signal"] is not None and
-            tf5["macd"] <= tf5["macd_signal"]
+            tf5["macd"] < tf5["macd_signal"] and
+            tf5["macd_hist"] is not None and tf5["macd_hist"] < 0
         ):
-            short_score += 3.0
+            short_score += 3.4
             reasons_short.append("5m entry")
             short_entry_ok = True
 
     if tf5["vol_last"] and tf5["vol_sma20"]:
-        if tf5["vol_last"] > tf5["vol_sma20"] * 1.08:
+        if tf5["vol_last"] > tf5["vol_sma20"] * 1.15:
             if long_entry_ok:
-                long_score += 0.8
+                long_score += 1.0
                 reasons_long.append("5m volume")
             if short_entry_ok:
-                short_score += 0.8
+                short_score += 1.0
                 reasons_short.append("5m volume")
 
     atr5 = tf5["atr14"]
     if atr5 is None or atr5 <= 0:
         return None, current_price, "ATR_UNAVAILABLE", atr5
 
-    # Dengeli USDT.D filter
+    # USDT.D ağırlık
     if usdtd_bias == "LONG":
-        long_score += 1.2
-        short_score -= 1.0
+        long_score += 1.4
+        short_score -= 1.3
         reasons_long.append("usdtd supports")
     elif usdtd_bias == "SHORT":
-        short_score += 1.2
-        long_score -= 1.0
+        short_score += 1.4
+        long_score -= 1.3
         reasons_short.append("usdtd supports")
     else:
         long_score -= NEUTRAL_USDTD_EXTRA_SCORE
         short_score -= NEUTRAL_USDTD_EXTRA_SCORE
 
-    # İsteğe bağlı sert blok modu
+    # Sert blok
     if STRICT_USDTD_BLOCK:
         if usdtd_bias == "LONG":
             short_entry_ok = False
@@ -1242,6 +1291,25 @@ def build_trade_signal(state, live_price):
             long_entry_ok = False
             long_score = -999
             reasons_long.append("blocked by usdtd")
+
+    # 30m ve 1h yön uyumu zorunlu gibi davran
+    if long_entry_ok:
+        if not (
+            tf30["ema21"] and tf30["ema50"] and tf30["close"] > tf30["ema21"] > tf30["ema50"] and
+            tf1h["ema21"] and tf1h["ema50"] and tf1h["close"] > tf1h["ema21"] > tf1h["ema50"]
+        ):
+            long_entry_ok = False
+            long_score -= 2.0
+            reasons_long.append("higher tf reject")
+
+    if short_entry_ok:
+        if not (
+            tf30["ema21"] and tf30["ema50"] and tf30["close"] < tf30["ema21"] < tf30["ema50"] and
+            tf1h["ema21"] and tf1h["ema50"] and tf1h["close"] < tf1h["ema21"] < tf1h["ema50"]
+        ):
+            short_entry_ok = False
+            short_score -= 2.0
+            reasons_short.append("higher tf reject")
 
     candidates = []
 
@@ -1257,7 +1325,7 @@ def build_trade_signal(state, live_price):
         rr = reward_tp2 / risk if risk > 0 else 0
 
         if rr >= MIN_RR_TO_TP2:
-            reasons = reasons_long[:8] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
+            reasons = reasons_long[:10] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
             if usdtd_now is not None and usdtd_fast is not None and usdtd_slow is not None:
                 reasons.append(f"USDTD:{round(usdtd_now,3)} {round(usdtd_fast,3)}/{round(usdtd_slow,3)}")
 
@@ -1269,7 +1337,7 @@ def build_trade_signal(state, live_price):
                 tp2=tp2,
                 tp3=tp3,
                 score=long_score,
-                strategy_tag="ETH_MEXC_15M_5M_USDTD_BALANCED",
+                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT",
                 reason=" | ".join(reasons),
                 usdtd_bias=usdtd_bias
             ))
@@ -1286,7 +1354,7 @@ def build_trade_signal(state, live_price):
         rr = reward_tp2 / risk if risk > 0 else 0
 
         if rr >= MIN_RR_TO_TP2:
-            reasons = reasons_short[:8] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
+            reasons = reasons_short[:10] + [btc_reason, usdtd_reason, f"RR:{round(rr, 2)}"]
             if usdtd_now is not None and usdtd_fast is not None and usdtd_slow is not None:
                 reasons.append(f"USDTD:{round(usdtd_now,3)} {round(usdtd_fast,3)}/{round(usdtd_slow,3)}")
 
@@ -1298,7 +1366,7 @@ def build_trade_signal(state, live_price):
                 tp2=tp2,
                 tp3=tp3,
                 score=short_score,
-                strategy_tag="ETH_MEXC_15M_5M_USDTD_BALANCED",
+                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT",
                 reason=" | ".join(reasons),
                 usdtd_bias=usdtd_bias
             ))
@@ -1430,7 +1498,7 @@ def run_once(state):
             if can_send:
                 if old_active and is_same_direction(old_active, signal):
                     upgraded, upgrade_reason = signal_upgrade_needed(old_active, signal)
-                    if upgraded:
+                    if upgraded and ALLOW_SMART_REPEAT_SIGNAL:
                         message = format_upgraded_signal_message(old_active, signal, upgrade_reason)
                     else:
                         message = format_signal_message(signal)
@@ -1472,8 +1540,8 @@ def send_startup_message():
         tg_send(
             "🤖 ETHUSDT Bot Başladı\n"
             "Kaynak: MEXC\n"
-            "Filtre: BTC + USDT.D\n"
-            "Mod: Dengeli\n"
+            "Filtre: BTC + USDT.D + 30m teyit\n"
+            "Mod: ELIT\n"
             "Komutlar: /panel /gunluk /haftalik /aylik /aktif /yardim"
         )
         log("Başlangıç mesajı gönderildi.")
