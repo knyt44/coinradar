@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = (
 )
 
 CHECK_EVERY_SECONDS = 20
-STATE_FILE = "eth_mexc_usdtd_elit_state.json"
+STATE_FILE = "eth_mexc_usdtd_elit_pro_v4_state.json"
 
 # =========================================================
 # SIGNAL / LIFECYCLE
@@ -55,6 +55,25 @@ ATR_TP1_MULTIPLIER = 1.30
 ATR_TP2_MULTIPLIER = 2.50
 ATR_TP3_MULTIPLIER = 3.80
 TRAIL_AFTER_TP2_ATR = 1.00
+
+# =========================================================
+# PARTIAL EXIT / PNL MODEL
+# =========================================================
+# Pozisyonu parça parça simüle eder:
+# TP1 -> %50 realize
+# TP2 -> %30 realize
+# TP3 -> kalan %20 realize
+#
+# SL veya timeout olduğunda kalan açık miktar, kapanış fiyatına göre hesaplanır.
+TP1_CLOSE_PCT = 0.50
+TP2_CLOSE_PCT = 0.30
+TP3_CLOSE_PCT = 0.20
+
+# TP1 sonrası stop direkt BE yerine küçük kâr kilitlesin
+POST_TP1_LOCK_R = 0.15  # entry üstüne/altına 0.15R kilitler
+
+# TP2 sonrası trailing aktif
+# ayrıca TP2 hit olduğunda zaten %30 realize edilir
 
 # =========================================================
 # FILTERS
@@ -141,6 +160,12 @@ def fmt_price(v):
         elif v >= 1:
             return f"{v:.4f}"
         return f"{v:.6f}"
+    except Exception:
+        return str(v)
+
+def fmt_r(v):
+    try:
+        return f"{float(v):+.2f}R"
     except Exception:
         return str(v)
 
@@ -409,15 +434,18 @@ def atr(candles, period=14):
 def default_stats():
     return {
         "total_signals": 0,
-        "wins": 0,
-        "losses": 0,
+        "positive_closes": 0,
+        "negative_closes": 0,
+        "flat_closes": 0,
         "tp1_hits": 0,
         "tp2_hits": 0,
         "tp3_hits": 0,
         "stops": 0,
         "timeouts": 0,
         "cancelled": 0,
-        "reversed": 0
+        "reversed": 0,
+        "gross_net_r": 0.0,
+        "avg_r_per_trade": 0.0
     }
 
 def default_state():
@@ -588,10 +616,12 @@ def signal_upgrade_needed(old_sig, new_sig):
     return False, "NO_MEANINGFUL_UPGRADE"
 
 def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_tag, reason, usdtd_bias):
+    risk_distance = abs(float(entry) - float(sl))
     return {
         "direction": direction.upper(),
         "entry": round(float(entry), 4),
         "sl": round(float(sl), 4),
+        "initial_sl": round(float(sl), 4),
         "tp1": round(float(tp1), 4),
         "tp2": round(float(tp2), 4),
         "tp3": round(float(tp3), 4),
@@ -609,7 +639,12 @@ def build_signal_payload(direction, entry, sl, tp1, tp2, tp3, score, strategy_ta
         "breakeven_done": False,
         "trail_active": False,
         "trail_stop": round(float(sl), 4),
-        "signal_signature": ""
+        "signal_signature": "",
+        "remaining_position": 1.0,
+        "realized_r": 0.0,
+        "risk_distance": round(risk_distance, 8),
+        "close_price": None,
+        "close_reason": None
     }
 
 def is_same_direction(a, b):
@@ -647,7 +682,8 @@ def format_signal_message(sig):
         f"TP2: {fmt_price(tp2)}\n"
         f"TP3: {fmt_price(tp3)}\n"
         f"RR: {rr:.2f}\n"
-        f"USDT.D: {sig.get('usdtd_bias', 'NEUTRAL')}"
+        f"USDT.D: {sig.get('usdtd_bias', 'NEUTRAL')}\n"
+        f"Plan: TP1 %50 | TP2 %30 | TP3 %20"
     )
 
 def format_upgraded_signal_message(old_sig, new_sig, upgrade_reason):
@@ -664,25 +700,26 @@ def format_upgraded_signal_message(old_sig, new_sig, upgrade_reason):
     )
 
 def format_close_message(sig, close_reason):
+    net_r = safe_float(sig.get("net_r"), 0.0)
     if close_reason == "TP3_HIT":
-        return "🏁 TP3 HIT\nİşlem tamamlandı"
+        return f"🏁 TP3 HIT\nİşlem tamamlandı\nNet: {fmt_r(net_r)}"
     if close_reason == "SL_HIT":
-        return "❌ STOP\nİşlem kapandı"
+        return f"❌ STOP\nİşlem kapandı\nNet: {fmt_r(net_r)}"
     if close_reason == "TIMEOUT":
-        return "⌛ TIMEOUT\nSinyal süresi doldu"
+        return f"⌛ TIMEOUT\nSinyal süresi doldu\nNet: {fmt_r(net_r)}"
     if close_reason == "CANCELLED_BEFORE_ENTRY_TP1":
         return "⚠️ SETUP IPTAL\nEntry gelmeden hedefe gitti"
     if close_reason == "REVERSED_BY_STRONGER_SIGNAL":
-        return "↩️ TERS SİNYAL\nDaha güçlü ters yön geldi"
+        return f"↩️ TERS SİNYAL\nDaha güçlü ters yön geldi\nNet: {fmt_r(net_r)}"
     if close_reason == "MAX_ACTIVE_AGE_EXCEEDED":
-        return "⌛ MAKS SÜRE\nAktif sinyal kapatıldı"
-    return "İşlem kapandı"
+        return f"⌛ MAKS SÜRE\nAktif sinyal kapatıldı\nNet: {fmt_r(net_r)}"
+    return f"İşlem kapandı\nNet: {fmt_r(net_r)}"
 
 def format_active_signal(sig):
     if not sig:
         return "Aktif işlem yok."
 
-    risk = abs(sig["entry"] - sig["sl"])
+    risk = abs(sig["entry"] - sig["initial_sl"])
     reward = abs(sig["tp2"] - sig["entry"])
     rr = reward / risk if risk > 0 else 0.0
     filled = "EVET" if sig.get("active") else "BEKLIYOR"
@@ -698,22 +735,30 @@ def format_active_signal(sig):
         f"TP2: {fmt_price(sig['tp2'])}\n"
         f"TP3: {fmt_price(sig['tp3'])}\n"
         f"RR: {rr:.2f}\n"
+        f"Kalan Pozisyon: %{sig.get('remaining_position', 0.0) * 100:.0f}\n"
+        f"Realized: {fmt_r(sig.get('realized_r', 0.0))}\n"
         f"USDT.D: {sig.get('usdtd_bias', 'NEUTRAL')}"
     )
 
 def format_panel(state):
     stats = state.get("stats", default_stats())
     total = int(stats.get("total_signals", 0))
-    wins = int(stats.get("wins", 0))
-    losses = int(stats.get("losses", 0))
-    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+    pos = int(stats.get("positive_closes", 0))
+    neg = int(stats.get("negative_closes", 0))
+    flat = int(stats.get("flat_closes", 0))
+    hit_rate = (pos / total * 100.0) if total > 0 else 0.0
+    net_r = safe_float(stats.get("gross_net_r", 0.0), 0.0)
+    avg_r = safe_float(stats.get("avg_r_per_trade", 0.0), 0.0)
 
     return (
         f"📊 PANEL\n"
         f"Toplam: {total}\n"
-        f"Kazanan: {wins}\n"
-        f"Kaybeden: {losses}\n"
-        f"Win Rate: %{win_rate:.1f}\n"
+        f"Pozitif: {pos}\n"
+        f"Negatif: {neg}\n"
+        f"Flat: {flat}\n"
+        f"Pozitif Oran: %{hit_rate:.1f}\n"
+        f"Net R: {fmt_r(net_r)}\n"
+        f"Ort/İşlem: {fmt_r(avg_r)}\n"
         f"TP1: {int(stats.get('tp1_hits', 0))}\n"
         f"TP2: {int(stats.get('tp2_hits', 0))}\n"
         f"TP3: {int(stats.get('tp3_hits', 0))}\n"
@@ -741,8 +786,9 @@ def aggregate_period_summary(state, period="daily", ref_ts=None):
         match_fn = lambda ts: month_key_from_ts(ts) == ref_key
 
     total = 0
-    wins = 0
-    losses = 0
+    pos = 0
+    neg = 0
+    flat = 0
     tp1 = 0
     tp2 = 0
     tp3 = 0
@@ -750,6 +796,7 @@ def aggregate_period_summary(state, period="daily", ref_ts=None):
     timeouts = 0
     cancelled = 0
     reversed_count = 0
+    net_r = 0.0
 
     for sig in history:
         closed_ts = sig.get("closed_ts")
@@ -766,11 +813,18 @@ def aggregate_period_summary(state, period="daily", ref_ts=None):
         if sig.get("tp3_hit"):
             tp3 += 1
 
+        sig_net_r = safe_float(sig.get("net_r"), 0.0)
+        net_r += sig_net_r
+
+        if sig_net_r > 0.000001:
+            pos += 1
+        elif sig_net_r < -0.000001:
+            neg += 1
+        else:
+            flat += 1
+
         reason = sig.get("close_reason")
-        if reason == "TP3_HIT":
-            wins += 1
-        elif reason == "SL_HIT":
-            losses += 1
+        if reason == "SL_HIT":
             stops += 1
         elif reason == "TIMEOUT":
             timeouts += 1
@@ -779,14 +833,18 @@ def aggregate_period_summary(state, period="daily", ref_ts=None):
         elif reason == "REVERSED_BY_STRONGER_SIGNAL":
             reversed_count += 1
 
-    win_rate = (wins / total * 100.0) if total > 0 else 0.0
+    hit_rate = (pos / total * 100.0) if total > 0 else 0.0
+    avg_r = (net_r / total) if total > 0 else 0.0
 
     return (
         f"{title}\n"
         f"Toplam: {total}\n"
-        f"Kazanan: {wins}\n"
-        f"Kaybeden: {losses}\n"
-        f"Win Rate: %{win_rate:.1f}\n"
+        f"Pozitif: {pos}\n"
+        f"Negatif: {neg}\n"
+        f"Flat: {flat}\n"
+        f"Pozitif Oran: %{hit_rate:.1f}\n"
+        f"Net R: {fmt_r(net_r)}\n"
+        f"Ort/İşlem: {fmt_r(avg_r)}\n"
         f"TP1: {tp1}\n"
         f"TP2: {tp2}\n"
         f"TP3: {tp3}\n"
@@ -808,6 +866,72 @@ def help_text():
     )
 
 # =========================================================
+# PNL HELPERS
+# =========================================================
+def calc_r_multiple(signal, exit_price):
+    entry = safe_float(signal.get("entry"))
+    risk = safe_float(signal.get("risk_distance"))
+    exit_price = safe_float(exit_price)
+
+    if entry is None or risk in (None, 0) or exit_price is None:
+        return 0.0
+
+    if signal["direction"] == "LONG":
+        return (exit_price - entry) / risk
+    return (entry - exit_price) / risk
+
+def realize_partial(signal, exit_price, close_pct):
+    close_pct = safe_float(close_pct, 0.0)
+    remaining = safe_float(signal.get("remaining_position"), 0.0)
+
+    if close_pct <= 0 or remaining <= 0:
+        return 0.0
+
+    actual_pct = min(close_pct, remaining)
+    r_mult = calc_r_multiple(signal, exit_price)
+    realized_r = actual_pct * r_mult
+
+    signal["remaining_position"] = round(max(0.0, remaining - actual_pct), 8)
+    signal["realized_r"] = round(safe_float(signal.get("realized_r"), 0.0) + realized_r, 8)
+
+    return realized_r
+
+def set_post_tp1_lock(signal):
+    entry = safe_float(signal.get("entry"))
+    risk = safe_float(signal.get("risk_distance"))
+    if entry is None or risk in (None, 0):
+        return
+
+    lock_distance = risk * POST_TP1_LOCK_R
+
+    if signal["direction"] == "LONG":
+        new_sl = entry + lock_distance
+        if new_sl > safe_float(signal.get("sl"), entry):
+            signal["sl"] = round(new_sl, 4)
+            signal["trail_stop"] = round(new_sl, 4)
+    else:
+        new_sl = entry - lock_distance
+        if new_sl < safe_float(signal.get("sl"), entry):
+            signal["sl"] = round(new_sl, 4)
+            signal["trail_stop"] = round(new_sl, 4)
+
+def finalize_signal_pnl(signal, close_price):
+    close_price = safe_float(close_price, signal.get("entry"))
+    remaining = safe_float(signal.get("remaining_position"), 0.0)
+    realized_r = safe_float(signal.get("realized_r"), 0.0)
+
+    extra_r = 0.0
+    if remaining > 0:
+        extra_r = remaining * calc_r_multiple(signal, close_price)
+
+    net_r = realized_r + extra_r
+    signal["net_r"] = round(net_r, 8)
+    signal["close_price"] = round(float(close_price), 4)
+    signal["remaining_position"] = 0.0
+
+    return net_r
+
+# =========================================================
 # STATS
 # =========================================================
 def update_stats_for_closed_signal(state, sig):
@@ -822,11 +946,18 @@ def update_stats_for_closed_signal(state, sig):
     if sig.get("tp3_hit"):
         stats["tp3_hits"] = int(stats.get("tp3_hits", 0)) + 1
 
+    net_r = safe_float(sig.get("net_r"), 0.0)
+    stats["gross_net_r"] = round(safe_float(stats.get("gross_net_r"), 0.0) + net_r, 8)
+
+    if net_r > 0.000001:
+        stats["positive_closes"] = int(stats.get("positive_closes", 0)) + 1
+    elif net_r < -0.000001:
+        stats["negative_closes"] = int(stats.get("negative_closes", 0)) + 1
+    else:
+        stats["flat_closes"] = int(stats.get("flat_closes", 0)) + 1
+
     reason = sig.get("close_reason")
-    if reason == "TP3_HIT":
-        stats["wins"] = int(stats.get("wins", 0)) + 1
-    elif reason == "SL_HIT":
-        stats["losses"] = int(stats.get("losses", 0)) + 1
+    if reason == "SL_HIT":
         stats["stops"] = int(stats.get("stops", 0)) + 1
     elif reason == "TIMEOUT":
         stats["timeouts"] = int(stats.get("timeouts", 0)) + 1
@@ -834,6 +965,12 @@ def update_stats_for_closed_signal(state, sig):
         stats["cancelled"] = int(stats.get("cancelled", 0)) + 1
     elif reason == "REVERSED_BY_STRONGER_SIGNAL":
         stats["reversed"] = int(stats.get("reversed", 0)) + 1
+
+    total = int(stats.get("total_signals", 0))
+    stats["avg_r_per_trade"] = round(
+        safe_float(stats.get("gross_net_r"), 0.0) / total if total > 0 else 0.0,
+        8
+    )
 
 # =========================================================
 # ACTIVE SIGNAL
@@ -847,8 +984,10 @@ def close_active_signal(state, close_reason, current_price=None, notify_telegram
     active["close_reason"] = close_reason
     active["closed_ts"] = utc_ts()
 
-    if current_price is not None:
-        active["close_price"] = round(float(current_price), 4)
+    if current_price is None:
+        current_price = active.get("entry")
+
+    finalize_signal_pnl(active, current_price)
 
     if notify_telegram:
         tg_send(format_close_message(active, close_reason))
@@ -856,7 +995,7 @@ def close_active_signal(state, close_reason, current_price=None, notify_telegram
     state["signal_history"].append(clone_signal(active))
     update_stats_for_closed_signal(state, active)
     state["active_signal"] = None
-    log(f"Aktif sinyal kapatildi: {close_reason}")
+    log(f"Aktif sinyal kapatildi: {close_reason} | net_r={active.get('net_r')}")
 
 def is_tp1_hit(signal, current_price):
     if not signal:
@@ -962,26 +1101,45 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
             return
         return
 
-    if is_sl_hit(active, current_price):
-        close_active_signal(state, "SL_HIT", current_price, notify_telegram=True)
+    # Önce TP3 kontrolü
+    if not active.get("tp3_hit") and is_tp3_hit(active, current_price):
+        if not active.get("tp1_hit"):
+            active["tp1_hit"] = True
+            realize_partial(active, active["tp1"], TP1_CLOSE_PCT)
+        if not active.get("tp2_hit"):
+            active["tp2_hit"] = True
+            realize_partial(active, active["tp2"], TP2_CLOSE_PCT)
+        if active.get("remaining_position", 0.0) > 0:
+            realize_partial(active, active["tp3"], active.get("remaining_position", 0.0))
+        active["tp3_hit"] = True
+        close_active_signal(state, "TP3_HIT", active["tp3"], notify_telegram=True)
         return
 
-    if not active.get("tp1_hit") and is_tp1_hit(active, current_price):
-        active["tp1_hit"] = True
-        if not active.get("breakeven_done"):
-            active["sl"] = round(float(active["entry"]), 4)
-            active["trail_stop"] = round(float(active["entry"]), 4)
-            active["breakeven_done"] = True
-            active["updated_ts"] = utc_ts()
-            tg_send("🎯 TP1 HIT\nStop BE oldu")
-
+    # Sonra TP2
     if not active.get("tp2_hit") and is_tp2_hit(active, current_price):
+        if not active.get("tp1_hit"):
+            active["tp1_hit"] = True
+            realized_tp1 = realize_partial(active, active["tp1"], TP1_CLOSE_PCT)
+            set_post_tp1_lock(active)
+            active["breakeven_done"] = True
+            tg_send(f"🎯 TP1 HIT\n%50 kapandı | Net realize: {fmt_r(realized_tp1)}")
+
         active["tp2_hit"] = True
+        realized_tp2 = realize_partial(active, active["tp2"], TP2_CLOSE_PCT)
         active["trail_active"] = True
         if atr_now is not None and atr_now > 0:
             update_trailing_stop(active, current_price, atr_now)
         active["updated_ts"] = utc_ts()
-        tg_send("🚀 TP2 HIT\nTrailing aktif")
+        tg_send(f"🚀 TP2 HIT\n%30 kapandı | Net realize: {fmt_r(realized_tp2)}\nTrailing aktif")
+
+    # Sonra TP1
+    if not active.get("tp1_hit") and is_tp1_hit(active, current_price):
+        active["tp1_hit"] = True
+        realized_tp1 = realize_partial(active, active["tp1"], TP1_CLOSE_PCT)
+        set_post_tp1_lock(active)
+        active["breakeven_done"] = True
+        active["updated_ts"] = utc_ts()
+        tg_send(f"🎯 TP1 HIT\n%50 kapandı | Net realize: {fmt_r(realized_tp1)}\nStop kâra çekildi")
 
     if active.get("trail_active"):
         changed = update_trailing_stop(active, current_price, atr_now)
@@ -990,11 +1148,6 @@ def refresh_active_signal_if_needed(state, current_price, atr_now=None):
 
     if is_sl_hit(active, current_price):
         close_active_signal(state, "SL_HIT", current_price, notify_telegram=True)
-        return
-
-    if not active.get("tp3_hit") and is_tp3_hit(active, current_price):
-        active["tp3_hit"] = True
-        close_active_signal(state, "TP3_HIT", current_price, notify_telegram=True)
         return
 
     if is_expired(active):
@@ -1292,7 +1445,7 @@ def build_trade_signal(state, live_price):
             long_score = -999
             reasons_long.append("blocked by usdtd")
 
-    # 30m ve 1h yön uyumu zorunlu gibi davran
+    # 30m ve 1h yön uyumu
     if long_entry_ok:
         if not (
             tf30["ema21"] and tf30["ema50"] and tf30["close"] > tf30["ema21"] > tf30["ema50"] and
@@ -1337,7 +1490,7 @@ def build_trade_signal(state, live_price):
                 tp2=tp2,
                 tp3=tp3,
                 score=long_score,
-                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT",
+                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT_PRO_V4",
                 reason=" | ".join(reasons),
                 usdtd_bias=usdtd_bias
             ))
@@ -1366,7 +1519,7 @@ def build_trade_signal(state, live_price):
                 tp2=tp2,
                 tp3=tp3,
                 score=short_score,
-                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT",
+                strategy_tag="ETH_MEXC_15M_30M_1H_5M_USDTD_ELIT_PRO_V4",
                 reason=" | ".join(reasons),
                 usdtd_bias=usdtd_bias
             ))
@@ -1541,7 +1694,8 @@ def send_startup_message():
             "🤖 ETHUSDT Bot Başladı\n"
             "Kaynak: MEXC\n"
             "Filtre: BTC + USDT.D + 30m teyit\n"
-            "Mod: ELIT\n"
+            "Mod: ELIT PRO V4\n"
+            "Çıkış: TP1 %50 | TP2 %30 | TP3 %20\n"
             "Komutlar: /panel /gunluk /haftalik /aylik /aktif /yardim"
         )
         log("Başlangıç mesajı gönderildi.")
